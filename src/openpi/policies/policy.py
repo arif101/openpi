@@ -1,3 +1,10 @@
+"""
+Drop-in replacement for openpi/src/openpi/policies/policy.py
+that passes target_state through to sample_actions.
+
+The client sends target_state as an extra field in the observation dict.
+This policy extracts it and passes it as a kwarg to sample_actions.
+"""
 from collections.abc import Sequence
 import logging
 import pathlib
@@ -34,19 +41,6 @@ class Policy(BasePolicy):
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
     ):
-        """Initialize the Policy.
-
-        Args:
-            model: The model to use for action sampling.
-            rng: Random number generator key for JAX models. Ignored for PyTorch models.
-            transforms: Input data transformations to apply before inference.
-            output_transforms: Output data transformations to apply after inference.
-            sample_kwargs: Additional keyword arguments to pass to model.sample_actions.
-            metadata: Additional metadata to store with the policy.
-            pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
-                          Only relevant when is_pytorch=True.
-            is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
-        """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
@@ -60,21 +54,21 @@ class Policy(BasePolicy):
             self._model.eval()
             self._sample_actions = model.sample_actions
         else:
-            # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+        # Extract target_state if provided (for waypoint conditioning)
+        target_state = obs.pop("target_state", None)
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
-            # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
-            # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
@@ -82,10 +76,17 @@ class Policy(BasePolicy):
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
-
-            if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
-                noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
+            if noise.ndim == 2:
+                noise = noise[None, ...]
             sample_kwargs["noise"] = noise
+
+        # Pass target_state to sample_actions if provided
+        if target_state is not None:
+            ts = np.array(target_state, dtype=np.float32)
+            if not self._is_pytorch_model:
+                sample_kwargs["target_state"] = jnp.asarray(ts)[np.newaxis, ...]
+            else:
+                sample_kwargs["target_state"] = torch.from_numpy(ts).to(self._pytorch_device)[None, ...]
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -122,14 +123,17 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict) -> dict:
         results = self._policy.infer(obs)
 
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")
 
-        output_path = self._record_dir / f"step_{self._record_step}"
-        self._record_step += 1
+        for key, val in data.items():
+            key = key.replace("/", "_")
+            if isinstance(val, np.ndarray):
+                path = self._record_dir / f"{self._record_step:06d}_{key}.npy"
+                np.save(path, val)
 
-        np.save(output_path, np.asarray(data))
+        self._record_step += 1
         return results

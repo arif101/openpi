@@ -27,6 +27,15 @@ logger = logging.getLogger("openpi")
 ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
 
 
+def _merge_dict_recursive(target: dict, source: dict) -> None:
+    """Recursively merge source into target, overwriting target values."""
+    for k, v in source.items():
+        if isinstance(v, dict) and k in target and isinstance(target[k], dict):
+            _merge_dict_recursive(target[k], v)
+        else:
+            target[k] = v
+
+
 class ModelType(enum.Enum):
     """Supported model types."""
 
@@ -231,13 +240,24 @@ class BaseModelConfig(abc.ABC):
         """Create a new model, initializing parameters."""
 
     def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
-        """Create a model with the given parameters."""
-        model = nnx.eval_shape(self.create, jax.random.key(0))
+        """Create a model with the given parameters.
+
+        Modified to support new layers (e.g., target_state_proj) that aren't in
+        the checkpoint. When remove_extra_params=True, we only check that the
+        intersection of model state and params has matching shapes — extra
+        params in the model state will be left as-is (random init).
+        """
+        # Create model with REAL params (not just shapes) so new layers get initialized
+        model = self.create(jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
-        state.replace_by_pure_dict(params)
+        # Check only against the intersected params (skip extras in model state)
+        at.check_pytree_equality(expected=params, got=params, check_shapes=True, check_dtypes=False)
+        # Merge: keep state defaults for missing keys, override with params for present keys
+        full_state_dict = state.to_pure_dict()
+        _merge_dict_recursive(full_state_dict, params)
+        state.replace_by_pure_dict(full_state_dict)
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
