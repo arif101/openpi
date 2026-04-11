@@ -193,7 +193,7 @@ class Pi0(_model.BaseModel):
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *,
-        train: bool = False, target_state=None,
+        train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -207,8 +207,9 @@ class Pi0(_model.BaseModel):
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        # Read target_state from observation (None if not provided in dataset)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            observation, x_t, time, target_state=target_state,
+            observation, x_t, time, target_state=observation.target_state,
         )
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -232,6 +233,9 @@ class Pi0(_model.BaseModel):
         target_state=None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
+        # If target_state not passed explicitly, read from observation (waypoint conditioning)
+        if target_state is None:
+            target_state = observation.target_state
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps

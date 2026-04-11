@@ -80,6 +80,12 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Optional waypoint conditioning: target state for the action expert.
+        # When the dataset has a `target_state` column (mapped via repack to
+        # `observation/target_state`), pass it through to the model.
+        if "observation/target_state" in data:
+            inputs["target_state"] = data["observation/target_state"]
+
         return inputs
 
 

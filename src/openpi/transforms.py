@@ -334,6 +334,9 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        # Pad target_state for waypoint conditioning (if present)
+        if "target_state" in data:
+            data["target_state"] = pad_to_dim(data["target_state"], self.model_action_dim, axis=-1)
         return data
 
 
