@@ -836,7 +836,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_libero"
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
         ),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
