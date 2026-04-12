@@ -30,7 +30,7 @@ def extract_features_from_observation(
         Pooled hidden states as numpy array of shape [batch_size, hidden_dim].
     """
     pooled = model.extract_vlm_features(observation)
-    return np.asarray(pooled)
+    return np.asarray(pooled, dtype=np.float32)
 
 
 def extract_features_from_dict(
