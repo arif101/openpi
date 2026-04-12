@@ -222,6 +222,45 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def extract_vlm_features(
+        self,
+        observation: _model.Observation,
+    ) -> at.Float[at.Array, "b d"]:
+        """Extract pooled VLM hidden states from the prefix (images + language).
+
+        Runs embed_prefix + PaliGemma LLM on the prefix only (no action denoising),
+        then mean-pools over valid (non-padding) tokens.
+
+        This is the same forward pass as the first step of sample_actions, but
+        returns the hidden states instead of discarding them. Used by the
+        contact_mpc module to build latent world models on frozen VLM features.
+
+        Args:
+            observation: Observation containing images, state, and tokenized prompt.
+
+        Returns:
+            Pooled hidden state of shape [batch_size, hidden_dim].
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+
+        # Embed prefix (images + language tokens)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+
+        # Forward pass through the VLM — same path as sample_actions prefix pass
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+
+        # Mean-pool over valid (non-padding) prefix tokens
+        mask_expanded = prefix_mask[:, :, None].astype(prefix_out.dtype)
+        pooled = jnp.sum(prefix_out * mask_expanded, axis=1) / jnp.maximum(
+            jnp.sum(mask_expanded, axis=1), 1.0
+        )
+
+        return pooled
+
     @override
     def sample_actions(
         self,
