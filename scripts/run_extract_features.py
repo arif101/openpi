@@ -20,7 +20,7 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 from openpi.contact_mpc.features.dataset import FeatureDataset, detect_contact_timesteps
 from openpi.contact_mpc.features.extractor import extract_features_from_dict, get_hidden_dim
-from openpi.contact_mpc.features.probe import evaluate_ranking_accuracy, train_linear_probe
+from openpi.contact_mpc.features.probe import evaluate_ranking_accuracy, train_linear_probe, train_mlp_probe
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.shared import download
@@ -206,19 +206,45 @@ def main():
         ])
 
         if len(np.unique(progress_labels)) >= 2:
-            probe_model, probe_acc = train_linear_probe(
+            # 1. Linear probe (most conservative test)
+            logger.info("\n--- Linear Probe ---")
+            linear_model, linear_acc = train_linear_probe(
                 dataset.hidden_states, progress_labels
             )
-            logger.info(f"Temporal progress probe accuracy: {probe_acc:.3f}")
-            logger.info("(>0.65 suggests hidden states encode task progress; "
-                        "real success/failure probe needs Week 2 rollout data)")
+            logger.info(f"Linear probe accuracy: {linear_acc:.3f}")
 
-            # Save the probe for use as KS3 proxy scorer
+            # 2. MLP probe (fallback if linear fails)
+            logger.info("\n--- MLP Probe (2-layer, 256 hidden) ---")
+            mlp_model, mlp_acc = train_mlp_probe(
+                dataset.hidden_states, progress_labels
+            )
+            logger.info(f"MLP probe accuracy: {mlp_acc:.3f}")
+
+            # Interpretation
+            logger.info("\n=== Interpretation ===")
+            if linear_acc > 0.65:
+                logger.info(f"LINEAR PROBE PASSES ({linear_acc:.3f} > 0.65). "
+                            "Signal is linearly separable — strong result.")
+                best_model = linear_model
+            elif mlp_acc > 0.65:
+                logger.info(f"Linear probe fails ({linear_acc:.3f}) but MLP PASSES ({mlp_acc:.3f} > 0.65). "
+                            "Signal exists but needs nonlinear decoding — still viable for our 2-layer value function.")
+                best_model = mlp_model
+            else:
+                logger.warning(f"BOTH PROBES FAIL (linear={linear_acc:.3f}, mlp={mlp_acc:.3f}). "
+                               "Hidden states may not encode task progress. "
+                               "Consider: different pooling strategy, per-token features, or deeper probe. "
+                               "The search hypothesis is in trouble.")
+                best_model = mlp_model  # save anyway for inspection
+
+            logger.info("(Real success/failure probe needs Week 2 rollout data with actual failures)")
+
+            # Save the best probe for use as KS3 proxy scorer
             import pickle
-            probe_path = output_dir / "linear_probe.pkl"
+            probe_path = output_dir / "best_probe.pkl"
             with open(probe_path, "wb") as f:
-                pickle.dump(probe_model, f)
-            logger.info(f"Saved linear probe to {probe_path}")
+                pickle.dump(best_model, f)
+            logger.info(f"Saved best probe to {probe_path}")
         else:
             logger.warning("Not enough label diversity for probe — skipping")
 
