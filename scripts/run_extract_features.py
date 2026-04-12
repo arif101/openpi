@@ -26,7 +26,9 @@ from openpi.models import pi0_config
 from openpi.shared import download
 from openpi.training import config as train_config
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging AFTER all imports so JAX/absl can't overwrite our handler.
+# force=True removes any handlers that JAX/absl installed on the root logger.
+logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger(__name__)
 
 
