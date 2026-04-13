@@ -108,6 +108,7 @@ def train_ranking_probe(
     num_epochs: int = 50,
     batch_size: int = 256,
     lr: float = 1e-3,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> tuple[RankingMLP, float]:
     """Train a pairwise ranking probe with Bradley-Terry loss.
 
@@ -121,11 +122,13 @@ def train_ranking_probe(
         num_epochs: Training epochs.
         batch_size: Batch size.
         lr: Learning rate.
+        device: Training device.
 
     Returns:
         Tuple of (trained_model, val_ranking_accuracy).
     """
     input_dim = hidden_states.shape[1]
+    logger.info(f"Training on device: {device}")
 
     # Build train and val pairs
     h_better_train, h_worse_train = build_ranking_pairs(
@@ -143,11 +146,15 @@ def train_ranking_probe(
     )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
-    model = RankingMLP(input_dim, hidden_dim)
+    model = RankingMLP(input_dim, hidden_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_val_acc = 0.0
     best_state = None
+
+    # Move val data to device once
+    val_better_t = torch.tensor(h_better_val, dtype=torch.float32, device=device)
+    val_worse_t = torch.tensor(h_worse_val, dtype=torch.float32, device=device)
 
     for epoch in range(num_epochs):
         # Train
@@ -155,6 +162,7 @@ def train_ranking_probe(
         epoch_loss = 0.0
         n_batches = 0
         for h_b, h_w in train_loader:
+            h_b, h_w = h_b.to(device), h_w.to(device)
             score_better = model(h_b)
             score_worse = model(h_w)
             # Bradley-Terry loss: -log sigmoid(score_better - score_worse)
@@ -168,8 +176,8 @@ def train_ranking_probe(
         # Validate: ranking accuracy on val pairs
         model.eval()
         with torch.no_grad():
-            val_better_scores = model(torch.tensor(h_better_val, dtype=torch.float32))
-            val_worse_scores = model(torch.tensor(h_worse_val, dtype=torch.float32))
+            val_better_scores = model(val_better_t)
+            val_worse_scores = model(val_worse_t)
             val_acc = (val_better_scores > val_worse_scores).float().mean().item()
 
         if val_acc > best_val_acc:
@@ -180,7 +188,7 @@ def train_ranking_probe(
             logger.info(f"  Epoch {epoch+1}/{num_epochs}: loss={epoch_loss/n_batches:.4f}, val_ranking_acc={val_acc:.3f}")
 
     model.load_state_dict(best_state)
-    model.eval()
+    model.cpu().eval()
     logger.info(f"Best val ranking accuracy: {best_val_acc:.3f}")
 
     return model, best_val_acc
