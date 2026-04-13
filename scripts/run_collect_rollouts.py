@@ -41,7 +41,6 @@ from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
-from openpi.contact_mpc.features.extractor import extract_features_from_dict
 from openpi.contact_mpc.features.dataset import FeatureDataset, detect_contact_timesteps
 from openpi.models import model as _model
 from openpi.models import pi0_config
@@ -105,7 +104,7 @@ def load_pi05_model(checkpoint_path: str):
     # JIT compile sample_actions for speed
     sample_actions_jit = nnx_utils.module_jit(model.sample_actions)
 
-    return model, sample_actions_jit, config
+    return model, sample_actions_jit
 
 
 def build_observation_dict(obs, task_description):
@@ -148,7 +147,7 @@ def main():
 
     # Load model
     print(f"Loading Pi0.5 model...", flush=True)
-    model, sample_actions_jit, config = load_pi05_model(args.checkpoint)
+    model, sample_actions_jit = load_pi05_model(args.checkpoint)
     rng = jax.random.key(0)
     print(f"Model loaded.", flush=True)
 
@@ -200,32 +199,25 @@ def main():
                 obs_dict, raw_state = build_observation_dict(obs, task_description)
 
                 if not action_plan:
-                    # Decision point: extract hidden state AND get actions
+                    # Decision point: get actions + hidden state in one VLM pass
                     t_start = time.time()
                     observation = _model.Observation.from_dict(obs_dict)
 
-                    # Extract hidden state (one VLM forward pass)
-                    t0 = time.time()
-                    h = extract_features_from_dict(model, obs_dict)  # [1, 2048]
-                    t_feat = time.time() - t0
-
-                    # Get new action chunk (second VLM forward pass)
-                    t0 = time.time()
                     rng, sample_rng = jax.random.split(rng)
-                    action_chunk = sample_actions_jit(sample_rng, observation)
+                    action_chunk, h = sample_actions_jit(sample_rng, observation, return_features=True)
                     action_chunk = np.asarray(action_chunk[0])  # [action_horizon, action_dim]
-                    t_action = time.time() - t0
+                    h = np.asarray(h[0], dtype=np.float32)  # [hidden_dim]
 
-                    # Record: hidden state + full action chunk + simulator timestep
+                    # Record: hidden state + action chunk + simulator timestep
                     episode_records.append({
-                        "hidden_state": h[0],  # [2048]
-                        "action_chunk": action_chunk[:args.replan_steps, :7].astype(np.float32),  # [replan_steps, 7]
+                        "hidden_state": h,
+                        "action_chunk": action_chunk[:args.replan_steps, :7].astype(np.float32),
                         "sim_timestep": t,
                     })
 
                     action_plan.extend(action_chunk[:args.replan_steps])
                     n_decisions = len(episode_records)
-                    print(f"    t={t} decision#{n_decisions}: features={t_feat:.2f}s actions={t_action:.2f}s total={time.time()-t_start:.2f}s", flush=True)
+                    print(f"    t={t} decision#{n_decisions}: {time.time()-t_start:.2f}s", flush=True)
 
                 action = action_plan.popleft()
                 obs, reward, done, info = env.step(action[:7].tolist())
