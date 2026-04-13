@@ -194,13 +194,15 @@ def main():
                 # Build observation
                 obs_dict, raw_state = build_observation_dict(obs, task_description)
 
-                # Extract hidden state
-                h = extract_features_from_dict(model, obs_dict)  # [1, 2048]
-                episode_hidden_states.append(h[0])
-
                 if not action_plan:
-                    # Get new action chunk from model
+                    # Decision point: extract hidden state AND get actions in one pass
                     observation = _model.Observation.from_dict(obs_dict)
+
+                    # Extract hidden state (one VLM forward pass)
+                    h = extract_features_from_dict(model, obs_dict)  # [1, 2048]
+                    episode_hidden_states.append(h[0])
+
+                    # Get new action chunk (second VLM forward pass — shares KV cache pattern but separate call)
                     rng, sample_rng = jax.random.split(rng)
                     action_chunk = sample_actions_jit(sample_rng, observation)
                     action_chunk = np.asarray(action_chunk[0])  # [action_horizon, action_dim]
