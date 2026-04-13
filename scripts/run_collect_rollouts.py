@@ -56,7 +56,7 @@ MAX_STEPS = {
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", default="pi05_libero")
-    parser.add_argument("--checkpoint", default="gs://openpi-assets/checkpoints/pi05_libero/params")
+    parser.add_argument("--checkpoint", default="gs://openpi-assets/checkpoints/pi05_libero")
     parser.add_argument("--task-suite", default="libero_90")
     parser.add_argument("--num-trials", type=int, default=5)
     parser.add_argument("--num-steps-wait", type=int, default=10)
