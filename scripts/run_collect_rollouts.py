@@ -23,7 +23,13 @@ import pathlib
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 from openpi_client import image_tools
+
+# Allow torch.load to unpickle numpy arrays in LIBERO init state files
+# (PyTorch 2.7 defaults to weights_only=True which rejects numpy globals)
+_original_torch_load = torch.load
+torch.load = lambda *args, **kwargs: _original_torch_load(*args, **{**kwargs, "weights_only": False})
 
 # These imports require LIBERO to be installed
 from libero.libero import benchmark
