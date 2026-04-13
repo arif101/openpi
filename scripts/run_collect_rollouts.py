@@ -204,7 +204,7 @@ def main():
                     observation = _model.Observation.from_dict(obs_dict)
 
                     rng, sample_rng = jax.random.split(rng)
-                    action_chunk, h = sample_actions_jit(sample_rng, observation, return_features=True)
+                    action_chunk, h = sample_actions_jit(sample_rng, observation)
                     action_chunk = np.asarray(action_chunk[0])  # [action_horizon, action_dim]
                     h = np.asarray(h[0], dtype=np.float32)  # [hidden_dim]
 

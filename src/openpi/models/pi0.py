@@ -270,8 +270,7 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         target_state=None,
-        return_features: bool = False,
-    ) -> _model.Actions:
+    ) -> tuple[_model.Actions, at.Float[at.Array, "b d"]]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # If target_state not passed explicitly, read from observation (waypoint conditioning)
         if target_state is None:
@@ -287,7 +286,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, _unused), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
@@ -326,12 +325,10 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
 
-        if return_features:
-            # Mean-pool prefix hidden states over valid tokens (essentially free)
-            mask_expanded = prefix_mask[:, :, None].astype(prefix_out.dtype)
-            pooled = jnp.sum(prefix_out * mask_expanded, axis=1) / jnp.maximum(
-                jnp.sum(mask_expanded, axis=1), 1.0
-            )
-            return x_0, pooled
-
-        return x_0
+        # Always compute pooled features (essentially free — one mean-pool).
+        # Avoids a Python if-branch that JAX can't trace inside JIT.
+        mask_expanded = prefix_mask[:, :, None].astype(prefix_out.dtype)
+        pooled = jnp.sum(prefix_out * mask_expanded, axis=1) / jnp.maximum(
+            jnp.sum(mask_expanded, axis=1), 1.0
+        )
+        return x_0, pooled

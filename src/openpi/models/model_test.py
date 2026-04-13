@@ -20,8 +20,10 @@ def test_pi0_model():
     loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
     assert loss.shape == (batch_size, config.action_horizon)
 
-    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
+    actions, features = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+    assert features.shape[0] == batch_size
+    assert features.ndim == 2
 
 
 def test_pi0_lora_model():
@@ -35,8 +37,9 @@ def test_pi0_lora_model():
     loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
     assert loss.shape == (batch_size, config.action_horizon)
 
-    actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
+    actions, features = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+    assert features.shape[0] == batch_size
 
 
 def test_pi0_fast_model():
@@ -90,5 +93,6 @@ def test_model_restore():
     loss = model.compute_loss(key, obs, act)
     assert loss.shape == (batch_size, config.action_horizon)
 
-    actions = model.sample_actions(key, obs, num_steps=10)
+    actions, features = model.sample_actions(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+    assert features.shape[0] == batch_size

@@ -90,9 +90,12 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        # sample_actions returns (actions, features) for JAX models, just actions for PyTorch
+        actions = sample_result[0] if isinstance(sample_result, tuple) else sample_result
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
