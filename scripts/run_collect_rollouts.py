@@ -29,7 +29,11 @@ from openpi_client import image_tools
 # Allow torch.load to unpickle numpy arrays in LIBERO init state files
 # (PyTorch 2.7 defaults to weights_only=True which rejects numpy globals)
 _original_torch_load = torch.load
-torch.load = lambda *args, **kwargs: _original_torch_load(*args, **{**kwargs, "weights_only": False})
+def _patched_torch_load(*args, **kwargs):
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 
 # These imports require LIBERO to be installed
 from libero.libero import benchmark
@@ -180,8 +184,8 @@ def main():
             obs = env.set_init_state(initial_states[trial_idx])
             action_plan = collections.deque()
 
-            episode_hidden_states = []
-            episode_actions = []
+            # Each entry: (hidden_state, action_chunk, sim_timestep) at decision points only
+            episode_records = []  # list of (h, action_chunk, sim_t)
             done = False
             t = 0
 
@@ -195,22 +199,27 @@ def main():
                 obs_dict, raw_state = build_observation_dict(obs, task_description)
 
                 if not action_plan:
-                    # Decision point: extract hidden state AND get actions in one pass
+                    # Decision point: extract hidden state AND get actions
                     observation = _model.Observation.from_dict(obs_dict)
 
                     # Extract hidden state (one VLM forward pass)
                     h = extract_features_from_dict(model, obs_dict)  # [1, 2048]
-                    episode_hidden_states.append(h[0])
 
-                    # Get new action chunk (second VLM forward pass — shares KV cache pattern but separate call)
+                    # Get new action chunk (second VLM forward pass)
                     rng, sample_rng = jax.random.split(rng)
                     action_chunk = sample_actions_jit(sample_rng, observation)
                     action_chunk = np.asarray(action_chunk[0])  # [action_horizon, action_dim]
+
+                    # Record: hidden state + full action chunk + simulator timestep
+                    episode_records.append({
+                        "hidden_state": h[0],  # [2048]
+                        "action_chunk": action_chunk[:args.replan_steps, :7].astype(np.float32),  # [replan_steps, 7]
+                        "sim_timestep": t,
+                    })
+
                     action_plan.extend(action_chunk[:args.replan_steps])
 
                 action = action_plan.popleft()
-                episode_actions.append(action[:7].astype(np.float32))  # first 7 dims
-
                 obs, reward, done, info = env.step(action[:7].tolist())
                 if done:
                     total_successes += 1
@@ -220,14 +229,13 @@ def main():
             total_episodes += 1
             is_success = bool(done)
 
-            # Store episode data
-            ep_len = len(episode_hidden_states)
-            for step_idx in range(ep_len):
-                all_hidden_states.append(episode_hidden_states[step_idx])
-                all_actions.append(episode_actions[step_idx] if step_idx < len(episode_actions) else np.zeros(7, dtype=np.float32))
+            # Store episode data — one record per decision point
+            for rec in episode_records:
+                all_hidden_states.append(rec["hidden_state"])
+                all_actions.append(rec["action_chunk"])
                 all_episode_ids.append(episode_counter)
                 all_task_ids.append(task_id)
-                all_timesteps.append(step_idx)
+                all_timesteps.append(rec["sim_timestep"])
                 all_is_success.append(is_success)
 
             episode_counter += 1
@@ -247,12 +255,12 @@ def main():
     save_path = output_dir / f"rollouts_{args.task_suite}.npz"
     np.savez_compressed(
         save_path,
-        hidden_states=np.stack(all_hidden_states),
-        actions=np.stack(all_actions),
-        episode_ids=np.array(all_episode_ids),
-        task_ids=np.array(all_task_ids),
-        timesteps=np.array(all_timesteps),
-        is_success=np.array(all_is_success),
+        hidden_states=np.stack(all_hidden_states),  # [N, 2048]
+        action_chunks=np.stack(all_actions),  # [N, replan_steps, 7]
+        episode_ids=np.array(all_episode_ids),  # [N]
+        task_ids=np.array(all_task_ids),  # [N]
+        timesteps=np.array(all_timesteps),  # [N] — actual simulator timestep
+        is_success=np.array(all_is_success),  # [N]
     )
     print(f"Saved to {save_path}", flush=True)
 
