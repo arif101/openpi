@@ -1,17 +1,13 @@
-"""Collect Pi0.5 rollouts on LIBERO-90 with VLM hidden state extraction.
+"""Collect Pi0.5 rollouts on LIBERO with VLM hidden state extraction.
 
-Runs frozen Pi0.5 in the LIBERO simulator, records (hidden_state, action,
-success/failure) at every decision point. Output is used for:
-- Training the pairwise value function (success vs failure pairs)
-- Training F_pi0 (world model on Pi0.5's action distribution)
-- Re-evaluating KS3 with real success/failure signal
+Uses create_trained_policy to load the model with proper input/output
+transforms (normalization, tokenization, action unnormalization).
+Extracts VLM features from the policy's infer() output.
 
 Usage:
-    PYTHONPATH=/workspace/openpi/src /workspace/openpi/.venv/bin/python \
-        scripts/run_collect_rollouts.py \
-        --task-suite libero_90 \
-        --num-trials 5 \
-        --output-dir data/contact_mpc/rollouts
+    PYTHONPATH=/workspace/openpi/src:/workspace/openpi/third_party/libero \
+    /workspace/openpi/.venv/bin/python -u scripts/run_collect_rollouts.py \
+        --task-suite libero_90 --num-trials 5 --output-dir data/contact_mpc/rollouts
 """
 
 import argparse
@@ -25,10 +21,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from openpi_client import image_tools
 
 # Allow torch.load to unpickle numpy arrays in LIBERO init state files
-# (PyTorch 2.7 defaults to weights_only=True which rejects numpy globals)
 _original_torch_load = torch.load
 def _patched_torch_load(*args, **kwargs):
     if "weights_only" not in kwargs:
@@ -36,20 +30,15 @@ def _patched_torch_load(*args, **kwargs):
     return _original_torch_load(*args, **kwargs)
 torch.load = _patched_torch_load
 
-# These imports require LIBERO to be installed
 from libero.libero import benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+from openpi_client import image_tools
 
-from openpi.contact_mpc.features.dataset import FeatureDataset, detect_contact_timesteps
-from openpi.models import model as _model
-from openpi.models import pi0_config
-from openpi.shared import download
-from openpi.shared import nnx_utils
+from openpi.policies import policy_config
+from openpi.training import config as _config
 
-# Configure logging after all imports
 logging.basicConfig(level=logging.INFO, force=True)
-logger = logging.getLogger(__name__)
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
@@ -66,18 +55,20 @@ MAX_STEPS = {
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config-name", default="pi05_libero")
     parser.add_argument("--checkpoint", default="gs://openpi-assets/checkpoints/pi05_libero/params")
     parser.add_argument("--task-suite", default="libero_90")
-    parser.add_argument("--num-trials", type=int, default=5, help="Trials per task")
+    parser.add_argument("--num-trials", type=int, default=5)
     parser.add_argument("--num-steps-wait", type=int, default=10)
     parser.add_argument("--replan-steps", type=int, default=5)
     parser.add_argument("--output-dir", default="data/contact_mpc/rollouts")
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--max-tasks", type=int, default=None, help="Limit number of tasks (for debugging)")
+    parser.add_argument("--max-tasks", type=int, default=None)
     return parser.parse_args()
 
 
 def _quat2axisangle(quat):
+    quat = quat.copy()
     if quat[3] > 1.0:
         quat[3] = 1.0
     elif quat[3] < -1.0:
@@ -86,53 +77,6 @@ def _quat2axisangle(quat):
     if math.isclose(den, 0.0):
         return np.zeros(3)
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
-
-
-def load_pi05_model(checkpoint_path: str):
-    """Load frozen Pi0.5 and return model + jitted sample_actions."""
-    config = pi0_config.Pi0Config(
-        pi05=True,
-        action_horizon=10,
-        paligemma_variant="gemma_2b",
-        action_expert_variant="gemma_300m",
-    )
-    params_path = download.maybe_download(checkpoint_path)
-    params = _model.restore_params(params_path, dtype=jnp.bfloat16)
-    model = config.load(params)
-    model.eval()
-
-    # JIT compile sample_actions for speed
-    sample_actions_jit = nnx_utils.module_jit(model.sample_actions)
-
-    return model, sample_actions_jit
-
-
-def build_observation_dict(obs, task_description):
-    """Convert LIBERO observation to model input dict."""
-    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-    img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, RESIZE_SIZE, RESIZE_SIZE))
-    wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, RESIZE_SIZE, RESIZE_SIZE))
-
-    state = np.concatenate((
-        obs["robot0_eef_pos"],
-        _quat2axisangle(obs["robot0_eef_quat"]),
-        obs["robot0_gripper_qpos"],
-    ))
-
-    return {
-        "image": {
-            "base_0_rgb": img[np.newaxis],
-            "left_wrist_0_rgb": wrist_img[np.newaxis],
-            "right_wrist_0_rgb": np.zeros_like(img[np.newaxis]),
-        },
-        "image_mask": {
-            "base_0_rgb": np.array([True]),
-            "left_wrist_0_rgb": np.array([True]),
-            "right_wrist_0_rgb": np.array([True]),
-        },
-        "state": np.pad(state, (0, 32 - len(state)))[np.newaxis].astype(np.float32),
-    }, state
 
 
 def main():
@@ -145,11 +89,14 @@ def main():
     if max_steps is None:
         raise ValueError(f"Unknown task suite: {args.task_suite}")
 
-    # Load model
-    print(f"Loading Pi0.5 model...", flush=True)
-    model, sample_actions_jit = load_pi05_model(args.checkpoint)
-    rng = jax.random.key(0)
-    print(f"Model loaded.", flush=True)
+    # Load policy with proper transforms (normalization, tokenization, etc.)
+    print("Loading Pi0.5 policy with transforms...", flush=True)
+    train_config = _config.get_config(args.config_name)
+    policy = policy_config.create_trained_policy(
+        train_config,
+        args.checkpoint,
+    )
+    print("Policy loaded.", flush=True)
 
     # Initialize LIBERO
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -159,7 +106,7 @@ def main():
 
     # Collect rollouts
     all_hidden_states = []
-    all_actions = []
+    all_action_chunks = []
     all_episode_ids = []
     all_task_ids = []
     all_timesteps = []
@@ -174,8 +121,11 @@ def main():
         initial_states = task_suite.get_task_init_states(task_id)
 
         task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-        env_args = {"bddl_file_name": task_bddl_file, "camera_heights": LIBERO_ENV_RESOLUTION, "camera_widths": LIBERO_ENV_RESOLUTION}
-        env = OffScreenRenderEnv(**env_args)
+        env = OffScreenRenderEnv(
+            bddl_file_name=str(task_bddl_file),
+            camera_heights=LIBERO_ENV_RESOLUTION,
+            camera_widths=LIBERO_ENV_RESOLUTION,
+        )
         env.seed(args.seed)
         task_description = task.language
 
@@ -184,8 +134,7 @@ def main():
             obs = env.set_init_state(initial_states[trial_idx])
             action_plan = collections.deque()
 
-            # Each entry: (hidden_state, action_chunk, sim_timestep) at decision points only
-            episode_records = []  # list of (h, action_chunk, sim_t)
+            episode_records = []
             done = False
             t = 0
 
@@ -195,23 +144,39 @@ def main():
                     t += 1
                     continue
 
-                # Build observation
-                obs_dict, raw_state = build_observation_dict(obs, task_description)
-
                 if not action_plan:
-                    # Decision point: get actions + hidden state in one VLM pass
                     t_start = time.time()
-                    observation = _model.Observation.from_dict(obs_dict)
 
-                    rng, sample_rng = jax.random.split(rng)
-                    action_chunk, h = sample_actions_jit(sample_rng, observation)
-                    action_chunk = np.asarray(action_chunk[0])  # [action_horizon, action_dim]
-                    h = np.asarray(h[0], dtype=np.float32)  # [hidden_dim]
+                    # Build observation dict matching the eval script format
+                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    img = image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(img, RESIZE_SIZE, RESIZE_SIZE)
+                    )
+                    wrist_img = image_tools.convert_to_uint8(
+                        image_tools.resize_with_pad(wrist_img, RESIZE_SIZE, RESIZE_SIZE)
+                    )
+                    state = np.concatenate((
+                        obs["robot0_eef_pos"],
+                        _quat2axisangle(obs["robot0_eef_quat"]),
+                        obs["robot0_gripper_qpos"],
+                    ))
 
-                    # Record: hidden state + action chunk + simulator timestep
+                    # Call policy.infer() — handles all transforms
+                    element = {
+                        "observation/image": img,
+                        "observation/wrist_image": wrist_img,
+                        "observation/state": state,
+                        "prompt": str(task_description),
+                    }
+                    result = policy.infer(element)
+                    action_chunk = result["actions"]  # [action_horizon, 7] — already unnormalized
+                    h = result.get("vlm_features")  # [2048] or None
+
+                    # Record
                     episode_records.append({
-                        "hidden_state": h,
-                        "action_chunk": action_chunk[:args.replan_steps, :7].astype(np.float32),
+                        "hidden_state": h if h is not None else np.zeros(2048, dtype=np.float32),
+                        "action_chunk": action_chunk[:args.replan_steps].astype(np.float32),
                         "sim_timestep": t,
                     })
 
@@ -220,7 +185,7 @@ def main():
                     print(f"    t={t} decision#{n_decisions}: {time.time()-t_start:.2f}s", flush=True)
 
                 action = action_plan.popleft()
-                obs, reward, done, info = env.step(action[:7].tolist())
+                obs, reward, done, info = env.step(action.tolist())
                 if done:
                     total_successes += 1
                     break
@@ -229,10 +194,9 @@ def main():
             total_episodes += 1
             is_success = bool(done)
 
-            # Store episode data — one record per decision point
             for rec in episode_records:
                 all_hidden_states.append(rec["hidden_state"])
-                all_actions.append(rec["action_chunk"])
+                all_action_chunks.append(rec["action_chunk"])
                 all_episode_ids.append(episode_counter)
                 all_task_ids.append(task_id)
                 all_timesteps.append(rec["sim_timestep"])
@@ -247,20 +211,19 @@ def main():
 
         env.close()
 
-    # Save
     print(f"\nTotal: {total_episodes} episodes, {total_successes} successes "
           f"({total_successes/total_episodes*100:.1f}%)", flush=True)
-    print(f"Total hidden states: {len(all_hidden_states)}", flush=True)
+    print(f"Total decision points: {len(all_hidden_states)}", flush=True)
 
     save_path = output_dir / f"rollouts_{args.task_suite}.npz"
     np.savez_compressed(
         save_path,
-        hidden_states=np.stack(all_hidden_states),  # [N, 2048]
-        action_chunks=np.stack(all_actions),  # [N, replan_steps, 7]
-        episode_ids=np.array(all_episode_ids),  # [N]
-        task_ids=np.array(all_task_ids),  # [N]
-        timesteps=np.array(all_timesteps),  # [N] — actual simulator timestep
-        is_success=np.array(all_is_success),  # [N]
+        hidden_states=np.stack(all_hidden_states),
+        action_chunks=np.stack(all_action_chunks),
+        episode_ids=np.array(all_episode_ids),
+        task_ids=np.array(all_task_ids),
+        timesteps=np.array(all_timesteps),
+        is_success=np.array(all_is_success),
     )
     print(f"Saved to {save_path}", flush=True)
 

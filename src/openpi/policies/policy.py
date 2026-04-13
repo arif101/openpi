@@ -91,8 +91,11 @@ class Policy(BasePolicy):
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
-        # sample_actions returns (actions, features) for JAX models, just actions for PyTorch
-        actions = sample_result[0] if isinstance(sample_result, tuple) else sample_result
+        # sample_actions returns (actions, features) for JAX Pi0 models, just actions for PyTorch/FAST
+        if isinstance(sample_result, tuple):
+            actions, features = sample_result
+        else:
+            actions, features = sample_result, None
         outputs = {
             "state": inputs["state"],
             "actions": actions,
@@ -103,10 +106,18 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        # Extract features before output transforms (which only apply to actions/state)
+        if features is not None:
+            vlm_features = np.asarray(features[0], dtype=np.float32)
+        else:
+            vlm_features = None
+
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if vlm_features is not None:
+            outputs["vlm_features"] = vlm_features
         return outputs
 
     @property
