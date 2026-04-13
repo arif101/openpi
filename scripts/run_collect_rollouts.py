@@ -19,6 +19,7 @@ import collections
 import logging
 import math
 import pathlib
+import time
 
 import jax
 import jax.numpy as jnp
@@ -200,15 +201,20 @@ def main():
 
                 if not action_plan:
                     # Decision point: extract hidden state AND get actions
+                    t_start = time.time()
                     observation = _model.Observation.from_dict(obs_dict)
 
                     # Extract hidden state (one VLM forward pass)
+                    t0 = time.time()
                     h = extract_features_from_dict(model, obs_dict)  # [1, 2048]
+                    t_feat = time.time() - t0
 
                     # Get new action chunk (second VLM forward pass)
+                    t0 = time.time()
                     rng, sample_rng = jax.random.split(rng)
                     action_chunk = sample_actions_jit(sample_rng, observation)
                     action_chunk = np.asarray(action_chunk[0])  # [action_horizon, action_dim]
+                    t_action = time.time() - t0
 
                     # Record: hidden state + full action chunk + simulator timestep
                     episode_records.append({
@@ -218,6 +224,8 @@ def main():
                     })
 
                     action_plan.extend(action_chunk[:args.replan_steps])
+                    n_decisions = len(episode_records)
+                    print(f"    t={t} decision#{n_decisions}: features={t_feat:.2f}s actions={t_action:.2f}s total={time.time()-t_start:.2f}s", flush=True)
 
                 action = action_plan.popleft()
                 obs, reward, done, info = env.step(action[:7].tolist())
