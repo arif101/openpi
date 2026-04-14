@@ -1,23 +1,23 @@
-"""End-to-end MPC experiment: train world model, evaluate with value function, run on LIBERO.
+"""End-to-end MPC experiment with contact-triggered planning.
 
-This script does everything needed for the MPC test:
-1. Downloads features + rollouts from HF
-2. Trains a world model (small, H=10)
-3. Loads the trained value function
-4. Re-evaluates KS3 with the real value function
-5. Runs best-of-K MPC evaluation on LIBERO-90
+MPC only activates at contact events (gripper state change in the
+previous action chunk). Free-space decisions use K=1 (baseline speed).
+This makes MPC ~8x cheaper than running K=8 everywhere.
+
+Contact detection: if any action in the previous chunk had a gripper
+sign flip (action dim 6 crosses zero), the next decision is contact.
 
 Usage:
     PYTHONPATH=/workspace/openpi/src:/workspace/openpi/third_party/libero \
     /workspace/openpi/.venv/bin/python -u scripts/run_mpc_experiment.py \
-        --task-suite libero_90 --num-trials 5 --K 8 \
-        --output-dir data/contact_mpc/mpc_results
+        --task-suite libero_90 --num-trials 5 --K 8
 """
 
 import argparse
 import collections
 import math
 import pathlib
+import signal
 import time
 
 import jax
@@ -41,11 +41,10 @@ from huggingface_hub import hf_hub_download
 
 from openpi.contact_mpc.features.dataset import FeatureDataset
 from openpi.contact_mpc.world_model.architecture import LatentWorldModel, WorldModelConfig, SIZE_CONFIGS
-from openpi.contact_mpc.world_model.train import train_world_model, build_dataset_for_horizon
+from openpi.contact_mpc.world_model.train import train_world_model
 from openpi.contact_mpc.value_function.architecture import PairwiseValueFunction
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
-from openpi.models import model as _model
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
@@ -69,14 +68,15 @@ def parse_args():
     parser.add_argument("--num-trials", type=int, default=5)
     parser.add_argument("--num-steps-wait", type=int, default=10)
     parser.add_argument("--replan-steps", type=int, default=5)
-    parser.add_argument("--K", type=int, default=8, help="Number of candidate action chunks")
-    parser.add_argument("--wm-size", default="small", help="World model size: small, medium, large")
+    parser.add_argument("--K", type=int, default=8)
+    parser.add_argument("--wm-size", default="small")
     parser.add_argument("--wm-horizon", type=int, default=10)
     parser.add_argument("--output-dir", default="data/contact_mpc/mpc_results")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--max-tasks", type=int, default=None)
-    parser.add_argument("--skip-wm-train", action="store_true", help="Skip world model training (load from output-dir)")
-    parser.add_argument("--skip-eval", action="store_true", help="Only train world model, don't run LIBERO eval")
+    parser.add_argument("--skip-wm-train", action="store_true")
+    parser.add_argument("--episode-timeout", type=int, default=120, help="Max seconds per episode")
+    parser.add_argument("--mpc-everywhere", action="store_true", help="Run MPC at every decision, not just contact")
     return parser.parse_args()
 
 
@@ -89,68 +89,181 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
-def mpc_select_action(
-    policy,
-    obs_element: dict,
-    world_model: LatentWorldModel,
-    value_fn: PairwiseValueFunction,
-    K: int = 8,
-) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Sample K action chunks, predict futures, score, pick best.
+def detect_contact_in_chunk(action_chunk: np.ndarray) -> bool:
+    """Check if an action chunk contains a gripper sign change.
 
-    Args:
-        policy: The loaded Policy with transforms.
-        obs_element: Raw observation dict (observation/image, etc.)
-        world_model: Trained world model.
-        value_fn: Trained value function.
-        K: Number of candidates.
-
-    Returns:
-        Tuple of (best_action_chunk, best_features, info_dict).
+    Gripper command is the last dimension (index 6). A sign change
+    (positive → negative or vice versa) indicates a grasp or release.
     """
-    # Generate K candidates by calling policy.infer K times
-    # Each call uses a different internal RNG state
+    gripper_cmds = action_chunk[:, -1] if action_chunk.ndim == 2 else action_chunk[-1:]
+    for i in range(1, len(gripper_cmds)):
+        if (gripper_cmds[i] > 0) != (gripper_cmds[i-1] > 0):
+            return True
+    return False
+
+
+def mpc_select_action(policy, obs_element, world_model, value_fn, K=8):
+    """Sample K action chunks, predict futures via world model, score, pick best."""
     candidates = []
     features_list = []
     for _ in range(K):
-        result = policy.infer(dict(obs_element))  # copy to avoid mutation
-        candidates.append(result["actions"])  # [action_horizon, 7]
+        result = policy.infer(dict(obs_element))
+        candidates.append(result["actions"])
         if "vlm_features" in result and result["vlm_features"] is not None:
-            features_list.append(result["vlm_features"])  # [2048]
+            features_list.append(result["vlm_features"])
 
-    # If we have features and a world model, predict futures and score
     if features_list and world_model is not None:
         device = next(world_model.parameters()).device
         h_t = np.asarray(features_list[0], dtype=np.float32)
-        h_t_tensor = torch.tensor(h_t, dtype=torch.float32).unsqueeze(0).to(device)  # [1, 2048]
+        h_t_tensor = torch.tensor(h_t, dtype=torch.float32).unsqueeze(0).to(device)
 
         scores = []
-        for i, action_chunk in enumerate(candidates):
-            # Pad action chunk to world model's expected dims
+        for action_chunk in candidates:
             a = np.asarray(action_chunk[:world_model.config.max_horizon], dtype=np.float32)
             if a.shape[0] < world_model.config.max_horizon:
                 a = np.pad(a, [(0, world_model.config.max_horizon - a.shape[0]), (0, 0)])
-            a_tensor = torch.tensor(a, dtype=torch.float32).unsqueeze(0).to(device)  # [1, H, 7]
-
+            a_tensor = torch.tensor(a, dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
-                predicted_future = world_model(h_t_tensor, a_tensor)  # [1, 2048]
+                predicted_future = world_model(h_t_tensor, a_tensor)
                 score = value_fn(predicted_future).item()
             scores.append(score)
 
-        best_idx = np.argmax(scores)
-        info = {
-            "scores": scores,
-            "best_idx": best_idx,
-            "best_score": scores[best_idx],
-            "worst_score": min(scores),
-            "score_spread": max(scores) - min(scores),
-        }
+        best_idx = int(np.argmax(scores))
+        spread = max(scores) - min(scores)
     else:
-        # Fallback: random selection
         best_idx = 0
-        info = {"scores": [], "best_idx": 0, "score_spread": 0.0}
+        scores = []
+        spread = 0.0
 
-    return candidates[best_idx], features_list[0] if features_list else None, info
+    return candidates[best_idx], {
+        "best_idx": best_idx,
+        "score_spread": spread,
+        "scores": scores,
+    }
+
+
+def run_episodes(policy, world_model, value_fn, task_suite, args, K, mode_name):
+    """Run episodes with given K. Returns results dict."""
+    num_tasks = args.max_tasks or task_suite.n_tasks
+    max_steps = MAX_STEPS[args.task_suite]
+
+    total_episodes = 0
+    total_successes = 0
+    task_results = {}
+    all_score_spreads = []
+    contact_decisions = 0
+    total_decisions = 0
+
+    for task_id in range(num_tasks):
+        task = task_suite.get_task(task_id)
+        initial_states = task_suite.get_task_init_states(task_id)
+        task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+        env = OffScreenRenderEnv(
+            bddl_file_name=str(task_bddl_file),
+            camera_heights=LIBERO_ENV_RESOLUTION,
+            camera_widths=LIBERO_ENV_RESOLUTION,
+        )
+        env.seed(args.seed)
+        task_description = task.language
+        task_successes = 0
+
+        for trial_idx in range(min(args.num_trials, len(initial_states))):
+            env.reset()
+            obs = env.set_init_state(initial_states[trial_idx])
+            action_plan = collections.deque()
+            done = False
+            t = 0
+            last_action_chunk = None
+            episode_start = time.time()
+
+            while t < max_steps + args.num_steps_wait:
+                # Episode timeout
+                if time.time() - episode_start > args.episode_timeout:
+                    print(f"    TIMEOUT at t={t}", flush=True)
+                    break
+
+                if t < args.num_steps_wait:
+                    obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                    t += 1
+                    continue
+
+                if not action_plan:
+                    total_decisions += 1
+
+                    # Build observation
+                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, RESIZE_SIZE, RESIZE_SIZE))
+                    wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, RESIZE_SIZE, RESIZE_SIZE))
+                    state = np.concatenate((
+                        obs["robot0_eef_pos"],
+                        _quat2axisangle(obs["robot0_eef_quat"]),
+                        obs["robot0_gripper_qpos"],
+                    ))
+                    element = {
+                        "observation/image": img,
+                        "observation/wrist_image": wrist_img,
+                        "observation/state": state,
+                        "prompt": str(task_description),
+                    }
+
+                    # Decide: use MPC or baseline?
+                    use_mpc = False
+                    if K > 1:
+                        if args.mpc_everywhere:
+                            use_mpc = True
+                        elif last_action_chunk is not None and detect_contact_in_chunk(last_action_chunk):
+                            use_mpc = True
+                            contact_decisions += 1
+
+                    if use_mpc:
+                        action_chunk, mpc_info = mpc_select_action(
+                            policy, element, world_model, value_fn, K=K
+                        )
+                        all_score_spreads.append(mpc_info["score_spread"])
+                    else:
+                        result = policy.infer(element)
+                        action_chunk = result["actions"]
+
+                    last_action_chunk = action_chunk
+                    action_plan.extend(action_chunk[:args.replan_steps])
+
+                action = action_plan.popleft()
+                obs, reward, done, info = env.step(action.tolist())
+                if done:
+                    total_successes += 1
+                    task_successes += 1
+                    break
+                t += 1
+
+            total_episodes += 1
+
+        task_results[task_id] = {
+            "task": task_description,
+            "successes": task_successes,
+            "trials": min(args.num_trials, len(initial_states)),
+            "rate": task_successes / min(args.num_trials, len(initial_states)),
+        }
+        env.close()
+
+        if (task_id + 1) % 10 == 0 or task_id == num_tasks - 1:
+            rate = total_successes / total_episodes * 100 if total_episodes > 0 else 0
+            spread_str = f", mean_spread={np.mean(all_score_spreads):.4f}" if all_score_spreads else ""
+            contact_str = f", contact_decisions={contact_decisions}/{total_decisions}" if K > 1 and not args.mpc_everywhere else ""
+            print(f"  [{mode_name}] Tasks: {task_id+1}/{num_tasks}, "
+                  f"Episodes: {total_episodes}, "
+                  f"Successes: {total_successes} ({rate:.1f}%)"
+                  f"{spread_str}{contact_str}", flush=True)
+
+    return {
+        "total_episodes": total_episodes,
+        "total_successes": total_successes,
+        "success_rate": total_successes / total_episodes * 100 if total_episodes > 0 else 0,
+        "task_results": task_results,
+        "mean_score_spread": float(np.mean(all_score_spreads)) if all_score_spreads else 0,
+        "contact_decisions": contact_decisions,
+        "total_decisions": total_decisions,
+    }
 
 
 def main():
@@ -159,11 +272,10 @@ def main():
     output_dir = pathlib.Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    max_steps = MAX_STEPS.get(args.task_suite)
-    if max_steps is None:
+    if args.task_suite not in MAX_STEPS:
         raise ValueError(f"Unknown task suite: {args.task_suite}")
 
-    # === Step 1: Train world model on demo features ===
+    # === Step 1: Train or load world model ===
     wm_path = output_dir / "world_model.pt"
     wm_config_path = output_dir / "world_model_config.pt"
 
@@ -172,41 +284,36 @@ def main():
         wm_config = torch.load(str(wm_config_path), weights_only=False)
         world_model = LatentWorldModel(wm_config)
         world_model.load_state_dict(torch.load(str(wm_path), weights_only=True))
-        world_model.eval()
-        if torch.cuda.is_available():
-            world_model = world_model.cuda()
     else:
         print("=== Training World Model ===", flush=True)
         features_path = hf_hub_download(args.hf_repo, "libero90_features_H10.npz", repo_type="dataset")
         features = FeatureDataset.load(features_path)
-        print(f"Loaded {features.hidden_states.shape[0]} demo triples", flush=True)
-
         world_model, wm_metrics = train_world_model(
             features, horizon=args.wm_horizon, size=args.wm_size,
             num_epochs=100, batch_size=64, lr=1e-4,
         )
         torch.save(world_model.state_dict(), wm_path)
         torch.save(world_model.config, wm_config_path)
-        if torch.cuda.is_available():
-            world_model = world_model.cuda()
-        print(f"World model trained: {wm_metrics['param_count']:,} params, "
-              f"val_loss={wm_metrics['val_loss_best']:.6f}", flush=True)
+        print(f"World model: {wm_metrics['param_count']:,} params, val_loss={wm_metrics['val_loss_best']:.6f}", flush=True)
+
+    world_model.eval()
+    if torch.cuda.is_available():
+        world_model = world_model.cuda()
 
     # === Step 2: Load value function ===
     print("\n=== Loading Value Function ===", flush=True)
-    vf_path = output_dir.parent / "value_function" / "value_function.pt"
-    if not vf_path.exists():
-        # Try to find it
-        for candidate in [
-            pathlib.Path("data/contact_mpc/value_function/value_function.pt"),
-            output_dir / "value_function.pt",
-        ]:
-            if candidate.exists():
-                vf_path = candidate
-                break
-
-    if not vf_path.exists():
-        print("ERROR: Value function not found. Train it first with run_train_value_function.py", flush=True)
+    vf_candidates = [
+        output_dir.parent / "value_function" / "value_function.pt",
+        pathlib.Path("data/contact_mpc/value_function/value_function.pt"),
+        output_dir / "value_function.pt",
+    ]
+    vf_path = None
+    for p in vf_candidates:
+        if p.exists():
+            vf_path = p
+            break
+    if vf_path is None:
+        print("ERROR: Value function not found.", flush=True)
         return
 
     vf_config = torch.load(str(vf_path).replace("value_function.pt", "value_function_config.pt"), weights_only=False)
@@ -217,151 +324,63 @@ def main():
         value_fn = value_fn.cuda()
     print(f"Loaded value function: {value_fn.param_count():,} params", flush=True)
 
-    if args.skip_eval:
-        print("Skipping LIBERO evaluation (--skip-eval)", flush=True)
-        return
-
     # === Step 3: Load Pi0.5 policy ===
     print("\n=== Loading Pi0.5 Policy ===", flush=True)
     from openpi.shared import download
-    download.maybe_download(args.checkpoint + "/assets")  # Ensure assets are downloaded
+    download.maybe_download(args.checkpoint + "/assets")
     train_config = _config.get_config(args.config_name)
     policy = _policy_config.create_trained_policy(train_config, args.checkpoint)
     print("Policy loaded.", flush=True)
 
-    # === Step 4: Run MPC evaluation on LIBERO ===
-    print(f"\n=== MPC Evaluation: K={args.K}, {args.task_suite} ===", flush=True)
+    # === Step 4: Initialize LIBERO ===
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite]()
-    num_tasks = args.max_tasks or task_suite.n_tasks
 
-    # Run both baseline (K=1) and MPC (K=args.K) for comparison
-    results = {}
+    # === Step 5: Run baseline ===
+    print(f"\n{'='*60}", flush=True)
+    print(f"Running baseline (K=1) on {args.task_suite}", flush=True)
+    print(f"{'='*60}", flush=True)
+    baseline = run_episodes(policy, world_model, value_fn, task_suite, args, K=1, mode_name="baseline")
 
-    for mode, K in [("baseline", 1), ("mpc", args.K)]:
-        print(f"\n--- Running {mode} (K={K}) ---", flush=True)
-        total_episodes = 0
-        total_successes = 0
-        task_results = {}
-        all_score_spreads = []
+    # === Step 6: Run MPC ===
+    trigger_mode = "everywhere" if args.mpc_everywhere else "contact-only"
+    print(f"\n{'='*60}", flush=True)
+    print(f"Running MPC (K={args.K}, trigger={trigger_mode}) on {args.task_suite}", flush=True)
+    print(f"{'='*60}", flush=True)
+    mpc = run_episodes(policy, world_model, value_fn, task_suite, args, K=args.K, mode_name="mpc")
 
-        for task_id in range(num_tasks):
-            task = task_suite.get_task(task_id)
-            initial_states = task_suite.get_task_init_states(task_id)
-            task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-            env = OffScreenRenderEnv(
-                bddl_file_name=str(task_bddl_file),
-                camera_heights=LIBERO_ENV_RESOLUTION,
-                camera_widths=LIBERO_ENV_RESOLUTION,
-            )
-            env.seed(args.seed)
-            task_description = task.language
-            task_successes = 0
-
-            for trial_idx in range(min(args.num_trials, len(initial_states))):
-                env.reset()
-                obs = env.set_init_state(initial_states[trial_idx])
-                action_plan = collections.deque()
-                done = False
-                t = 0
-
-                while t < max_steps + args.num_steps_wait:
-                    if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
-                        t += 1
-                        continue
-
-                    if not action_plan:
-                        # Build observation
-                        img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                        wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                        img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, RESIZE_SIZE, RESIZE_SIZE))
-                        wrist_img = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_img, RESIZE_SIZE, RESIZE_SIZE))
-                        state = np.concatenate((
-                            obs["robot0_eef_pos"],
-                            _quat2axisangle(obs["robot0_eef_quat"]),
-                            obs["robot0_gripper_qpos"],
-                        ))
-                        element = {
-                            "observation/image": img,
-                            "observation/wrist_image": wrist_img,
-                            "observation/state": state,
-                            "prompt": str(task_description),
-                        }
-
-                        if K == 1:
-                            # Baseline: single action chunk
-                            result = policy.infer(element)
-                            action_chunk = result["actions"]
-                        else:
-                            # MPC: sample K, score with world model + value function
-                            action_chunk, _, mpc_info = mpc_select_action(
-                                policy, element, world_model, value_fn, K=K
-                            )
-                            all_score_spreads.append(mpc_info["score_spread"])
-
-                        action_plan.extend(action_chunk[:args.replan_steps])
-
-                    action = action_plan.popleft()
-                    obs, reward, done, info = env.step(action.tolist())
-                    if done:
-                        total_successes += 1
-                        task_successes += 1
-                        break
-                    t += 1
-
-                total_episodes += 1
-
-            task_results[task_id] = {
-                "task": task_description,
-                "successes": task_successes,
-                "trials": min(args.num_trials, len(initial_states)),
-                "rate": task_successes / min(args.num_trials, len(initial_states)),
-            }
-            env.close()
-
-            if (task_id + 1) % 10 == 0:
-                print(f"  Tasks: {task_id+1}/{num_tasks}, "
-                      f"Episodes: {total_episodes}, "
-                      f"Successes: {total_successes} ({total_successes/total_episodes*100:.1f}%)",
-                      flush=True)
-
-        rate = total_successes / total_episodes * 100
-        results[mode] = {
-            "total_episodes": total_episodes,
-            "total_successes": total_successes,
-            "success_rate": rate,
-            "task_results": task_results,
-            "mean_score_spread": np.mean(all_score_spreads) if all_score_spreads else 0,
-        }
-        print(f"\n{mode.upper()}: {total_successes}/{total_episodes} ({rate:.1f}%)", flush=True)
-
-    # === Step 5: Report ===
+    # === Step 7: Report ===
     print(f"\n{'='*60}", flush=True)
     print("FINAL RESULTS", flush=True)
     print(f"{'='*60}", flush=True)
-    baseline_rate = results["baseline"]["success_rate"]
-    mpc_rate = results["mpc"]["success_rate"]
-    print(f"Baseline (K=1): {baseline_rate:.1f}%", flush=True)
-    print(f"MPC (K={args.K}):     {mpc_rate:.1f}%", flush=True)
-    print(f"Improvement:    {mpc_rate - baseline_rate:+.1f} percentage points", flush=True)
-    if results["mpc"]["mean_score_spread"] > 0:
-        print(f"Mean score spread across K={args.K} candidates: {results['mpc']['mean_score_spread']:.4f}", flush=True)
+    print(f"Baseline (K=1):           {baseline['success_rate']:.1f}% ({baseline['total_successes']}/{baseline['total_episodes']})", flush=True)
+    print(f"MPC (K={args.K}, {trigger_mode}): {mpc['success_rate']:.1f}% ({mpc['total_successes']}/{mpc['total_episodes']})", flush=True)
+    print(f"Improvement:              {mpc['success_rate'] - baseline['success_rate']:+.1f} percentage points", flush=True)
+    if mpc["mean_score_spread"] > 0:
+        print(f"Mean score spread:        {mpc['mean_score_spread']:.4f}", flush=True)
+    if mpc["contact_decisions"] > 0:
+        print(f"Contact decisions:        {mpc['contact_decisions']}/{mpc['total_decisions']} "
+              f"({mpc['contact_decisions']/mpc['total_decisions']*100:.1f}%)", flush=True)
 
     # Per-task comparison
     print(f"\nPer-task breakdown (tasks where results differ):", flush=True)
-    for tid in sorted(results["baseline"]["task_results"].keys()):
-        b = results["baseline"]["task_results"][tid]
-        m = results["mpc"]["task_results"][tid]
+    for tid in sorted(baseline["task_results"].keys()):
+        b = baseline["task_results"][tid]
+        m = mpc["task_results"][tid]
         if b["rate"] != m["rate"]:
-            print(f"  Task {tid} ({b['task'][:50]}): baseline={b['rate']:.0%} → mpc={m['rate']:.0%}", flush=True)
+            delta = m["rate"] - b["rate"]
+            print(f"  Task {tid}: baseline={b['rate']:.0%} → mpc={m['rate']:.0%} ({delta:+.0%}) | {b['task'][:60]}", flush=True)
 
-    # Save results
+    # Save
     np.savez(
         output_dir / "mpc_results.npz",
-        baseline_rate=baseline_rate,
-        mpc_rate=mpc_rate,
+        baseline_rate=baseline["success_rate"],
+        mpc_rate=mpc["success_rate"],
         K=args.K,
+        trigger_mode=trigger_mode,
+        mean_score_spread=mpc["mean_score_spread"],
+        contact_decisions=mpc["contact_decisions"],
+        total_decisions=mpc["total_decisions"],
     )
     print(f"\nSaved to {output_dir}/mpc_results.npz", flush=True)
 
