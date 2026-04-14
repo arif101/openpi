@@ -77,6 +77,7 @@ def parse_args():
     parser.add_argument("--skip-wm-train", action="store_true")
     parser.add_argument("--episode-timeout", type=int, default=120, help="Max seconds per episode")
     parser.add_argument("--mpc-everywhere", action="store_true", help="Run MPC at every decision, not just contact")
+    parser.add_argument("--skip-baseline", action="store_true", help="Skip baseline run, use known 28.9% rate")
     return parser.parse_args()
 
 
@@ -336,11 +337,20 @@ def main():
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite]()
 
-    # === Step 5: Run baseline ===
-    print(f"\n{'='*60}", flush=True)
-    print(f"Running baseline (K=1) on {args.task_suite}", flush=True)
-    print(f"{'='*60}", flush=True)
-    baseline = run_episodes(policy, world_model, value_fn, task_suite, args, K=1, mode_name="baseline")
+    # === Step 5: Run baseline (or skip) ===
+    if args.skip_baseline:
+        print(f"\nSkipping baseline (using known rates: libero_90=28.9%, libero_10=93.3%)", flush=True)
+        known_rates = {"libero_90": 28.9, "libero_10": 93.3}
+        baseline = {
+            "success_rate": known_rates.get(args.task_suite, 0),
+            "total_successes": 0,
+            "total_episodes": 0,
+        }
+    else:
+        print(f"\n{'='*60}", flush=True)
+        print(f"Running baseline (K=1) on {args.task_suite}", flush=True)
+        print(f"{'='*60}", flush=True)
+        baseline = run_episodes(policy, world_model, value_fn, task_suite, args, K=1, mode_name="baseline")
 
     # === Step 6: Run MPC ===
     trigger_mode = "everywhere" if args.mpc_everywhere else "contact-only"
@@ -353,7 +363,12 @@ def main():
     print(f"\n{'='*60}", flush=True)
     print("FINAL RESULTS", flush=True)
     print(f"{'='*60}", flush=True)
-    print(f"Baseline (K=1):           {baseline['success_rate']:.1f}% ({baseline['total_successes']}/{baseline['total_episodes']})", flush=True)
+    baseline_str = f"{baseline['success_rate']:.1f}%"
+    if baseline['total_episodes'] > 0:
+        baseline_str += f" ({baseline['total_successes']}/{baseline['total_episodes']})"
+    else:
+        baseline_str += " (known)"
+    print(f"Baseline (K=1):           {baseline_str}", flush=True)
     print(f"MPC (K={args.K}, {trigger_mode}): {mpc['success_rate']:.1f}% ({mpc['total_successes']}/{mpc['total_episodes']})", flush=True)
     print(f"Improvement:              {mpc['success_rate'] - baseline['success_rate']:+.1f} percentage points", flush=True)
     if mpc["mean_score_spread"] > 0:
