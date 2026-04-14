@@ -120,16 +120,17 @@ def mpc_select_action(
 
     # If we have features and a world model, predict futures and score
     if features_list and world_model is not None:
-        h_t = features_list[0]  # All K share the same observation → same hidden state
-        h_t_tensor = torch.tensor(h_t, dtype=torch.float32).unsqueeze(0)  # [1, 2048]
+        device = next(world_model.parameters()).device
+        h_t = np.asarray(features_list[0], dtype=np.float32)
+        h_t_tensor = torch.tensor(h_t, dtype=torch.float32).unsqueeze(0).to(device)  # [1, 2048]
 
         scores = []
         for i, action_chunk in enumerate(candidates):
             # Pad action chunk to world model's expected dims
-            a = action_chunk[:world_model.config.max_horizon]  # [H, 7]
+            a = np.asarray(action_chunk[:world_model.config.max_horizon], dtype=np.float32)
             if a.shape[0] < world_model.config.max_horizon:
                 a = np.pad(a, [(0, world_model.config.max_horizon - a.shape[0]), (0, 0)])
-            a_tensor = torch.tensor(a, dtype=torch.float32).unsqueeze(0)  # [1, H, 7]
+            a_tensor = torch.tensor(a, dtype=torch.float32).unsqueeze(0).to(device)  # [1, H, 7]
 
             with torch.no_grad():
                 predicted_future = world_model(h_t_tensor, a_tensor)  # [1, 2048]
@@ -172,6 +173,8 @@ def main():
         world_model = LatentWorldModel(wm_config)
         world_model.load_state_dict(torch.load(str(wm_path), weights_only=True))
         world_model.eval()
+        if torch.cuda.is_available():
+            world_model = world_model.cuda()
     else:
         print("=== Training World Model ===", flush=True)
         features_path = hf_hub_download(args.hf_repo, "libero90_features_H10.npz", repo_type="dataset")
@@ -184,6 +187,8 @@ def main():
         )
         torch.save(world_model.state_dict(), wm_path)
         torch.save(world_model.config, wm_config_path)
+        if torch.cuda.is_available():
+            world_model = world_model.cuda()
         print(f"World model trained: {wm_metrics['param_count']:,} params, "
               f"val_loss={wm_metrics['val_loss_best']:.6f}", flush=True)
 
@@ -208,6 +213,8 @@ def main():
     value_fn = PairwiseValueFunction(vf_config["input_dim"], vf_config["hidden_dim"])
     value_fn.load_state_dict(torch.load(str(vf_path), weights_only=True))
     value_fn.eval()
+    if torch.cuda.is_available():
+        value_fn = value_fn.cuda()
     print(f"Loaded value function: {value_fn.param_count():,} params", flush=True)
 
     if args.skip_eval:
