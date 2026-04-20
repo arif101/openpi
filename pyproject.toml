@@ -74,6 +74,10 @@ libero = [
     "h5py",
     "thop",
     "termcolor",
+    "gym",
+    "cloudpickle",
+    "gdown",
+    "seaborn",
 ]
 
 [tool.uv]
