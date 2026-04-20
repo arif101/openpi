@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>VLA Continuous Improvement — Demo</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  html { scroll-behavior: smooth; }
+  .card { @apply bg-white rounded-2xl shadow-sm border border-slate-200 p-6; }
+  .pill { @apply inline-block px-2 py-0.5 rounded-full text-xs font-medium; }
+  .pill-planning { @apply bg-sky-100 text-sky-800; }
+  .pill-skill { @apply bg-amber-100 text-amber-800; }
+  .pill-perception { @apply bg-violet-100 text-violet-800; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+
+<header class="bg-slate-900 text-white">
+  <div class="max-w-6xl mx-auto px-6 py-5 flex items-center justify-between">
+    <div>
+      <div class="text-xs uppercase tracking-widest text-slate-400">VLA Continuous Improvement</div>
+      <h1 class="text-2xl font-semibold">Attribution → Candidate → Simulate → Ship</h1>
+    </div>
+    <div class="text-sm text-slate-300">
+      Powered by Pi0.5 &middot; latent world model &middot; Claude Sonnet 4.6
+    </div>
+  </div>
+  <nav class="bg-slate-800">
+    <div class="max-w-6xl mx-auto px-6 flex gap-5 text-sm">
+      <a href="#scene" class="py-3 hover:text-sky-300">1 &middot; The problem</a>
+      <a href="#attribution" class="py-3 hover:text-sky-300">2 &middot; Attribution</a>
+      <a href="#candidates" class="py-3 hover:text-sky-300">3 &middot; Candidates</a>
+      <a href="#simulate" class="py-3 hover:text-sky-300">4 &middot; Simulate</a>
+      <a href="#validate" class="py-3 hover:text-sky-300">5 &middot; Validate</a>
+    </div>
+  </nav>
+</header>
+
+<main class="max-w-6xl mx-auto px-6 py-10 space-y-10">
+
+  <!-- SECTION 1: The problem -->
+  <section id="scene" class="card">
+    <div class="flex items-start justify-between">
+      <div>
+        <h2 class="text-xl font-semibold">Pi0.5 on LIBERO-90</h2>
+        <p class="text-slate-600 mt-1">
+          Your fleet is running the open-source Pi0.5 policy on 90 unseen tasks.
+          After 450 rollouts, 320 episodes failed. They're sitting in your log bucket.
+        </p>
+      </div>
+      <div class="text-right">
+        <div class="text-5xl font-semibold text-slate-900" id="stat-overall">—</div>
+        <div class="text-xs uppercase text-slate-500 tracking-widest">Overall success rate</div>
+      </div>
+    </div>
+    <div class="grid grid-cols-3 gap-4 mt-6">
+      <div class="rounded-xl bg-slate-100 p-4">
+        <div class="text-xs uppercase text-slate-500">Total episodes</div>
+        <div class="text-2xl font-semibold" id="stat-total">—</div>
+      </div>
+      <div class="rounded-xl bg-emerald-50 p-4">
+        <div class="text-xs uppercase text-emerald-700">Successes</div>
+        <div class="text-2xl font-semibold text-emerald-800" id="stat-success">—</div>
+      </div>
+      <div class="rounded-xl bg-rose-50 p-4">
+        <div class="text-xs uppercase text-rose-700">Failures</div>
+        <div class="text-2xl font-semibold text-rose-800" id="stat-failure">—</div>
+      </div>
+    </div>
+    <p class="mt-5 text-sm text-slate-600">
+      Today: an ML engineer spends days triaging these. Tomorrow: this dashboard
+      decomposes, proposes, simulates, and ships improvements &mdash; without a single real-robot rollout.
+    </p>
+  </section>
+
+  <!-- SECTION 2: Attribution -->
+  <section id="attribution" class="card">
+    <h2 class="text-xl font-semibold">Failure attribution</h2>
+    <p class="text-slate-600 mt-1">
+      Claude Sonnet 4.6 watches each failed rollout and classifies the failure.
+      320 failures attributed in ~15 minutes, ~<span id="cost-total" class="font-semibold">$0</span>.
+    </p>
+    <div class="grid grid-cols-5 gap-6 mt-6">
+      <div class="col-span-2">
+        <canvas id="taxonomy-chart" height="220"></canvas>
+      </div>
+      <div class="col-span-3 text-sm">
+        <div class="mb-3 text-xs uppercase tracking-widest text-slate-500">Sample attribution</div>
+        <div class="rounded-lg border border-slate-200 p-4 bg-slate-50" id="sample-attribution">
+          <div class="text-slate-500">Loading…</div>
+        </div>
+        <button class="mt-3 px-3 py-1.5 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700"
+                onclick="showNextSample()">Next example →</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- SECTION 3: Candidates -->
+  <section id="candidates" class="card">
+    <h2 class="text-xl font-semibold">Cluster-targeted LoRA candidates</h2>
+    <p class="text-slate-600 mt-1">
+      Failures cluster naturally along the taxonomy. We fine-tune one LoRA patch per cluster
+      on matched-task success trajectories.
+    </p>
+    <div class="mt-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" id="cluster-cards"></div>
+  </section>
+
+  <!-- SECTION 4: Simulate -->
+  <section id="simulate" class="card">
+    <h2 class="text-xl font-semibold">Offline simulation via latent world model</h2>
+    <p class="text-slate-600 mt-1">
+      Our 2048-dim latent world model rolls each candidate forward on 50 held-out initial states.
+      The value function ranks them &mdash; no real-robot rollouts required.
+    </p>
+    <div class="mt-6">
+      <canvas id="ranking-chart" height="150"></canvas>
+    </div>
+    <p class="mt-4 text-xs text-slate-500">
+      Scores are relative within this run (the value function was trained on 19 tasks and memorizes task identity; we use it only for candidate ranking, its strong regime).
+    </p>
+  </section>
+
+  <!-- SECTION 5: Validate -->
+  <section id="validate" class="card">
+    <h2 class="text-xl font-semibold">Validation &mdash; imagined vs real</h2>
+    <p class="text-slate-600 mt-1">
+      For each (candidate, task) pair: compare the world-model's imagined score
+      against real LIBERO success rate.
+    </p>
+    <div class="mt-6 grid grid-cols-2 gap-6">
+      <div>
+        <canvas id="scatter-chart" height="280"></canvas>
+      </div>
+      <div class="flex flex-col justify-center">
+        <div class="text-xs uppercase text-slate-500 tracking-widest">Pearson r</div>
+        <div class="text-6xl font-semibold text-slate-900" id="corr-r">—</div>
+        <div class="text-sm text-slate-600" id="corr-ci">95% CI: — to —</div>
+        <div class="mt-4">
+          <span id="strength-pill" class="pill pill-planning">—</span>
+        </div>
+        <div class="mt-5 text-sm text-slate-600" id="corr-interpretation"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="text-center text-xs text-slate-500 py-6">
+    Built on <a class="underline" href="https://github.com/Physical-Intelligence/openpi">openpi</a>
+    &middot; <a class="underline" href="https://www.pi.website/">Physical Intelligence</a>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
