@@ -49,6 +49,22 @@ if torch.cuda.is_available():
 PY
 
 # -------------------------------------------------------------------------
+step "1b. Install LIBERO runtime deps (under-declared by LIBERO's setup.py)"
+
+# These are required by scripts that import libero.libero.envs.
+# The `libero` dep group in pyproject.toml enumerates them.
+uv sync --group libero
+
+# Container-level GL libraries for headless MuJoCo rendering. Safe to run
+# even if already installed. If apt-get is unavailable (non-Debian base),
+# ignore this block — you'll need to install libegl1 / libosmesa6 manually.
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y -qq libegl1 libegl1-mesa libgles2 libgl1 libosmesa6 >/dev/null
+    log "Installed headless GL libraries (EGL + OSMesa)"
+fi
+
+# -------------------------------------------------------------------------
 step "2. Pull rollouts + features from HF"
 
 ROLLOUTS_NPZ="$ROLLOUTS_DIR/rollouts_libero_90.npz"
