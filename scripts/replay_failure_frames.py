@@ -23,6 +23,7 @@ import argparse
 import collections
 import io
 import json
+import math
 import pathlib
 import time
 
@@ -60,6 +61,9 @@ def parse_args():
                    help="Default: only replay is_success==False episodes.")
     p.add_argument("--include-successes", action="store_true",
                    help="Also replay successful episodes (e.g., for matched-pair LoRA training).")
+    p.add_argument("--no-save-observations", action="store_true",
+                   help=("Skip saving observations.npz. Default is to save per-decision "
+                         "(agentview, wrist, state) tensors needed for DPO training."))
     return p.parse_args()
 
 
@@ -130,6 +134,32 @@ def extract_agentview_frame(obs) -> np.ndarray:
     return np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
 
 
+def extract_wrist_frame(obs) -> np.ndarray:
+    return np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+
+
+def _quat2axisangle(quat):
+    """Match the helper in run_collect_rollouts.py so state vectors align."""
+    quat = quat.copy()
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        return np.zeros(3)
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+def extract_state_vector(obs) -> np.ndarray:
+    """7-dim: EEF pos (3) + axis-angle EEF rot (3) + gripper qpos (1)."""
+    return np.concatenate((
+        obs["robot0_eef_pos"],
+        _quat2axisangle(obs["robot0_eef_quat"]),
+        obs["robot0_gripper_qpos"],
+    )).astype(np.float32)
+
+
 def save_jpeg(arr: np.ndarray, path: pathlib.Path, quality: int) -> int:
     """Save a uint8 HxWx3 array as JPEG. Returns bytes written."""
     img = Image.fromarray(arr)
@@ -147,8 +177,21 @@ def replay_episode(
     num_steps_wait: int,
     out_dir: pathlib.Path,
     jpeg_quality: int,
+    save_observations: bool = True,
 ) -> dict:
-    """Replay one episode, saving a frame at each decision point + final."""
+    """Replay one episode, saving per-decision observations + frames.
+
+    When save_observations=True (default), saves a single observations.npz
+    per episode containing, per decision point:
+      - agentview_rgb: [N, 256, 256, 3] uint8   (pre-flip matches training)
+      - wrist_rgb:     [N, 256, 256, 3] uint8
+      - state:         [N, 7] float32           (EEF pos + axis-angle + gripper)
+      - timestep:      [N] int64
+
+    These observations are what Pi0.5 needs to recompute its flow-matching
+    loss during DPO training. The separate per-decision .jpg files remain
+    for human-readable inspection and the attribution judge.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     env.reset()
@@ -158,7 +201,6 @@ def replay_episode(
     for _ in range(num_steps_wait):
         obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
         if done:
-            # Shouldn't happen in wait phase, but break defensively
             break
 
     frames_saved = []
@@ -166,12 +208,24 @@ def replay_episode(
     done = False
     final_t = num_steps_wait
 
+    obs_agentview: list[np.ndarray] = []
+    obs_wrist: list[np.ndarray] = []
+    obs_state: list[np.ndarray] = []
+    obs_timesteps: list[int] = []
+
     for decision_timestep, action_chunk in decisions:
-        # Save the frame at this decision point (pre-action-execution)
+        # Save the JPEG for human inspection / VLM judge
         frame = extract_agentview_frame(obs)
         fpath = out_dir / f"t{decision_timestep:04d}.jpg"
         total_bytes += save_jpeg(frame, fpath, jpeg_quality)
         frames_saved.append({"timestep": decision_timestep, "path": fpath.name})
+
+        # Save the full observation tensors (needed for DPO training)
+        if save_observations:
+            obs_agentview.append(frame)
+            obs_wrist.append(extract_wrist_frame(obs))
+            obs_state.append(extract_state_vector(obs))
+            obs_timesteps.append(decision_timestep)
 
         # Execute the stored action chunk
         for action in action_chunk:
@@ -188,12 +242,27 @@ def replay_episode(
     total_bytes += save_jpeg(final_frame, fpath, jpeg_quality)
     frames_saved.append({"timestep": final_t, "path": fpath.name, "is_final": True})
 
+    obs_bytes = 0
+    if save_observations and obs_timesteps:
+        obs_path = out_dir / "observations.npz"
+        np.savez_compressed(
+            obs_path,
+            agentview_rgb=np.stack(obs_agentview).astype(np.uint8),
+            wrist_rgb=np.stack(obs_wrist).astype(np.uint8),
+            state=np.stack(obs_state).astype(np.float32),
+            timestep=np.array(obs_timesteps, dtype=np.int64),
+        )
+        obs_bytes = obs_path.stat().st_size
+        total_bytes += obs_bytes
+
     return {
         "num_frames": len(frames_saved),
         "frames": frames_saved,
         "final_t": final_t,
         "replay_done": bool(done),
         "bytes_written": total_bytes,
+        "obs_bytes": obs_bytes,
+        "has_observations": save_observations and bool(obs_timesteps),
     }
 
 
@@ -275,6 +344,7 @@ def main():
             num_steps_wait=args.num_steps_wait,
             out_dir=ep_dir,
             jpeg_quality=args.jpeg_quality,
+            save_observations=not args.no_save_observations,
         )
         env.close()
 
