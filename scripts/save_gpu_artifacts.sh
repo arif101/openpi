@@ -129,8 +129,11 @@ log "Tarball created:"
 log "  $(du -h "$OUT" | cut -f1)  $OUT"
 log ""
 log "Manifest (top-level entries):"
-tar tzf "$OUT" | head -30
-TOTAL_ENTRIES=$(tar tzf "$OUT" | wc -l)
+# Use { ... || true; } to swallow the SIGPIPE that tar gets when head closes
+# its stdin after reading 30 lines. Without this, set -euo pipefail kills
+# the script before the push block runs.
+{ tar tzf "$OUT" 2>/dev/null || true; } | head -30
+TOTAL_ENTRIES=$(tar tzf "$OUT" 2>/dev/null | wc -l)
 log "  ... ($TOTAL_ENTRIES total entries)"
 
 # Optionally push to HF
