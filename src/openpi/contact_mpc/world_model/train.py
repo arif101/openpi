@@ -126,7 +126,7 @@ def _infonce_loss(predicted: torch.Tensor, target: torch.Tensor, temperature: fl
 
 def _vicreg_loss(
     x: torch.Tensor,
-    target_std: float = 1.0,
+    target_std: float | torch.Tensor = 1.0,
     variance_weight: float = 1.0,
     covariance_weight: float = 0.04,
 ) -> torch.Tensor:
@@ -137,11 +137,27 @@ def _vicreg_loss(
 
     Reference: Bardes, Ponce, LeCun — VICReg (ICLR 2022); used here on the
     predictor's *output* distribution to attack predictor-side collapse.
+
+    target_std can be either a scalar (classic VICReg target=1.0) or a
+    per-dimension tensor of shape [D] so the regularizer pushes predicted
+    features toward matching the *real* feature distribution's per-dim
+    variance rather than an arbitrary unit-std target. Per-dim targeting
+    is the correct move when the encoder outputs aren't normalized (our
+    case: frozen Pi0.5 pooled VLM features).
     """
     B, D = x.shape
-    # Variance: penalize std(dim) < target_std
-    std = torch.sqrt(x.var(dim=0) + 1e-4)
-    L_var = torch.mean(torch.nn.functional.relu(target_std - std))
+    std = torch.sqrt(x.var(dim=0) + 1e-4)                            # [D]
+
+    if isinstance(target_std, torch.Tensor):
+        target = target_std.to(x.device)
+        if target.shape != std.shape:
+            raise ValueError(
+                f"target_std tensor shape {target.shape} != predictor output dims {std.shape}"
+            )
+    else:
+        target = torch.full_like(std, float(target_std))
+
+    L_var = torch.mean(torch.nn.functional.relu(target - std))
 
     # Covariance: penalize off-diagonal covariance
     x_centered = x - x.mean(dim=0, keepdim=True)
@@ -171,6 +187,7 @@ def train_world_model(
     vicreg_variance_weight: float = 1.0,
     vicreg_covariance_weight: float = 0.04,
     vicreg_target_std: float = 1.0,
+    vicreg_match_real_std: bool = False,
 ) -> tuple[LatentWorldModel, dict]:
     """Train the world model and return the model + training metrics.
 
@@ -237,6 +254,24 @@ def train_world_model(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.MSELoss()
 
+    # Pre-compute the per-dim target std for VICReg — matches the real
+    # feature distribution's per-dim variance rather than an arbitrary
+    # unit-std target. Essential for frozen-encoder setups where the
+    # features' native scale is whatever Pi0.5 learned.
+    if use_vicreg and vicreg_match_real_std:
+        real_std_per_dim = torch.tensor(
+            fh[train_idx].std(axis=0), dtype=torch.float32
+        ).to(device)
+        logger.info(
+            f"  VICReg target_std: per-dim (matched to real features). "
+            f"mean={float(real_std_per_dim.mean()):.4f}, "
+            f"median={float(real_std_per_dim.median()):.4f}, "
+            f"max={float(real_std_per_dim.max()):.4f}"
+        )
+        vicreg_target: float | torch.Tensor = real_std_per_dim
+    else:
+        vicreg_target = vicreg_target_std
+
     # Training loop with early stopping
     best_val_loss = float("inf")
     best_state = None
@@ -270,7 +305,7 @@ def train_world_model(
             if use_vicreg:
                 L_vic = _vicreg_loss(
                     pred,
-                    target_std=vicreg_target_std,
+                    target_std=vicreg_target,
                     variance_weight=vicreg_variance_weight,
                     covariance_weight=vicreg_covariance_weight,
                 )

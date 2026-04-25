@@ -52,6 +52,9 @@ def parse_args():
     parser.add_argument("--vicreg-variance-weight", type=float, default=1.0)
     parser.add_argument("--vicreg-covariance-weight", type=float, default=0.04)
     parser.add_argument("--vicreg-target-std", type=float, default=1.0)
+    parser.add_argument("--vicreg-match-real-std", action="store_true",
+                        help="Compute target_std per-dim from real features. "
+                             "Essential when encoder outputs aren't unit-std (our case).")
     return parser.parse_args()
 
 
@@ -121,6 +124,7 @@ def main():
                 vicreg_variance_weight=args.vicreg_variance_weight,
                 vicreg_covariance_weight=args.vicreg_covariance_weight,
                 vicreg_target_std=args.vicreg_target_std,
+                vicreg_match_real_std=args.vicreg_match_real_std,
             )
             save_world_model(model, metrics, str(output_dir))
 

@@ -110,6 +110,33 @@ class TestVICRegLoss:
         L = _vicreg_loss(torch.randn(16, 8))
         assert L.dim() == 0
 
+    def test_per_dim_target_std_tensor(self):
+        """When target_std is a [D] tensor, variance penalty applies per-dim."""
+        torch.manual_seed(0)
+        # Predictor output: 0.1 std on every dim — universal collapse
+        x = (torch.randn(200, 8) * 0.1).detach()
+        # Target: 0.5 std on every dim (larger than current)
+        target = torch.full((8,), 0.5)
+        L = _vicreg_loss(x, target_std=target, variance_weight=1.0, covariance_weight=0.0)
+        assert L.item() > 0.3  # large variance penalty
+
+    def test_per_dim_target_respects_individual_dims(self):
+        """If target_std has a dim with 0, that dim shouldn't be penalized."""
+        torch.manual_seed(0)
+        x = (torch.randn(200, 4) * 0.01).detach()
+        # Target: zero on 3 dims, high on 1 dim → penalty should be ~high/4
+        target = torch.tensor([2.0, 0.0, 0.0, 0.0])
+        L = _vicreg_loss(x, target_std=target, variance_weight=1.0, covariance_weight=0.0)
+        # L = mean(max(0, target - std)) = mean([2.0 - ~0.01, 0 clipped, 0 clipped, 0 clipped])
+        # ≈ mean([~2.0, 0, 0, 0]) = ~0.5
+        assert 0.3 < L.item() < 0.7
+
+    def test_per_dim_target_shape_mismatch_raises(self):
+        x = torch.randn(16, 8)
+        bad_target = torch.full((5,), 1.0)  # wrong dim
+        with pytest.raises(ValueError, match="target_std tensor shape"):
+            _vicreg_loss(x, target_std=bad_target)
+
 
 class TestCombinedBackprop:
     """Sanity check that both regularizers can be combined with MSE and
