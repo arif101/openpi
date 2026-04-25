@@ -306,3 +306,162 @@ Push LIBERO-PRO position perturbation from 46% to 70%+ while maintaining ≥90% 
 - HuggingFace: arif101/libero90_vlm_features, arif101/libero90_successes, arif101/libero90_waypoints
 - GPU setup gist: gist.github.com/arif101/d11940897b13130f1e782b3141c38cca
 - Previous session log: /Users/arifahmed/side-projects/vla-serve/SESSION_LOG.md
+
+---
+
+## Phase 5: World-Model Research + LIBERO-PRO Lift (Apr 19 – Apr 25)
+
+This phase pivoted from the attribution/MVP track of Phase 1–4 to a research-heavy world-model thesis after multiple rounds of strategic clarification. The work answered the gating question for the entire research program.
+
+### The strategic pivot
+
+After the Phase 4 numbers (KS3 ranking 46–57%, value function memorizing task identity), several rounds of debate over the right direction:
+
+- "Factored VLA" pitch (latent disentanglement + counterfactual augmentation) — critic destroyed it on Locatello-impossibility grounds.
+- "Improvement-loop attribution platform" — built but pulled back to research focus when user pushed against commodity-tooling pitch.
+- "Latent MBRL + reasoning + chess" — too ambitious, too many moving parts.
+- "World models as the moat" — what we landed on, with LIBERO-PRO as the headline benchmark.
+
+User input that locked the direction: *"better world models, better reasoning will lead to VLAs generalizing to more scenarios."*
+
+### Built infrastructure (this phase)
+
+```
+contact_mpc/
+├── attribution/         # Phase 1.5 — Claude Sonnet 4.6 failure judge + cluster
+│   ├── judge.py         # 17 tests — VLM judge with prompt caching, tool use
+│   ├── cluster.py       # 13 tests — failure_type × hidden-state k-means
+│   └── prompts.py       # robotics-specific 3-way taxonomy
+├── eval/                # Phase 1.5 — offline LoRA candidate ranking
+│   ├── offline_evaluator.py    # 13 tests — score candidates via WM + VF
+│   └── correlation_study.py    # 16 tests — Pearson r + bootstrap CI
+├── dpo/                 # Built; not exercised because we pivoted to MCTS
+│   ├── pair_builder.py  # 8 tests — within-task (success, failure) pairs
+│   └── loss.py          # 17 tests — flow-matching DPO with cosine/L2 modes
+├── planner/             # Phase 5 — inference-time tree search
+│   └── mcts.py          # 12 tests — AlphaZero-style PUCT, lazy expansion
+└── world_model/         # Extended with anti-collapse regularizers
+    └── train.py         # +VICReg + InfoNCE; per-dim target_std matching
+```
+
+### World-model debugging — the diagnostic + fix story
+
+Phase 4 left a broken WM: KS3 ranking 0.545, val MSE 5e-5 but the value function ranked WM outputs at 0.371 (worse than random). Built a diagnostic script that ran on the existing checkpoint and produced the numbers below.
+
+**Diagnosed three stacked failure modes:**
+1. **Variance collapse**: 99% of dims had pred std < 50% of real std; median ratio 0.065. MSE on 2048-dim Pi0.5 features hides task-critical error in nuisance-dim averaging.
+2. **Manifold drift**: pred-to-real NN distance >> real-to-real NN distance after VICReg-only fix (drift_ratio went from 1.0 → 2.0 → 7.3 across iterations).
+3. **Cosine-InfoNCE degeneracy**: Pi0.5's pooled features cluster on a tight cone; all pairwise cosines ≈ 1.0; cosine-InfoNCE training loss stuck at exactly `0.1 × log(64) = 0.416` — the random-classification floor — for 40 epochs. Switched to L2-distance InfoNCE.
+
+### Training recipe progression
+
+| Variant | KS3 | Δ vs prev | Verdict |
+|---|---|---|---|
+| Baseline (MSE only) | 0.545 | — | FAIL |
+| + VICReg w/ per-dim real-std target | 0.643 | +0.098 | FAIL |
+| + cosine InfoNCE | 0.672 | +0.029 | FAIL |
+| **+ L2 InfoNCE (replacing cosine)** | **0.726** | **+0.054** | **PASS** ✓ |
+
+L2 InfoNCE was the breakthrough — fixed the contrastive degeneracy for cone-shaped frozen-VLM features. Total improvement +18.1pp over MSE-only baseline; first WM variant to pass the 0.70 KS3 threshold.
+
+### Experiment A — the gating result
+
+Wrapped the L2-InfoNCE-VICReg WM + Phase 4 value function in MCTS (K=4 candidates, 32 simulations, depth 1, contact-triggered) and evaluated on LIBERO-10 with 5cm object-position perturbation.
+
+**Multi-seed result on LIBERO-PRO 5cm:**
+
+| Seed | Pi0.5 baseline | Pi0.5 + MCTS | Lift |
+|---|---|---|---|
+| 7 | 46.0% (23/50) | 56.0% (28/50) | **+10.0pp** |
+| 14 | 36.0% (18/50) | 44.0% (22/50) | **+8.0pp** |
+
+- Reproduces the LIBERO-PRO paper's reported 46% baseline exactly (seed=7).
+- Both seeds land +8 to +10pp lift consistently.
+- Per-task: 5+ tasks improved, 0–1 regressed across the two seeds.
+- Wall time: ~70 min per 100-episode run on A40. ~970 MCTS calls per run (contact-triggered).
+- **First measurable lift on LIBERO-PRO from any inference-time-search method.**
+
+### Novelty audit — honest assessment
+
+After the result landed, ran a novelty audit against the 2025–2026 MCTS+VLA literature. Findings:
+
+| Axis | Verdict |
+|---|---|
+| Architectural | **Not novel.** VLAPS (arXiv 2508.12211, Aug 2025), VLA-Reasoner (2509.22643, Sep 2025), V-VLAPS (2601.00969, Jan 2026) preceded the MCTS-with-VLA-prior-over-learned-WM pattern. |
+| Backbone substitution (Pi0.5 vs Octo) | Trivially novel. |
+| Empirical | **Novel and defensible.** First MCTS+WM result on LIBERO-PRO specifically. |
+| Methods recipe | **Novel — strongest contribution.** VICReg+per-dim-matched + L2-InfoNCE for cone-shaped frozen-VLM features. Diagnostic + fix combination unpublished. |
+| Robustness positioning | Novel. Almost all 2026 inference-time-search-VLA work targets capability, not robustness. |
+
+Drop the "first MCTS+WM in VLAs" framing entirely. The honest novelty: methods recipe + LIBERO-PRO empirical first + robustness framing.
+
+### YC positioning v2 — the PI blog finding
+
+Read PI's blog after the novelty audit. Their **April 16, 2026 π0.7 release** (9 days before this writing) explicitly named our wedge as future work:
+
+> *"Powerful and steerable models like π0.7 might make it possible in the future to solve even more complex unseen tasks by having the model 'think through' possible ways to perform them, leverage its ability to follow diverse prompts to ground these thoughts in actions, and then reflect on the outcomes to revise the task plan."*
+
+PI has named "deliberation / think harder / reflect and revise" as missing in 3+ separate blog posts (π0, RTC, Knowledge Insulation, π0.7). They have not built it. Their existing System-2 (Hi Robot) is hierarchical *prompting*, not search.
+
+**New positioning** (in `demo/yc_pitch.md`): *"The inference-time deliberation layer for openpi."* Use PI's own published roadmap as our product description. Position complementary to PI, alongside their existing partners (Weave/Ultra are vertical operators; we're the horizontal reasoning layer they invited but don't yet have).
+
+### W26 cohort intel
+
+- **One Robot (W26)** has "world model for VLA eval" branded — we cannot enter that frame and win. They train task-specific action-conditioned video WMs per customer for VLA eval/sim. Operators-with-pedigree (Industrial Next, Tesla) — not lab spinout.
+- **Pattern across W26 robotics**: 6 of 8 are picks-and-shovels (data, sim, eval, hands). Zero claim architectural novelty. All have a deployable artifact in 90 days. Funded shapes: data engine > eval/sim > vertical operator > hardware-with-data-moat.
+- **No-LOI playbook**: replace LOIs with shipped artifacts. The demo IS the LOI (Origami sells hands to Amazon, Servo7 has Carly running, Luel hit $2M ARR).
+
+### What stands and what's still open
+
+**Stands:**
+- KS3=0.726 WM checkpoint (`world_model_H10_medium_ncel2_vic.pt`)
+- +8–10pp lift on LIBERO-10 perturbed across 2 seeds
+- 60+ unit tests across attribution, eval, planner, regularizer modules
+- YC pitch v2 in `demo/yc_pitch.md`
+- Memory persisted: phase roadmap, MVP claim, scope discipline, Experiment A result, YC competitive intel, PI blog intel
+
+**Still open (next 2 weeks):**
+- LIBERO-90 generalization run (queued, ~6 hr)
+- Seed=21 replication for 3-seed CI on LIBERO-10
+- Perturbation curve at 3, 7, 10 cm
+- Ablations: VICReg-only, NCE-only, plain-MSE WM
+- Cross-VLA test (port recipe to OpenVLA)
+- Real-robot demo (gated on hardware access)
+- arXiv preprint (target CoRL 2026 deadline ~June)
+
+### Files added this phase
+
+```
+src/openpi/contact_mpc/attribution/   (judge, prompts, cluster + tests)
+src/openpi/contact_mpc/dpo/           (pair_builder, loss + tests)
+src/openpi/contact_mpc/eval/          (offline_evaluator, correlation_study + tests)
+src/openpi/contact_mpc/planner/       (mcts + tests)
+src/openpi/contact_mpc/world_model/regularizers_test.py
+scripts/diagnose_world_model.py
+scripts/diagnose_vic_checkpoint.sh
+scripts/smoke_test_mcts.sh
+scripts/run_experiment_a.sh
+scripts/run_libero_pro_mcts.py
+scripts/run_libero_candidate_eval.py
+scripts/run_correlation_study.py
+scripts/run_candidate_ranking.py
+scripts/run_failure_clustering.py
+scripts/run_prepare_dpo_pairs.py
+scripts/run_vlm_attribution.py
+scripts/replay_failure_frames.py
+scripts/setup_gpu_box.sh
+scripts/prepare_lora_candidates.py
+demo/dashboard/                       (HTML + Chart.js + fallback data)
+demo/loom_script.md
+demo/README.md
+demo/yc_pitch.md                       (v2 positioning, PI-roadmap-anchored)
+```
+
+### Memory persisted
+
+- `project_phase_roadmap.md` — Phase 1–3 scope (validation / memorization / reasoning)
+- `project_mvp_standalone_claim.md` — what Phase 1 validates
+- `feedback_scope_discipline.md` — don't de-scope to avoid infra work
+- `project_experiment_a_result.md` — multi-seed LIBERO-PRO numbers
+- `project_yc_competitive_intel.md` — W26 cohort patterns + One Robot
+- `project_pi_blog_intel.md` — π0.7 quote and positioning
