@@ -329,6 +329,7 @@ def main():
     print("\n=== Loading Pi0.5 Policy ===", flush=True)
     from openpi.shared import download
     download.maybe_download(args.checkpoint + "/assets")
+    download.maybe_download(args.checkpoint + "/params")
     train_config = _config.get_config(args.config_name)
     policy = _policy_config.create_trained_policy(train_config, args.checkpoint)
     print("Policy loaded.", flush=True)

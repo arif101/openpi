@@ -478,7 +478,11 @@ def main():
 
     print("Loading Pi0.5 policy...", flush=True)
     from openpi.shared import download
+    # Download BOTH assets and params on first run. The legacy pattern of
+    # downloading only "/assets" works on warm caches but fails on a fresh
+    # GPU box because restore_params then can't find /params locally.
     download.maybe_download(args.checkpoint + "/assets")
+    download.maybe_download(args.checkpoint + "/params")
     train_cfg = _config.get_config(args.config_name)
     policy = _policy_config.create_trained_policy(train_cfg, args.checkpoint)
     print("Policy loaded.", flush=True)
