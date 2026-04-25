@@ -60,6 +60,59 @@ class TestInfoNCELoss:
         assert L.dim() == 0
 
 
+class TestInfoNCEL2Variant:
+    """L2-based InfoNCE — designed for feature distributions where cosine
+    is degenerate (e.g., features cluster on a tight cone)."""
+
+    def test_l2_matched_pairs_score_lower_than_random(self):
+        torch.manual_seed(0)
+        target = torch.randn(16, 32)
+        random_pred = torch.randn(16, 32)
+        L_matched = _infonce_loss(target, target, temperature=0.1, similarity="l2")
+        L_random = _infonce_loss(random_pred, target, temperature=0.1, similarity="l2")
+        assert L_matched < L_random
+
+    def test_l2_works_when_cosine_is_degenerate(self):
+        """Construct features where ALL pairs have cosine ~1.0 (cone-shaped
+        distribution like Pi0.5's pooled hidden states). Cosine InfoNCE
+        cannot discriminate; L2 InfoNCE can."""
+        torch.manual_seed(0)
+        # Build a "cone" of features: all share a strong common direction
+        # plus a tiny per-sample perturbation in random directions.
+        common_direction = torch.ones(64) * 10.0
+        perturbations = torch.randn(16, 64) * 0.01
+        targets = common_direction + perturbations
+        # Cosine similarity between any two of these is ~1.0
+        cos_sims = torch.nn.functional.cosine_similarity(
+            targets.unsqueeze(0), targets.unsqueeze(1), dim=-1,
+        )
+        assert (cos_sims > 0.99).all().item(), "Setup failure: not enough collapse"
+
+        # Cosine InfoNCE on matched pairs gives near-uniform logits (degenerate)
+        L_cosine_matched = _infonce_loss(targets, targets, 0.1, similarity="cosine")
+        # L2 InfoNCE can still discriminate via magnitude/distance
+        L_l2_matched = _infonce_loss(targets, targets, 0.1, similarity="l2")
+
+        # When cosine is degenerate, L_cosine_matched is near log(B); L2 can be much lower
+        assert L_l2_matched < L_cosine_matched
+
+    def test_l2_gradient_pulls_predictions_toward_targets(self):
+        torch.manual_seed(0)
+        target = torch.randn(8, 16)
+        pred = torch.randn(8, 16, requires_grad=True)
+        L = _infonce_loss(pred, target, temperature=0.1, similarity="l2")
+        L.backward()
+        with torch.no_grad():
+            d_before = ((pred - target) ** 2).sum(dim=-1).mean()
+            pred_new = pred - 0.05 * pred.grad
+            d_after = ((pred_new - target) ** 2).sum(dim=-1).mean()
+        assert d_after < d_before  # gradient step pulls predictions closer to targets
+
+    def test_unknown_similarity_raises(self):
+        with pytest.raises(ValueError, match="Unknown InfoNCE similarity mode"):
+            _infonce_loss(torch.randn(4, 8), torch.randn(4, 8), 0.1, similarity="dot")
+
+
 class TestVICRegLoss:
     def test_zero_when_output_has_unit_std_and_identity_cov(self):
         """Near-optimal input (per-dim std ≈ 1, dims ≈ decorrelated) should

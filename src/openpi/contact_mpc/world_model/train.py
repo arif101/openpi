@@ -108,19 +108,48 @@ def build_dataset_for_horizon(
     return h, a, fh
 
 
-def _infonce_loss(predicted: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
+def _infonce_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    temperature: float,
+    similarity: str = "cosine",
+) -> torch.Tensor:
     """Contrastive loss that pulls predictions onto the real-feature manifold.
 
-    For a batch of (predicted_i, real_i) pairs, encourages cosine similarity
-    between each predicted and its own target to exceed similarity to other
-    targets in the batch. Directly penalizes off-manifold outputs.
+    For a batch of (predicted_i, real_i) pairs, encourages similarity between
+    each predicted and its own target to exceed similarity to other targets
+    in the batch. Directly penalizes off-manifold outputs.
 
-    Reference: van den Oord 2018, applied to MBRL in VICReg-MBRL lineage.
+    Two similarity modes:
+
+    "cosine" — classic InfoNCE on L2-normalized vectors. Use when features
+        have meaningful angular structure. *Degenerate* when all features
+        point in nearly the same direction (e.g., Pi0.5's pooled hidden
+        states cluster on a tight cone): all pairwise cosines ≈ 1.0,
+        softmax saturates, and gradient vanishes.
+
+    "l2" — InfoNCE on negative L2 distance. Use when feature magnitudes
+        carry signal that L2-normalization would erase. The right choice
+        for cone-shaped feature distributions where cosine is degenerate.
+
+    Reference: van den Oord 2018 (cosine variant); the L2-variant is the
+    metric-learning-with-NCE formulation common in self-supervised
+    learning when features aren't unit-normalized (Hadsell et al. 2006
+    contrastive loss in modern InfoNCE clothing).
     """
-    p = torch.nn.functional.normalize(predicted, dim=-1)
-    t = torch.nn.functional.normalize(target, dim=-1)
-    logits = (p @ t.T) / max(temperature, 1e-6)  # [B, B]
-    labels = torch.arange(len(p), device=p.device)
+    if similarity == "cosine":
+        p = torch.nn.functional.normalize(predicted, dim=-1)
+        t = torch.nn.functional.normalize(target, dim=-1)
+        logits = (p @ t.T) / max(temperature, 1e-6)
+    elif similarity == "l2":
+        # Negative L2 distance: closer pairs get higher logits.
+        # cdist returns shape [B, B] of pairwise Euclidean distances.
+        dists = torch.cdist(predicted, target, p=2)
+        logits = -dists / max(temperature, 1e-6)
+    else:
+        raise ValueError(f"Unknown InfoNCE similarity mode: {similarity!r}")
+
+    labels = torch.arange(len(predicted), device=predicted.device)
     return torch.nn.functional.cross_entropy(logits, labels)
 
 
@@ -183,6 +212,7 @@ def train_world_model(
     use_infonce: bool = False,
     infonce_weight: float = 0.1,
     infonce_temperature: float = 0.1,
+    infonce_similarity: str = "l2",
     use_vicreg: bool = False,
     vicreg_variance_weight: float = 1.0,
     vicreg_covariance_weight: float = 0.04,
@@ -298,7 +328,9 @@ def train_world_model(
             epoch_mse += L_mse.item() * len(batch_h)
 
             if use_infonce:
-                L_nce = _infonce_loss(pred, batch_fh, infonce_temperature)
+                L_nce = _infonce_loss(
+                    pred, batch_fh, infonce_temperature, similarity=infonce_similarity,
+                )
                 loss = loss + infonce_weight * L_nce
                 epoch_infonce += L_nce.item() * len(batch_h)
 
@@ -378,6 +410,7 @@ def train_world_model(
         "use_infonce": use_infonce,
         "infonce_weight": infonce_weight if use_infonce else 0.0,
         "infonce_temperature": infonce_temperature if use_infonce else 0.0,
+        "infonce_similarity": infonce_similarity if use_infonce else "",
         "use_vicreg": use_vicreg,
         "vicreg_variance_weight": vicreg_variance_weight if use_vicreg else 0.0,
         "vicreg_covariance_weight": vicreg_covariance_weight if use_vicreg else 0.0,
@@ -403,7 +436,10 @@ def save_world_model(model: LatentWorldModel, metrics: dict, output_dir: str) ->
     if metrics["contact_only"]:
         tag += "_contact"
     if metrics.get("use_infonce"):
-        tag += "_nce"
+        sim = metrics.get("infonce_similarity", "")
+        # Cosine is the legacy default; tag L2 explicitly so checkpoints
+        # don't collide with the older cosine variant.
+        tag += "_nce" if sim in ("", "cosine") else f"_nce{sim}"
     if metrics.get("use_vicreg"):
         tag += "_vic"
 

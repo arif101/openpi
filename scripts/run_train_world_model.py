@@ -47,6 +47,10 @@ def parse_args():
                         help="Add InfoNCE contrastive loss on predicted vs real. Attacks manifold drift.")
     parser.add_argument("--infonce-weight", type=float, default=0.1)
     parser.add_argument("--infonce-temperature", type=float, default=0.1)
+    parser.add_argument("--infonce-similarity", choices=["cosine", "l2"], default="l2",
+                        help="Use L2 distance (default; works for cone-shaped feature "
+                             "distributions like Pi0.5 pooled hidden states) or cosine "
+                             "(legacy; degenerate when features cluster on a tight cone).")
     parser.add_argument("--use-vicreg", action="store_true",
                         help="Add VICReg regularization on predictor outputs. Attacks variance collapse.")
     parser.add_argument("--vicreg-variance-weight", type=float, default=1.0)
@@ -120,6 +124,7 @@ def main():
                 use_infonce=args.use_infonce,
                 infonce_weight=args.infonce_weight,
                 infonce_temperature=args.infonce_temperature,
+                infonce_similarity=args.infonce_similarity,
                 use_vicreg=args.use_vicreg,
                 vicreg_variance_weight=args.vicreg_variance_weight,
                 vicreg_covariance_weight=args.vicreg_covariance_weight,
