@@ -1,40 +1,91 @@
 #!/usr/bin/env bash
 #
-# Re-diagnose the VICReg-trained world model after retraining.
+# Diagnose a world-model variant against the baseline.
 #
-# Symlinks the new _vic checkpoint into the canonical mpc_results path
-# (so downstream scripts can find it under a stable name), then runs the
-# diagnostic that compares predicted vs real feature distributions.
+# Usage:
+#   bash scripts/diagnose_vic_checkpoint.sh                  # default: nce_vic (best so far)
+#   bash scripts/diagnose_vic_checkpoint.sh vic              # VICReg-only variant
+#   bash scripts/diagnose_vic_checkpoint.sh nce              # InfoNCE-only variant
+#   bash scripts/diagnose_vic_checkpoint.sh nce_vic          # both regularizers
+#   bash scripts/diagnose_vic_checkpoint.sh ""               # baseline (no regularizers)
 #
-# Usage (run with nohup for survival across disconnects):
-#   nohup bash scripts/diagnose_vic_checkpoint.sh > diag_vic.log 2>&1 &
-#   tail -f diag_vic.log
+# The variant string maps directly to the suffix in train.py's checkpoint
+# naming: world_model_H{H}_{size}_{variant}.pt. Run with nohup if you
+# want survival across disconnects:
+#   nohup bash scripts/diagnose_vic_checkpoint.sh nce_vic > diag.log 2>&1 &
+#   tail -f diag.log
 
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/workspace/openpi}"
 cd "$REPO_ROOT"
 
-SOURCE_CKPT="data/contact_mpc/world_model/world_model_H10_medium_vic.pt"
-SOURCE_CFG="data/contact_mpc/world_model/world_model_config_H10_medium_vic.pt"
-LINK_CKPT="data/contact_mpc/mpc_results/world_model_vic.pt"
-LINK_CFG="data/contact_mpc/mpc_results/world_model_config_vic.pt"
-OUT_DIR="data/contact_mpc/diagnostics_vic"
+VARIANT="${1:-nce_vic}"
+SIZE="${SIZE:-medium}"
+HORIZON="${HORIZON:-10}"
+
+if [[ -n "$VARIANT" ]]; then
+    SUFFIX="_${VARIANT}"
+else
+    SUFFIX=""
+fi
+
+SOURCE_CKPT="data/contact_mpc/world_model/world_model_H${HORIZON}_${SIZE}${SUFFIX}.pt"
+SOURCE_CFG="data/contact_mpc/world_model/world_model_config_H${HORIZON}_${SIZE}${SUFFIX}.pt"
+LINK_CKPT="data/contact_mpc/mpc_results/world_model${SUFFIX}.pt"
+LINK_CFG="data/contact_mpc/mpc_results/world_model_config${SUFFIX}.pt"
+OUT_DIR="data/contact_mpc/diagnostics${SUFFIX}"
+BASELINE_REPORT="data/contact_mpc/diagnostics/wm_diagnostic_report.json"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
-# 1. Sanity-check the new checkpoint exists
+log "Variant: '${VARIANT}'  (suffix='${SUFFIX}')"
+log "Source checkpoint: $SOURCE_CKPT"
+
+# 1. Sanity-check the new checkpoint exists. Print a useful retraining
+#    command on miss based on the requested variant.
 if [[ ! -f "$SOURCE_CKPT" || ! -f "$SOURCE_CFG" ]]; then
-    log "ERROR: VIC checkpoint not found at $SOURCE_CKPT (or _config). Run training first:"
-    log "  PYTHONPATH=src uv run python3 scripts/run_train_world_model.py \\"
-    log "    --features-path data/contact_mpc/features/libero90_features_H10.npz \\"
-    log "    --probe-path data/contact_mpc/features/best_probe.pkl \\"
-    log "    --output-dir data/contact_mpc/world_model --skip-sweep \\"
-    log "    --use-vicreg --vicreg-match-real-std"
+    log "ERROR: checkpoint not found at $SOURCE_CKPT"
+    log ""
+    log "To train the '${VARIANT}' variant, run:"
+    log ""
+    case "$VARIANT" in
+        "")
+            log "  PYTHONPATH=src uv run python3 scripts/run_train_world_model.py \\"
+            log "    --features-path data/contact_mpc/features/libero90_features_H10.npz \\"
+            log "    --probe-path data/contact_mpc/features/best_probe.pkl \\"
+            log "    --output-dir data/contact_mpc/world_model --skip-sweep"
+            ;;
+        "vic")
+            log "  PYTHONPATH=src uv run python3 scripts/run_train_world_model.py \\"
+            log "    --features-path data/contact_mpc/features/libero90_features_H10.npz \\"
+            log "    --probe-path data/contact_mpc/features/best_probe.pkl \\"
+            log "    --output-dir data/contact_mpc/world_model --skip-sweep \\"
+            log "    --use-vicreg --vicreg-match-real-std"
+            ;;
+        "nce")
+            log "  PYTHONPATH=src uv run python3 scripts/run_train_world_model.py \\"
+            log "    --features-path data/contact_mpc/features/libero90_features_H10.npz \\"
+            log "    --probe-path data/contact_mpc/features/best_probe.pkl \\"
+            log "    --output-dir data/contact_mpc/world_model --skip-sweep \\"
+            log "    --use-infonce --infonce-weight 0.1 --infonce-temperature 0.1"
+            ;;
+        "nce_vic")
+            log "  PYTHONPATH=src uv run python3 scripts/run_train_world_model.py \\"
+            log "    --features-path data/contact_mpc/features/libero90_features_H10.npz \\"
+            log "    --probe-path data/contact_mpc/features/best_probe.pkl \\"
+            log "    --output-dir data/contact_mpc/world_model --skip-sweep \\"
+            log "    --use-vicreg --vicreg-match-real-std \\"
+            log "    --use-infonce --infonce-weight 0.1 --infonce-temperature 0.1"
+            ;;
+        *)
+            log "  (Unknown variant '${VARIANT}'. Common choices: '', 'vic', 'nce', 'nce_vic'.)"
+            ;;
+    esac
     exit 1
 fi
 
-# 2. Symlink to canonical paths
+# 2. Symlink to canonical paths for downstream scripts
 mkdir -p "$(dirname "$LINK_CKPT")"
 ln -sf "$(realpath "$SOURCE_CKPT")" "$LINK_CKPT"
 ln -sf "$(realpath "$SOURCE_CFG")"  "$LINK_CFG"
@@ -43,7 +94,7 @@ log "Linked: $LINK_CFG  -> $SOURCE_CFG"
 
 # 3. Run the diagnostic
 log ""
-log "===== Running diagnostic on VIC checkpoint ====="
+log "===== Running diagnostic on '${VARIANT}' checkpoint ====="
 PYTHONPATH=src uv run python3 scripts/diagnose_world_model.py \
     --world-model "$LINK_CKPT" \
     --world-model-config "$LINK_CFG" \
@@ -53,31 +104,17 @@ PYTHONPATH=src uv run python3 scripts/diagnose_world_model.py \
     --rollouts data/contact_mpc/rollouts/rollouts_libero_90.npz \
     --output-dir "$OUT_DIR"
 
-log ""
-log "===== Side-by-side: baseline vs VIC ====="
-log "Look for these key numbers in the report above and below:"
-log "  Per-dim variance ratio: baseline 0.099 -> VIC ?"
-log "  Fraction collapsed:     baseline 99%   -> VIC ?"
-log "  VF score std (pred):    baseline 0.154 -> VIC ?"
-log "  VF score gap (real):    baseline 0.65  (success-failure)"
-log "  VF score gap (pred):    baseline ~0    -> VIC ?"
+VARIANT_REPORT="$OUT_DIR/wm_diagnostic_report.json"
 
-# 4. Pretty-print the report JSONs side-by-side if both exist
-BASELINE_REPORT="data/contact_mpc/diagnostics/wm_diagnostic_report.json"
-VIC_REPORT="$OUT_DIR/wm_diagnostic_report.json"
-
-if [[ -f "$BASELINE_REPORT" && -f "$VIC_REPORT" ]]; then
+# 4. Side-by-side comparison vs baseline if both exist (and the variant
+#    isn't itself the baseline).
+if [[ -n "$VARIANT" && -f "$BASELINE_REPORT" && -f "$VARIANT_REPORT" ]]; then
     log ""
-    log "===== Baseline vs VIC, key fields ====="
+    log "===== Baseline vs '${VARIANT}', key fields ====="
     PYTHONPATH=src uv run python3 - <<PY
-import json, sys
+import json
 b = json.load(open("$BASELINE_REPORT"))["diagnostics"]
-v = json.load(open("$VIC_REPORT"))["diagnostics"]
-
-def fetch(d, *keys):
-    for k in keys:
-        d = d.get(k, {}) if isinstance(d, dict) else None
-    return d
+v = json.load(open("$VARIANT_REPORT"))["diagnostics"]
 
 rows = [
     ("Per-dim variance ratio (mean)",
@@ -115,7 +152,7 @@ if "vf_score_shift" in b and "vf_score_shift" in v:
          v["vf_score_shift"].get("vf_pred_success_failure_gap")),
     ]
 
-print(f"{'Metric':<40} {'Baseline':>12} {'VIC':>12}  {'Δ':>10}")
+print(f"{'Metric':<40} {'Baseline':>12} {'$VARIANT':>12}  {'Δ':>10}")
 print("-" * 80)
 for name, b_val, v_val in rows:
     if b_val is None or v_val is None:
@@ -127,5 +164,5 @@ PY
 fi
 
 log ""
-log "Done. Report at $OUT_DIR/wm_diagnostic_report.json"
+log "Done. Report at $VARIANT_REPORT"
 log "Plots at  $OUT_DIR/wm_diagnostic_plots.png"
