@@ -42,6 +42,16 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--train-contact-only", action="store_true", help="Also train contact-only variant for KS2")
     parser.add_argument("--skip-sweep", action="store_true", help="Only train medium/H=10 (for debugging)")
+    # Anti-collapse regularizers (default off for backwards compat)
+    parser.add_argument("--use-infonce", action="store_true",
+                        help="Add InfoNCE contrastive loss on predicted vs real. Attacks manifold drift.")
+    parser.add_argument("--infonce-weight", type=float, default=0.1)
+    parser.add_argument("--infonce-temperature", type=float, default=0.1)
+    parser.add_argument("--use-vicreg", action="store_true",
+                        help="Add VICReg regularization on predictor outputs. Attacks variance collapse.")
+    parser.add_argument("--vicreg-variance-weight", type=float, default=1.0)
+    parser.add_argument("--vicreg-covariance-weight", type=float, default=0.04)
+    parser.add_argument("--vicreg-target-std", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -104,6 +114,13 @@ def main():
             model, metrics = train_world_model(
                 features, horizon=H, size=size,
                 num_epochs=args.num_epochs, batch_size=args.batch_size, lr=args.lr,
+                use_infonce=args.use_infonce,
+                infonce_weight=args.infonce_weight,
+                infonce_temperature=args.infonce_temperature,
+                use_vicreg=args.use_vicreg,
+                vicreg_variance_weight=args.vicreg_variance_weight,
+                vicreg_covariance_weight=args.vicreg_covariance_weight,
+                vicreg_target_std=args.vicreg_target_std,
             )
             save_world_model(model, metrics, str(output_dir))
 

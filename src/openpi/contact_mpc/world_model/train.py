@@ -108,6 +108,50 @@ def build_dataset_for_horizon(
     return h, a, fh
 
 
+def _infonce_loss(predicted: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Contrastive loss that pulls predictions onto the real-feature manifold.
+
+    For a batch of (predicted_i, real_i) pairs, encourages cosine similarity
+    between each predicted and its own target to exceed similarity to other
+    targets in the batch. Directly penalizes off-manifold outputs.
+
+    Reference: van den Oord 2018, applied to MBRL in VICReg-MBRL lineage.
+    """
+    p = torch.nn.functional.normalize(predicted, dim=-1)
+    t = torch.nn.functional.normalize(target, dim=-1)
+    logits = (p @ t.T) / max(temperature, 1e-6)  # [B, B]
+    labels = torch.arange(len(p), device=p.device)
+    return torch.nn.functional.cross_entropy(logits, labels)
+
+
+def _vicreg_loss(
+    x: torch.Tensor,
+    target_std: float = 1.0,
+    variance_weight: float = 1.0,
+    covariance_weight: float = 0.04,
+) -> torch.Tensor:
+    """VICReg regularizer: push per-dim std toward target_std and decorrelate dims.
+
+    Variance term prevents mean-regression collapse (LeWM's mechanism).
+    Covariance term prevents dimensional redundancy.
+
+    Reference: Bardes, Ponce, LeCun — VICReg (ICLR 2022); used here on the
+    predictor's *output* distribution to attack predictor-side collapse.
+    """
+    B, D = x.shape
+    # Variance: penalize std(dim) < target_std
+    std = torch.sqrt(x.var(dim=0) + 1e-4)
+    L_var = torch.mean(torch.nn.functional.relu(target_std - std))
+
+    # Covariance: penalize off-diagonal covariance
+    x_centered = x - x.mean(dim=0, keepdim=True)
+    cov = (x_centered.T @ x_centered) / max(B - 1, 1)
+    off_diag = cov - torch.diag(torch.diag(cov))
+    L_cov = (off_diag ** 2).sum() / D
+
+    return variance_weight * L_var + covariance_weight * L_cov
+
+
 def train_world_model(
     features: FeatureDataset,
     horizon: int,
@@ -119,6 +163,14 @@ def train_world_model(
     val_fraction: float = 0.15,
     patience: int = 10,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    # --- regularizers (default off — strict backward compat) ---
+    use_infonce: bool = False,
+    infonce_weight: float = 0.1,
+    infonce_temperature: float = 0.1,
+    use_vicreg: bool = False,
+    vicreg_variance_weight: float = 1.0,
+    vicreg_covariance_weight: float = 0.04,
+    vicreg_target_std: float = 1.0,
 ) -> tuple[LatentWorldModel, dict]:
     """Train the world model and return the model + training metrics.
 
@@ -133,6 +185,16 @@ def train_world_model(
         val_fraction: Fraction of data for validation.
         patience: Early stopping patience (epochs without val improvement).
         device: Training device.
+        use_infonce: If True, add an InfoNCE contrastive term that pulls
+            predicted features toward real features on the same manifold.
+            Attacks manifold-drift failure mode (see diagnose_world_model.py).
+        infonce_weight: Weight of the InfoNCE term relative to MSE.
+        infonce_temperature: Softmax temperature for the InfoNCE logits.
+        use_vicreg: If True, add VICReg regularization on the predictor's
+            outputs. Attacks variance-collapse failure mode.
+        vicreg_variance_weight: Weight of the variance-floor term.
+        vicreg_covariance_weight: Weight of the off-diagonal covariance penalty.
+        vicreg_target_std: Target per-dim std for the variance term.
 
     Returns:
         Tuple of (trained_model, metrics_dict).
@@ -182,21 +244,50 @@ def train_world_model(
     train_losses = []
     val_losses = []
 
+    # Track component losses separately for diagnostics
+    component_hist: dict[str, list[float]] = {"mse": [], "infonce": [], "vicreg": []}
+
     for epoch in range(num_epochs):
         # Train
         model.train()
         epoch_loss = 0.0
+        epoch_mse = 0.0
+        epoch_infonce = 0.0
+        epoch_vicreg = 0.0
         for batch_h, batch_a, batch_fh in train_loader:
             batch_h, batch_a, batch_fh = batch_h.to(device), batch_a.to(device), batch_fh.to(device)
             pred = model(batch_h, batch_a)
-            loss = criterion(pred, batch_fh)
+
+            L_mse = criterion(pred, batch_fh)
+            loss = L_mse
+            epoch_mse += L_mse.item() * len(batch_h)
+
+            if use_infonce:
+                L_nce = _infonce_loss(pred, batch_fh, infonce_temperature)
+                loss = loss + infonce_weight * L_nce
+                epoch_infonce += L_nce.item() * len(batch_h)
+
+            if use_vicreg:
+                L_vic = _vicreg_loss(
+                    pred,
+                    target_std=vicreg_target_std,
+                    variance_weight=vicreg_variance_weight,
+                    covariance_weight=vicreg_covariance_weight,
+                )
+                loss = loss + L_vic
+                epoch_vicreg += L_vic.item() * len(batch_h)
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_loss += loss.item() * len(batch_h)
+
         train_loss = epoch_loss / n_train
         train_losses.append(train_loss)
+        component_hist["mse"].append(epoch_mse / n_train)
+        component_hist["infonce"].append(epoch_infonce / n_train if use_infonce else 0.0)
+        component_hist["vicreg"].append(epoch_vicreg / n_train if use_vicreg else 0.0)
 
         # Validate
         model.eval()
@@ -249,6 +340,15 @@ def train_world_model(
         "horizon": horizon,
         "size": size,
         "contact_only": contact_only,
+        "use_infonce": use_infonce,
+        "infonce_weight": infonce_weight if use_infonce else 0.0,
+        "infonce_temperature": infonce_temperature if use_infonce else 0.0,
+        "use_vicreg": use_vicreg,
+        "vicreg_variance_weight": vicreg_variance_weight if use_vicreg else 0.0,
+        "vicreg_covariance_weight": vicreg_covariance_weight if use_vicreg else 0.0,
+        "component_mse_final": component_hist["mse"][-1] if component_hist["mse"] else 0.0,
+        "component_infonce_final": component_hist["infonce"][-1] if component_hist["infonce"] else 0.0,
+        "component_vicreg_final": component_hist["vicreg"][-1] if component_hist["vicreg"] else 0.0,
     }
 
     logger.info(f"  Best val loss: {best_val_loss:.6f}")
@@ -267,6 +367,10 @@ def save_world_model(model: LatentWorldModel, metrics: dict, output_dir: str) ->
     tag = f"H{metrics['horizon']}_{metrics['size']}"
     if metrics["contact_only"]:
         tag += "_contact"
+    if metrics.get("use_infonce"):
+        tag += "_nce"
+    if metrics.get("use_vicreg"):
+        tag += "_vic"
 
     torch.save(model.state_dict(), output_dir / f"world_model_{tag}.pt")
     torch.save(model.config, output_dir / f"world_model_config_{tag}.pt")
