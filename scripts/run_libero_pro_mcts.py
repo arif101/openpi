@@ -94,6 +94,10 @@ def parse_args():
     p.add_argument("--mcts-c-puct", type=float, default=1.4)
     p.add_argument("--mcts-everywhere", action="store_true",
                    help="Run MCTS at every decision, not just contact events (slower).")
+    p.add_argument("--verbose-mcts", action="store_true",
+                   help="Log MCTS diagnostics (visit counts, score spreads) at every "
+                        "search call. Useful for smoke-testing whether search is "
+                        "discriminating between candidates.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -285,6 +289,7 @@ def run_episode(
     mcts_planner: MCTSPlanner | None,
     mcts_everywhere: bool,
     policy_sampler: Pi05PolicySampler | None,
+    verbose_mcts: bool = False,
 ) -> dict:
     """Run one LIBERO episode under one mode; return outcome + telemetry."""
     env.reset()
@@ -337,6 +342,19 @@ def run_episode(
 
                 action_chunk, diag = mcts_planner.plan(h_root)
                 mcts_calls += 1
+
+                if verbose_mcts:
+                    visits = diag["child_visits"]
+                    qs = diag["child_Q"]
+                    q_spread = max(qs) - min(qs) if qs else 0.0
+                    visit_concentration = max(visits) / max(sum(visits), 1)
+                    print(
+                        f"    [MCTS t={t}] visits={visits} "
+                        f"Q_spread={q_spread:.4f} "
+                        f"top_visit_frac={visit_concentration:.2f} "
+                        f"chosen_idx={diag['chosen_idx']}",
+                        flush=True,
+                    )
             else:
                 result = policy.infer(dict(obs_element))
                 action_chunk = np.asarray(result["actions"], dtype=np.float32)
@@ -360,7 +378,7 @@ def run_episode(
     }
 
 
-def run_suite(*, policy, task_suite, args, mode, mcts_planner, policy_sampler):
+def run_suite(*, policy, task_suite, args, mode, mcts_planner, policy_sampler, verbose_mcts=False):
     """Run (max_tasks × num_trials) episodes under one mode."""
     num_tasks = args.max_tasks or task_suite.n_tasks
     max_steps = MAX_STEPS[args.task_suite]
@@ -402,6 +420,7 @@ def run_suite(*, policy, task_suite, args, mode, mcts_planner, policy_sampler):
                 mcts_planner=mcts_planner,
                 mcts_everywhere=args.mcts_everywhere,
                 policy_sampler=policy_sampler,
+                verbose_mcts=verbose_mcts,
             )
             total_episodes += 1
             total_mcts_calls += result["mcts_calls"]
@@ -509,6 +528,7 @@ def main():
     mcts_out = run_suite(
         policy=policy, task_suite=task_suite, args=args,
         mode="mcts", mcts_planner=planner, policy_sampler=sampler,
+        verbose_mcts=args.verbose_mcts,
     )
 
     # Report
