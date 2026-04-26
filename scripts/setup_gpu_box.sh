@@ -137,11 +137,35 @@ else
 fi
 
 # -------------------------------------------------------------------------
+step "4b. Train action-conditional Q(h, a) value function"
+#
+# This is the Sprint 1 "better VF" experiment: action-conditional scorer
+# with feature-space perturbation augmentation. Replaces V(h) for the
+# LIBERO-90 robustness eval. Skip if checkpoint already exists.
+
+QHA_DIR="data/contact_mpc/q_function_libero90"
+QHA_CKPT="$QHA_DIR/q_function.pt"
+QHA_CFG="$QHA_DIR/q_function_config.pt"
+mkdir -p "$QHA_DIR"
+
+if [[ -f "$QHA_CKPT" && -f "$QHA_CFG" ]]; then
+    log "[skip] Q(h, a) already trained at $QHA_CKPT"
+else
+    log "Training Q(h, a) (est. 30-45 min on A40)..."
+    PYTHONPATH="$REPO_ROOT/src" uv run python3 -u scripts/run_train_q_function.py \
+        --features-files "$HF_REPO:libero90_features_H10.npz" \
+        --output-dir "$QHA_DIR" \
+        --perturb-noise-std-fraction 0.1 \
+        --num-epochs 100 \
+        --batch-size 256
+fi
+
+# -------------------------------------------------------------------------
 step "5. Run unit tests"
 
 PYTHONPATH="$REPO_ROOT/src" uv run python3 -m pytest \
-    src/openpi/contact_mpc/attribution/ \
-    src/openpi/contact_mpc/eval/ \
+    src/openpi/contact_mpc/planner/mcts_test.py \
+    src/openpi/contact_mpc/value_function/pairwise_dataset_test.py \
     --no-header --noconftest -q
 
 # -------------------------------------------------------------------------
@@ -151,7 +175,21 @@ log "Artifacts ready:"
 ls -lh "$ROLLOUTS_NPZ" "$FEATURES_NPZ" "$PROBE_PKL" 2>/dev/null || true
 ls -lh "$WM_CKPT" "$WM_CFG" 2>/dev/null || true
 ls -lh "$VF_CKPT" "$VF_CFG" 2>/dev/null || true
+ls -lh "$QHA_CKPT" "$QHA_CFG" 2>/dev/null || true
 ls -lh "$TARGET_WM" "$TARGET_CFG" 2>/dev/null || true
 
 log ""
-log "Done. Next: set ANTHROPIC_API_KEY and run the Stage A smoke test from demo/README.md."
+log "Done. Next: run the LIBERO-PRO eval gate."
+log ""
+log "Reproduce the Phase 5 baseline (V(h) + MCTS, seed=7, 5cm):"
+log "  PYTHONPATH=src:third_party/libero MUJOCO_GL=egl uv run python3 -u \\"
+log "    scripts/run_libero_pro_mcts.py \\"
+log "    --world-model $TARGET_WM --value-function $VF_CKPT \\"
+log "    --value-function-type v --task-suite libero_10 \\"
+log "    --num-trials 5 --perturbation-cm 5.0 --seed 7 \\"
+log "    --mcts-width-k 4 --mcts-max-depth 1 --mcts-num-simulations 32 \\"
+log "    --output-dir data/contact_mpc/baseline_check"
+log ""
+log "Run Q(h, a) + MCTS on LIBERO-90 (the decision gate):"
+log "  ... same command but --value-function $QHA_CKPT --value-function-type qha"
+log "      --task-suite libero_90"
