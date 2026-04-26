@@ -23,6 +23,8 @@ REPO_ROOT="${REPO_ROOT:-/workspace/openpi}"
 cd "$REPO_ROOT"
 
 HF_REPO="arif101/libero90_vlm_features"
+ARTIFACTS_HF_REPO="${ARTIFACTS_HF_REPO:-arif101/openpi-mcts-artifacts}"
+ARTIFACTS_TARBALL="${ARTIFACTS_TARBALL:-gpu_artifacts.tar.gz}"
 ROLLOUTS_DIR="data/contact_mpc/rollouts"
 FEATURES_DIR="data/contact_mpc/features"
 WM_DIR="data/contact_mpc/world_model"
@@ -33,6 +35,46 @@ mkdir -p "$ROLLOUTS_DIR" "$FEATURES_DIR" "$WM_DIR" "$WM_TARGET_DIR" "$VF_DIR"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 step() { log ""; log "===== $* ====="; }
+
+# -------------------------------------------------------------------------
+step "0. Restore prior artifacts from HF (if available)"
+#
+# Pulls the gpu_artifacts.tar.gz that save_gpu_artifacts.sh uploaded to
+# $ARTIFACTS_HF_REPO. Untars in place so that the trained WM + V(h)
+# checkpoints + symlinks land at their canonical paths and the steps
+# below short-circuit ("[skip] X already trained").
+#
+# Disable by setting ARTIFACTS_HF_REPO=- (any value where the dataset
+# doesn't exist will also just log a warning and continue from scratch).
+
+if [[ -f "$WM_DIR/world_model_H10_medium.pt" && -f "$VF_DIR/value_function.pt" ]]; then
+    log "[skip] WM + V(h) already on disk — not pulling tarball"
+elif [[ "$ARTIFACTS_HF_REPO" == "-" ]]; then
+    log "[skip] ARTIFACTS_HF_REPO=-, training from scratch"
+else
+    log "Pulling $ARTIFACTS_TARBALL from HF dataset $ARTIFACTS_HF_REPO..."
+    uv run python3 - <<PY || log "  WARN: tarball pull failed; will train from scratch"
+import shutil, pathlib, sys
+from huggingface_hub import hf_hub_download
+try:
+    src = hf_hub_download(
+        repo_id="$ARTIFACTS_HF_REPO",
+        filename="$ARTIFACTS_TARBALL",
+        repo_type="dataset",
+    )
+    dst = pathlib.Path("$ARTIFACTS_TARBALL")
+    shutil.copy(src, dst)
+    print(f"Pulled to {dst} ({dst.stat().st_size / 1e6:.1f} MB)")
+except Exception as e:
+    print(f"Failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+    if [[ -f "$ARTIFACTS_TARBALL" ]]; then
+        log "Extracting $ARTIFACTS_TARBALL..."
+        tar xzf "$ARTIFACTS_TARBALL"
+        log "Extracted. WM + V(h) + experiment results restored."
+    fi
+fi
 
 # -------------------------------------------------------------------------
 step "1. Verify environment"
