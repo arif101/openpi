@@ -195,7 +195,7 @@ if [[ -f "$QHA_CKPT" && -f "$QHA_CFG" ]]; then
 else
     log "Training Q(h, a) (est. 30-45 min on A40)..."
     PYTHONPATH="$REPO_ROOT/src" uv run python3 -u scripts/run_train_q_function.py \
-        --features-files "$HF_REPO:libero90_features_H10.npz" \
+        --rollouts-files "$HF_REPO:rollouts_libero_90.npz" \
         --output-dir "$QHA_DIR" \
         --perturb-noise-std-fraction 0.1 \
         --num-epochs 100 \
