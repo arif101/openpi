@@ -37,7 +37,19 @@ log() { echo "[$(date '+%F %T')] $*"; }
 step() { log ""; log "===== $* ====="; }
 
 # -------------------------------------------------------------------------
-step "0. Restore prior artifacts from HF (if available)"
+step "0a. Initialize git submodules (LIBERO, aloha)"
+#
+# `git clone` without --recurse-submodules leaves third_party/libero empty,
+# which causes `ModuleNotFoundError: No module named 'libero'` at eval time.
+# Idempotent — already-initialized submodules are no-ops.
+
+if [[ -f .gitmodules ]]; then
+    git submodule update --init --recursive
+    log "Submodules initialized."
+fi
+
+# -------------------------------------------------------------------------
+step "0b. Restore prior artifacts from HF (if available)"
 #
 # Pulls the gpu_artifacts.tar.gz that save_gpu_artifacts.sh uploaded to
 # $ARTIFACTS_HF_REPO. Untars in place so that the trained WM + V(h)
