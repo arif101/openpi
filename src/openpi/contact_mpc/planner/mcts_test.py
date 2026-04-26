@@ -38,7 +38,7 @@ def _make_biased_world_model():
 def _make_linear_value_fn():
     """value_fn(h) = sum(h). With biased WM, bigger actions -> bigger values."""
 
-    def v(h):
+    def v(h, action_chunk=None, *, frame=None, task=None):
         return float(np.sum(np.atleast_1d(h)))
 
     return v
@@ -179,7 +179,7 @@ class TestMCTSPlanner:
         planner = MCTSPlanner(
             policy_sampler=_make_policy_sampler(actions, priors),
             world_model=lambda h, a: h,  # identity WM
-            value_fn=lambda h: 0.0,       # flat value -> only prior matters
+            value_fn=lambda h, a=None, *, frame=None, task=None: 0.0,  # flat value -> only prior matters
             config=MCTSConfig(
                 num_simulations=20, width_k=4, max_depth=1,
                 c_puct=1.4, prior_temperature=0.5,

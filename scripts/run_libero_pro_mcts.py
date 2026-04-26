@@ -52,7 +52,10 @@ from openpi_client import image_tools
 
 from openpi.contact_mpc.planner.mcts import MCTSConfig
 from openpi.contact_mpc.planner.mcts import MCTSPlanner
-from openpi.contact_mpc.value_function.architecture import PairwiseValueFunction
+from openpi.contact_mpc.value_function.architecture import (
+    ActionConditionalValueFunction,
+    PairwiseValueFunction,
+)
 from openpi.contact_mpc.world_model.architecture import LatentWorldModel
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
@@ -78,6 +81,13 @@ def parse_args():
     p.add_argument("--world-model-config", default=None)
     p.add_argument("--value-function", required=True)
     p.add_argument("--value-function-config", default=None)
+    p.add_argument(
+        "--value-function-type",
+        choices=["v", "qha"],
+        default="v",
+        help="'v' = legacy V(h) PairwiseValueFunction. "
+             "'qha' = action-conditional ActionConditionalValueFunction Q(h, a).",
+    )
     p.add_argument("--task-suite", default="libero_10")
     p.add_argument("--num-trials", type=int, default=5)
     p.add_argument("--num-steps-wait", type=int, default=10)
@@ -234,16 +244,67 @@ class TorchWorldModelAdapter:
 
 
 class TorchValueFnAdapter:
-    """Wraps a PyTorch PairwiseValueFunction as a scalar callable."""
+    """Wraps a PyTorch PairwiseValueFunction V(h) as a ValueFn callable.
+
+    The widened ValueFn protocol passes ``action_chunk``, ``frame``, and
+    ``task`` as extra args; this adapter ignores them (V(h) doesn't need them).
+    """
 
     def __init__(self, value_fn: PairwiseValueFunction, device):
         self.vf = value_fn
         self.device = device
 
-    def __call__(self, hidden_state: np.ndarray) -> float:
+    def __call__(
+        self,
+        hidden_state: np.ndarray,
+        action_chunk: np.ndarray | None = None,
+        *,
+        frame: np.ndarray | None = None,
+        task: str | None = None,
+    ) -> float:
         h = torch.tensor(hidden_state, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             return float(self.vf(h).item())
+
+
+class TorchQFnAdapter:
+    """Wraps a PyTorch ActionConditionalValueFunction Q(h, a) as a ValueFn callable.
+
+    Requires ``action_chunk`` to be passed by MCTS. If absent (e.g., a depth-0
+    bootstrap call that we don't currently make), falls back to scoring with
+    a zero action chunk so the call doesn't crash.
+    """
+
+    def __init__(self, q_fn: ActionConditionalValueFunction, device):
+        self.q = q_fn
+        self.device = device
+        self.horizon = q_fn.action_chunk_horizon
+        self.action_dim = q_fn.action_dim
+
+    def __call__(
+        self,
+        hidden_state: np.ndarray,
+        action_chunk: np.ndarray | None = None,
+        *,
+        frame: np.ndarray | None = None,
+        task: str | None = None,
+    ) -> float:
+        if action_chunk is None:
+            action_chunk = np.zeros((self.horizon, self.action_dim), dtype=np.float32)
+        # Pad / truncate to expected horizon
+        if action_chunk.shape[0] < self.horizon:
+            pad = np.zeros(
+                (self.horizon - action_chunk.shape[0], action_chunk.shape[1]),
+                dtype=np.float32,
+            )
+            action_chunk = np.concatenate([action_chunk, pad], axis=0)
+        elif action_chunk.shape[0] > self.horizon:
+            action_chunk = action_chunk[: self.horizon]
+
+        h = torch.tensor(hidden_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        a = torch.tensor(action_chunk, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            return float(self.q(h, a).item())
 
 
 # -------------------- Checkpoint loading --------------------
@@ -268,6 +329,28 @@ def load_value_function(ckpt_path: str, cfg_path: str | None, device) -> Pairwis
     vf.load_state_dict(torch.load(ckpt_path, weights_only=True))
     vf = vf.to(device).eval()
     return vf
+
+
+def load_q_function(
+    ckpt_path: str, cfg_path: str | None, device,
+) -> ActionConditionalValueFunction:
+    cfg = torch.load(cfg_path or _default_cfg_path(ckpt_path), weights_only=False)
+    if cfg.get("type") and cfg["type"] != "ActionConditionalValueFunction":
+        raise ValueError(
+            f"Expected ActionConditionalValueFunction config at {cfg_path}, "
+            f"got type={cfg.get('type')!r}"
+        )
+    q = ActionConditionalValueFunction(
+        hidden_state_dim=cfg["hidden_state_dim"],
+        action_chunk_horizon=cfg["action_chunk_horizon"],
+        action_dim=cfg["action_dim"],
+        action_emb_dim=cfg.get("action_emb_dim", 128),
+        hidden_dim=cfg.get("hidden_dim", 256),
+        dropout=cfg.get("dropout", 0.0),  # eval-time: dropout off
+    )
+    q.load_state_dict(torch.load(ckpt_path, weights_only=True))
+    q = q.to(device).eval()
+    return q
 
 
 # -------------------- Evaluation loops --------------------
@@ -340,7 +423,11 @@ def run_episode(
                 # Seed the sampler cache so we don't waste the first call
                 policy_sampler._cached_prior_features = h_root  # noqa: SLF001
 
-                action_chunk, diag = mcts_planner.plan(h_root)
+                action_chunk, diag = mcts_planner.plan(
+                    h_root,
+                    frame=obs_element["observation/image"],
+                    task=obs_element["prompt"],
+                )
                 mcts_calls += 1
 
                 if verbose_mcts:
@@ -472,8 +559,17 @@ def main():
     wm = load_world_model(args.world_model, args.world_model_config, device)
     print(f"  {wm.param_count():,} params, hidden_dim={wm.config.hidden_dim}, H={wm.config.max_horizon}", flush=True)
 
-    print(f"Loading value function from {args.value_function}", flush=True)
-    vf = load_value_function(args.value_function, args.value_function_config, device)
+    print(
+        f"Loading value function from {args.value_function} "
+        f"(type={args.value_function_type})",
+        flush=True,
+    )
+    if args.value_function_type == "v":
+        vf = load_value_function(args.value_function, args.value_function_config, device)
+    elif args.value_function_type == "qha":
+        vf = load_q_function(args.value_function, args.value_function_config, device)
+    else:
+        raise ValueError(f"Unknown --value-function-type: {args.value_function_type!r}")
     print(f"  {vf.param_count():,} params", flush=True)
 
     print("Loading Pi0.5 policy...", flush=True)
@@ -492,7 +588,10 @@ def main():
 
     # Build MCTS components (adapter fns + planner)
     wm_fn = TorchWorldModelAdapter(wm, device)
-    vf_fn = TorchValueFnAdapter(vf, device)
+    if args.value_function_type == "v":
+        vf_fn = TorchValueFnAdapter(vf, device)
+    else:
+        vf_fn = TorchQFnAdapter(vf, device)
     # policy_sampler's obs is rebound per-decision; placeholder init
     placeholder_obs = {
         "observation/image": np.zeros((RESIZE_SIZE, RESIZE_SIZE, 3), dtype=np.uint8),

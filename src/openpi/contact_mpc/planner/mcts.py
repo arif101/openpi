@@ -47,11 +47,21 @@ class WorldModelFn(Protocol):
 
 
 class ValueFn(Protocol):
-    """Callable scoring a hidden state. Higher is better."""
+    """Callable scoring a hidden state. Higher is better.
+
+    Extra context (action_chunk leading to the leaf, the root frame, the task
+    instruction) is optional — pure-latent value functions ignore it. Frame +
+    task are needed by foundation PRMs (Robometer, Sonnet) that score over
+    pixels and language rather than latents.
+    """
 
     def __call__(
         self,
-        hidden_state: np.ndarray,  # [hidden_dim]
+        hidden_state: np.ndarray,             # [hidden_dim]
+        action_chunk: np.ndarray | None = None,  # edge that produced this leaf
+        *,
+        frame: np.ndarray | None = None,      # root-call image (HxWx3 uint8)
+        task: str | None = None,              # natural-language instruction
     ) -> float:
         ...
 
@@ -141,8 +151,19 @@ class MCTSPlanner:
         self.config = config or MCTSConfig()
         self.rng = rng or np.random.default_rng(0)
 
-    def plan(self, root_hidden_state: np.ndarray) -> tuple[np.ndarray, dict]:
-        """Run MCTS and return (chosen_action_chunk, diagnostics)."""
+    def plan(
+        self,
+        root_hidden_state: np.ndarray,
+        *,
+        frame: np.ndarray | None = None,
+        task: str | None = None,
+    ) -> tuple[np.ndarray, dict]:
+        """Run MCTS and return (chosen_action_chunk, diagnostics).
+
+        ``frame`` and ``task`` are forwarded to value_fn calls — needed by
+        foundation PRMs that score (frame, task, action_chunk). Latent-only
+        value functions ignore them.
+        """
         root = MCTSNode(
             hidden_state=root_hidden_state,
             parent=None,
@@ -161,7 +182,12 @@ class MCTSPlanner:
                 )
             if not leaf.is_expanded and leaf.depth < self.config.max_depth:
                 self._expand(leaf)
-            value = self.value_fn(leaf.hidden_state)
+            value = self.value_fn(
+                leaf.hidden_state,
+                leaf.action_chunk,
+                frame=frame,
+                task=task,
+            )
             self._backprop(leaf, value)
 
         if not root.children:
