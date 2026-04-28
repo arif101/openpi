@@ -1,41 +1,48 @@
 {
-  "_comment": "Hand-written prompt overrides for LIBERO-90 tasks where Pi0.5 baseline got 0/5 in the V(h) seed=7 5cm eval (2026-04-27, data/contact_mpc/v_libero90/...). Each task has 1-3 candidate rephrasings. Strategy: (1) decompose compound steps into the FIRST primitive only, (2) make the spatial reference more explicit, (3) emphasize grasping/contact when applicable. We test which (if any) breaks the 0% ceiling.",
+  "_comment": "Hand-written prompt overrides for LIBERO-90 tasks where Pi0.5 baseline got 0/5 in the V(h) seed=7 5cm eval (data/contact_mpc/v_libero90/...). Keys are 0-indexed task_ids (passed to task_suite.get_task). Strategies: (A) decompose compound steps to the FIRST primitive, (B) emphasize grasping/contact, (C) make spatial reference explicit.",
 
+  "1": [
+    "close the top drawer of the cabinet"
+  ],
+  "3": [
+    "open the top drawer of the cabinet",
+    "grasp the butter at the back"
+  ],
   "4": [
     "open the top drawer of the cabinet",
-    "grasp the top drawer handle"
+    "grasp the butter at the front"
   ],
   "5": [
     "open the top drawer of the cabinet",
-    "grasp the top drawer handle"
-  ],
-  "6": [
-    "open the top drawer of the cabinet",
     "grasp the chocolate pudding"
   ],
-  "7": [
+  "6": [
     "grasp the bottom drawer handle",
     "pull the bottom drawer outward",
     "reach toward the bottom drawer handle"
   ],
-  "8": [
+  "7": [
     "grasp the top drawer handle",
     "pull the top drawer outward",
     "reach toward the top drawer handle"
   ],
-  "16": [
+  "11": [
+    "grasp the top drawer handle",
+    "pull the top drawer outward"
+  ],
+  "15": [
     "grasp the middle black bowl",
     "pick up the middle black bowl"
   ],
-  "17": [
+  "16": [
     "grasp the front black bowl",
     "pick up the front black bowl"
   ],
-  "18": [
+  "17": [
     "grasp the middle black bowl",
     "pick up the middle black bowl"
   ],
-  "19": [
+  "18": [
     "grasp the frying pan",
     "pick up the frying pan handle"
   ]

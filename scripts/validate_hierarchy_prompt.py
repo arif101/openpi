@@ -178,6 +178,22 @@ def main():
     target_task_ids = sorted(overrides.keys())
     print(f"Loaded overrides for {len(target_task_ids)} tasks: {target_task_ids}", flush=True)
 
+    # Pre-flight alignment check: print (task_id, real task language, overrides)
+    # BEFORE loading the policy / running episodes so the user can ctrl-C if a
+    # mapping looks wrong.
+    print("\n=== Alignment check (verify each override matches the task) ===", flush=True)
+    benchmark_dict_pre = benchmark.get_benchmark_dict()
+    suite_pre = benchmark_dict_pre[args.task_suite]()
+    for tid in target_task_ids:
+        try:
+            t = suite_pre.get_task(tid)
+            print(f"  task_id={tid}: \"{t.language}\"", flush=True)
+            for ov in overrides[tid]:
+                print(f"      override: \"{ov}\"", flush=True)
+        except Exception as e:
+            print(f"  task_id={tid}: ERROR loading task — {e}", flush=True)
+    print("=" * 70, flush=True)
+
     # Load policy
     print("Loading Pi0.5 policy...", flush=True)
     from openpi.shared import download
