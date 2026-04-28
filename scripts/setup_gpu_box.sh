@@ -191,20 +191,24 @@ else
 fi
 
 # -------------------------------------------------------------------------
-step "4b. Train action-conditional Q(h, a) value function"
+step "4b. Train action-conditional Q(h, a) value function (opt-in)"
 #
-# This is the Sprint 1 "better VF" experiment: action-conditional scorer
-# with feature-space perturbation augmentation. Replaces V(h) for the
-# LIBERO-90 robustness eval. Skip if checkpoint already exists.
+# Sprint 1 result (2026-04-27): Q(h, a) ≈ V(h) on LIBERO-90 perturbed (±1pp);
+# bottleneck is upstream of the VF. Q(h, a) is shelved by default — Phase 2
+# experiments use V(h). Re-enable by setting TRAIN_QHA=1.
 
 QHA_DIR="data/contact_mpc/q_function_libero90"
 QHA_CKPT="$QHA_DIR/q_function.pt"
 QHA_CFG="$QHA_DIR/q_function_config.pt"
-mkdir -p "$QHA_DIR"
+TRAIN_QHA="${TRAIN_QHA:-0}"
 
-if [[ -f "$QHA_CKPT" && -f "$QHA_CFG" ]]; then
+if [[ "$TRAIN_QHA" != "1" ]]; then
+    log "[skip] Q(h, a) training disabled by default (set TRAIN_QHA=1 to enable)."
+    log "       V(h) is the canonical VF for Phase 2 experiments. Q(h, a) shelved per Sprint 1 result."
+elif [[ -f "$QHA_CKPT" && -f "$QHA_CFG" ]]; then
     log "[skip] Q(h, a) already trained at $QHA_CKPT"
 else
+    mkdir -p "$QHA_DIR"
     log "Training Q(h, a) (est. 30-45 min on A40)..."
     PYTHONPATH="$REPO_ROOT/src" uv run python3 -u scripts/run_train_q_function.py \
         --rollouts-files "$HF_REPO:rollouts_libero_90.npz" \
