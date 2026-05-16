@@ -1,0 +1,68 @@
+# Hardcoded end-effector targets for REASON-VLA v3 MPPI refinement.
+#
+# Each entry says: "for THIS task, MPPI should prefer trajectories that
+# end with the gripper near these xyz coordinates."
+#
+# This is a Week-2 prototype hack. Week 3 work: replace this YAML with
+# automatic BDDL goal-predicate parsing that derives targets from the
+# task's success criteria programmatically.
+#
+# The targets below are EDUCATED GUESSES. They were inferred from task
+# descriptions; the actual world-frame coordinates would need to be
+# verified against the LIBERO scene. To find the right xyz, you can
+# look at the BDDL file or run the env and inspect object positions.
+#
+# Coordinate frame: world frame (z up). Typical LIBERO tabletop has
+# table surface at z ≈ 0.82, objects at z ≈ 0.86-0.95.
+
+libero_10:
+  # Task 0: "put both the alphabet soup and the tomato sauce in the basket"
+  # Target = basket center (approximate; verify with env)
+  0:
+    target_xyz: [0.0, 0.20, 0.85]
+    description: "basket center on table"
+
+  # Task 1: "put both the cream cheese box and the butter in the basket"
+  1:
+    target_xyz: [0.0, 0.20, 0.85]
+    description: "basket center on table"
+
+  # Task 2: "turn on the stove and put the moka pot on it"
+  2:
+    target_xyz: [-0.10, -0.10, 0.95]
+    description: "stove burner location"
+
+  # Task 3: "put the black bowl in the bottom drawer of the cabinet and close it"
+  3:
+    target_xyz: [-0.15, -0.20, 0.75]
+    description: "cabinet bottom drawer interior"
+
+  # Task 4: "put the white mug on the left plate and put the yellow pizza on the right plate"
+  4:
+    target_xyz: [-0.20, 0.0, 0.88]
+    description: "left plate position"
+
+  # Task 5: "pick up the book and place it in the back compartment of the caddy"
+  5:
+    target_xyz: [0.10, -0.20, 0.90]
+    description: "back compartment of caddy"
+
+  # Task 6: "put the white mug on the plate and put the chocolate pudding to the right of the plate"
+  6:
+    target_xyz: [0.0, 0.0, 0.90]
+    description: "plate center"
+
+  # Task 7: "put both the alphabet soup and the cream cheese box in the basket"
+  7:
+    target_xyz: [0.0, 0.20, 0.85]
+    description: "basket center"
+
+  # Task 8: "put both moka pots on the stove"
+  8:
+    target_xyz: [-0.10, -0.10, 0.95]
+    description: "stove burner location"
+
+  # Task 9: "put the yellow and white mug in the microwave and close it"
+  9:
+    target_xyz: [0.20, -0.10, 0.95]
+    description: "microwave interior"
