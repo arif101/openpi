@@ -116,7 +116,9 @@ def main() -> int:
         print(f"    rollout time: {dt_ms:.1f}ms ({dt_ms/H:.2f}ms per step)", flush=True)
         print(f"    initial EE pose: {roll.ee_pose_traj[0, :3]}", flush=True)
         print(f"    final EE pose:   {roll.ee_pose_traj[-1, :3]}", flush=True)
-        print(f"    contact counts: {roll.contact_counts.tolist()}", flush=True)
+        print(f"    contact counts (raw): {roll.contact_counts.tolist()}", flush=True)
+        print(f"    penetration total: {roll.penetration_total.sum():.4f}m  "
+              f"(robot-only: {roll.robot_penetration.sum():.4f}m)", flush=True)
     except Exception as e:
         print(f"    FAIL: {e}", flush=True)
         import traceback; traceback.print_exc()
@@ -126,11 +128,13 @@ def main() -> int:
     print("\n[4] Cost breakdown for zero action vs zero prior...", flush=True)
     try:
         cost = ev.cost(roll, zero_action, prior_action=zero_action)
-        print(f"    joint_limit:     {cost.joint_limit:.4f}", flush=True)
-        print(f"    collision_count: {cost.collision_count:.4f}", flush=True)
-        print(f"    end_effector:    {cost.end_effector:.4f}", flush=True)
-        print(f"    anchor:          {cost.anchor:.4f}", flush=True)
-        print(f"    total:           {cost.total:.4f}", flush=True)
+        print(f"    joint_limit:           {cost.joint_limit:.4f}", flush=True)
+        print(f"    collision_penetration: {cost.collision_penetration:.6f}m", flush=True)
+        print(f"    end_effector:          {cost.end_effector:.4f}", flush=True)
+        print(f"    anchor:                {cost.anchor:.4f}", flush=True)
+        print(f"    raw_contact_count:     {cost.raw_contact_count:.0f}  (diagnostic only)",
+              flush=True)
+        print(f"    total:                 {cost.total:.4f}", flush=True)
     except Exception as e:
         print(f"    FAIL: {e}", flush=True)
         import traceback; traceback.print_exc()
@@ -157,8 +161,11 @@ def main() -> int:
         sample_costs.sort(key=lambda x: x[1])
         print(f"    cost range: {sample_costs[0][1]:.3f} (best) — {sample_costs[-1][1]:.3f} (worst)",
               flush=True)
+        print(f"    spread: {sample_costs[-1][1] - sample_costs[0][1]:.3f}  "
+              f"(if spread ≈ 0, MPPI won't discriminate — re-tune weights)",
+              flush=True)
         print(f"    best sample components: jl={sample_costs[0][2].joint_limit:.3f} "
-              f"coll={sample_costs[0][2].collision_count:.1f} "
+              f"coll={sample_costs[0][2].collision_penetration:.4f}m "
               f"ee={sample_costs[0][2].end_effector:.4f} "
               f"anchor={sample_costs[0][2].anchor:.3f}", flush=True)
     except Exception as e:

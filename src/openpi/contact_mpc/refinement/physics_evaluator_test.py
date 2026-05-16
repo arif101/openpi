@@ -65,6 +65,8 @@ def test_rollout_returns_correct_shapes(evaluator):
     assert roll.qvel_traj.shape == (H + 1, evaluator.model.nv)
     assert roll.ee_pose_traj.shape == (H + 1, 7)
     assert roll.contact_counts.shape == (H,)
+    assert roll.penetration_total.shape == (H,)
+    assert roll.robot_penetration.shape == (H,)
     assert roll.joint_limit_margin.shape == (H + 1, evaluator.model.njnt)
 
 
@@ -166,19 +168,21 @@ def test_cost_ee_target_distance(evaluator):
 
 
 def test_weighted_total_matches_components(evaluator):
-    """Verify that total == w.jl·jl + w.coll·coll + w.ee·ee + w.anchor·anchor."""
+    """Verify that total == sum of (weight · component)."""
     H = 3
     init_qpos = np.zeros(evaluator.model.nq)
     init_qvel = np.zeros(evaluator.model.nv)
     action_chunk = np.ones((H, evaluator.model.nu)) * 0.2
     prior_action = np.zeros_like(action_chunk)
 
-    weights = CostWeights(joint_limit=10.0, collision_count=2.0, end_effector=3.0, anchor=4.0)
+    weights = CostWeights(
+        joint_limit=10.0, collision_penetration=200.0, end_effector=3.0, anchor=4.0,
+    )
     ev = PhysicsEvaluator.from_xml_string(TEST_XML, ee_body_name="eef", weights=weights)
     roll, cost = ev.evaluate(init_qpos, init_qvel, action_chunk, prior_action)
     expected = (
         weights.joint_limit * cost.joint_limit
-        + weights.collision_count * cost.collision_count
+        + weights.collision_penetration * cost.collision_penetration
         + weights.end_effector * cost.end_effector
         + weights.anchor * cost.anchor
     )

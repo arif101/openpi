@@ -41,6 +41,8 @@ class RolloutResult:
     qvel_traj: np.ndarray            # [H+1, nv]
     ee_pose_traj: np.ndarray         # [H+1, 7] world-frame end-effector (xyz + quaternion wxyz)
     contact_counts: np.ndarray       # [H] number of active contacts per step
+    penetration_total: np.ndarray    # [H] sum of negative contact distances per step (real collisions)
+    robot_penetration: np.ndarray    # [H] same as above but only contacts involving the robot
     joint_limit_margin: np.ndarray   # [H+1, nq] signed distance to nearest limit
                                      #   positive = inside the limit
                                      #   negative = violation magnitude
@@ -50,11 +52,13 @@ class RolloutResult:
 class CostBreakdown:
     """Named cost components + total. All scalar."""
 
-    joint_limit: float       # sum of violations (only positive contributions)
-    collision_count: float   # total contact events
-    end_effector: float      # final EE position vs target (or 0 if no target)
-    anchor: float            # ||action - prior||²
-    total: float             # weighted sum (using weights from PhysicsEvaluator)
+    joint_limit: float           # sum of joint-limit violations
+    collision_penetration: float # sum of (-min(0, dist)) over robot-involved contacts
+    end_effector: float          # final EE position vs target (or 0 if no target)
+    anchor: float                # ||action - prior||²
+    total: float                 # weighted sum (using weights from PhysicsEvaluator)
+    # Diagnostics (not in weighted total but exposed for analysis)
+    raw_contact_count: float     # total contacts (incl. resting); for sanity-check only
 
 
 @dataclasses.dataclass
@@ -62,7 +66,7 @@ class CostWeights:
     """Weights for combining the cost components into a scalar."""
 
     joint_limit: float = 10.0
-    collision_count: float = 1.0
+    collision_penetration: float = 100.0  # large since penetrations are in meters; 1mm = 0.1 cost
     end_effector: float = 1.0
     anchor: float = 0.1
 
@@ -118,6 +122,28 @@ class PhysicsEvaluator:
         self._jnt_qposadr = model.jnt_qposadr.copy()
         self._jnt_type = model.jnt_type.copy()
 
+        # Mark which geoms belong to the robot (for filtering contacts to
+        # "robot vs world" rather than "table vs floor"). A geom is robot if
+        # its body's ancestor chain includes a body whose name starts with
+        # any of the known robot prefixes used by LIBERO / Robosuite.
+        robot_body_prefixes = ("robot0_", "gripper0_", "panda")
+        is_robot_body = np.zeros(model.nbody, dtype=bool)
+        for b in range(model.nbody):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b) or ""
+            if any(name.startswith(p) for p in robot_body_prefixes):
+                is_robot_body[b] = True
+        # Propagate to descendants (a body is robot if any ancestor is robot)
+        for b in range(model.nbody):
+            parent = b
+            while parent > 0:
+                if is_robot_body[parent]:
+                    is_robot_body[b] = True
+                    break
+                parent = model.body_parentid[parent]
+        self._is_robot_geom = np.zeros(model.ngeom, dtype=bool)
+        for g in range(model.ngeom):
+            self._is_robot_geom[g] = is_robot_body[model.geom_bodyid[g]]
+
     @classmethod
     def from_xml_path(cls, xml_path: str, **kwargs) -> "PhysicsEvaluator":
         return cls(mujoco.MjModel.from_xml_path(xml_path), **kwargs)
@@ -170,6 +196,8 @@ class PhysicsEvaluator:
         qvel_traj = np.zeros((H + 1, self.model.nv), dtype=np.float64)
         ee_pose_traj = np.zeros((H + 1, 7), dtype=np.float64)
         contact_counts = np.zeros(H, dtype=np.int32)
+        penetration_total = np.zeros(H, dtype=np.float64)
+        robot_penetration = np.zeros(H, dtype=np.float64)
         joint_limit_margin = np.zeros((H + 1, self.model.njnt), dtype=np.float64)
 
         # Record initial state
@@ -185,6 +213,9 @@ class PhysicsEvaluator:
             qvel_traj[t + 1] = d.qvel
             ee_pose_traj[t + 1] = self._ee_pose(d)
             contact_counts[t] = d.ncon
+            pen_all, pen_robot = self._contact_penetration_stats(d)
+            penetration_total[t] = pen_all
+            robot_penetration[t] = pen_robot
             joint_limit_margin[t + 1] = self._joint_limit_margin(d.qpos)
 
         return RolloutResult(
@@ -192,6 +223,8 @@ class PhysicsEvaluator:
             qvel_traj=qvel_traj,
             ee_pose_traj=ee_pose_traj,
             contact_counts=contact_counts,
+            penetration_total=penetration_total,
+            robot_penetration=robot_penetration,
             joint_limit_margin=joint_limit_margin,
         )
 
@@ -223,8 +256,12 @@ class PhysicsEvaluator:
         else:
             jl_cost = 0.0
 
-        # Collision-count cost: total contact events
-        coll_cost = float(np.sum(rollout.contact_counts))
+        # Collision-penetration cost: only counts ROBOT-involved contacts where
+        # the contact distance is negative (real penetration). Stationary
+        # resting contacts (table-on-floor, object-on-table) have dist ≈ 0 and
+        # don't contribute. This is the bug-fix vs the v1 cost which counted
+        # raw d.ncon (was dominated by ~100 baseline contacts per step).
+        coll_cost = float(np.sum(rollout.robot_penetration))
 
         # End-effector cost: final-step EE position vs target
         if ee_target_xyz is not None:
@@ -242,17 +279,18 @@ class PhysicsEvaluator:
         w = self.weights
         total = (
             w.joint_limit * jl_cost
-            + w.collision_count * coll_cost
+            + w.collision_penetration * coll_cost
             + w.end_effector * ee_cost
             + w.anchor * anchor_cost
         )
 
         return CostBreakdown(
             joint_limit=jl_cost,
-            collision_count=coll_cost,
+            collision_penetration=coll_cost,
             end_effector=ee_cost,
             anchor=anchor_cost,
             total=total,
+            raw_contact_count=float(np.sum(rollout.contact_counts)),
         )
 
     def evaluate(
@@ -271,6 +309,28 @@ class PhysicsEvaluator:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _contact_penetration_stats(self, data: mujoco.MjData) -> tuple[float, float]:
+        """Compute total and robot-only penetration depth at the current state.
+
+        Returns:
+            (penetration_total, robot_penetration) where each is the sum of
+            ``max(0, -dist)`` over contacts (so resting contacts at dist≈0
+            don't contribute; only real penetration does).
+        """
+        if data.ncon == 0:
+            return 0.0, 0.0
+        pen_all = 0.0
+        pen_robot = 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            depth = max(0.0, -float(c.dist))
+            if depth == 0.0:
+                continue
+            pen_all += depth
+            if self._is_robot_geom[c.geom1] or self._is_robot_geom[c.geom2]:
+                pen_robot += depth
+        return pen_all, pen_robot
 
     def _ee_pose(self, data: mujoco.MjData) -> np.ndarray:
         """Extract end-effector pose: (x, y, z, qw, qx, qy, qz)."""
