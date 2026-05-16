@@ -18,7 +18,11 @@ Design decisions:
 Cost components:
 - joint_limit: sum of joint-limit violations across the trajectory
 - collision_count: total contact-event count (gross safety filter)
-- end_effector_distance: final-step gripper position vs target (if provided)
+- target_distance: final-step distance from the *tracked body* (an object the
+  robot is manipulating, or the end-effector by default) to ``target_xyz``.
+  Tracking an object body lets "put X in Y" tasks work without explicit stage
+  detection — once the robot grasps X, X's position tracks the EE, so driving
+  X toward Y naturally encodes both pick and place.
 - anchor: ||action_chunk - prior_action||² (preserves Pi0.5's information)
 
 The refiner layer (later) decides how to weight + combine these.
@@ -46,6 +50,9 @@ class RolloutResult:
     joint_limit_margin: np.ndarray   # [H+1, nq] signed distance to nearest limit
                                      #   positive = inside the limit
                                      #   negative = violation magnitude
+    tracked_body_pos_traj: Optional[np.ndarray] = None
+                                     # [H+1, 3] world-frame xyz of the tracked body if
+                                     # ``target_body_id`` was passed to rollout; else None.
 
 
 @dataclasses.dataclass
@@ -54,7 +61,7 @@ class CostBreakdown:
 
     joint_limit: float           # sum of joint-limit violations
     collision_penetration: float # sum of (-min(0, dist)) over robot-involved contacts
-    end_effector: float          # final EE position vs target (or 0 if no target)
+    target_distance: float       # final tracked-body (or EE) position vs target_xyz (0 if no target)
     anchor: float                # ||action - prior||²
     total: float                 # weighted sum (using weights from PhysicsEvaluator)
     # Diagnostics (not in weighted total but exposed for analysis)
@@ -67,7 +74,7 @@ class CostWeights:
 
     joint_limit: float = 10.0
     collision_penetration: float = 100.0  # large since penetrations are in meters; 1mm = 0.1 cost
-    end_effector: float = 1.0
+    target_distance: float = 1.0
     anchor: float = 0.1
 
 
@@ -157,6 +164,7 @@ class PhysicsEvaluator:
         init_qpos: np.ndarray,
         init_qvel: np.ndarray,
         action_chunk: np.ndarray,
+        target_body_id: Optional[int] = None,
     ) -> RolloutResult:
         """Forward-simulate action chunk from initial state.
 
@@ -165,6 +173,10 @@ class PhysicsEvaluator:
             init_qvel: [nv] generalized velocity
             action_chunk: [H, action_dim] sequence of control inputs to apply
                           one per ``mj_step``
+            target_body_id: if set, additionally record ``data.xpos[id]`` per
+                step into ``RolloutResult.tracked_body_pos_traj``. The cost
+                function then computes target distance from that body instead
+                of the end-effector.
 
         Returns:
             ``RolloutResult`` with per-step trajectory and diagnostics.
@@ -199,12 +211,16 @@ class PhysicsEvaluator:
         penetration_total = np.zeros(H, dtype=np.float64)
         robot_penetration = np.zeros(H, dtype=np.float64)
         joint_limit_margin = np.zeros((H + 1, self.model.njnt), dtype=np.float64)
+        track = target_body_id is not None
+        tracked_body_pos_traj = np.zeros((H + 1, 3), dtype=np.float64) if track else None
 
         # Record initial state
         qpos_traj[0] = d.qpos
         qvel_traj[0] = d.qvel
         ee_pose_traj[0] = self._ee_pose(d)
         joint_limit_margin[0] = self._joint_limit_margin(d.qpos)
+        if track:
+            tracked_body_pos_traj[0] = d.xpos[target_body_id]
 
         for t in range(H):
             d.ctrl[:] = action_chunk[t]
@@ -217,6 +233,8 @@ class PhysicsEvaluator:
             penetration_total[t] = pen_all
             robot_penetration[t] = pen_robot
             joint_limit_margin[t + 1] = self._joint_limit_margin(d.qpos)
+            if track:
+                tracked_body_pos_traj[t + 1] = d.xpos[target_body_id]
 
         return RolloutResult(
             qpos_traj=qpos_traj,
@@ -226,6 +244,7 @@ class PhysicsEvaluator:
             penetration_total=penetration_total,
             robot_penetration=robot_penetration,
             joint_limit_margin=joint_limit_margin,
+            tracked_body_pos_traj=tracked_body_pos_traj,
         )
 
     def cost(
@@ -233,7 +252,7 @@ class PhysicsEvaluator:
         rollout: RolloutResult,
         action_chunk: np.ndarray,
         prior_action: Optional[np.ndarray] = None,
-        ee_target_xyz: Optional[np.ndarray] = None,
+        target_xyz: Optional[np.ndarray] = None,
     ) -> CostBreakdown:
         """Compute named cost components + weighted total from a rollout.
 
@@ -242,8 +261,10 @@ class PhysicsEvaluator:
             action_chunk: the action chunk that produced this rollout
             prior_action: Pi0.5's initial proposal (anchor target).
                           If None, anchor cost is 0.
-            ee_target_xyz: [3] target end-effector position.
-                          If None, end_effector cost is 0.
+            target_xyz: [3] target world-frame position. Distance is measured
+                from the tracked body (recorded in ``rollout.tracked_body_pos_traj``)
+                if available, otherwise from the end-effector. If None, target
+                cost is 0.
 
         Returns:
             ``CostBreakdown`` with named components and the weighted total.
@@ -263,12 +284,15 @@ class PhysicsEvaluator:
         # raw d.ncon (was dominated by ~100 baseline contacts per step).
         coll_cost = float(np.sum(rollout.robot_penetration))
 
-        # End-effector cost: final-step EE position vs target
-        if ee_target_xyz is not None:
-            final_xyz = rollout.ee_pose_traj[-1, :3]
-            ee_cost = float(np.linalg.norm(final_xyz - ee_target_xyz))
+        # Target-distance cost: final-step tracked-body (or EE fallback) vs target_xyz
+        if target_xyz is not None:
+            if rollout.tracked_body_pos_traj is not None:
+                final_pos = rollout.tracked_body_pos_traj[-1]
+            else:
+                final_pos = rollout.ee_pose_traj[-1, :3]
+            target_dist = float(np.linalg.norm(final_pos - target_xyz))
         else:
-            ee_cost = 0.0
+            target_dist = 0.0
 
         # Anchor cost: ||action - prior||²
         if prior_action is not None:
@@ -280,14 +304,14 @@ class PhysicsEvaluator:
         total = (
             w.joint_limit * jl_cost
             + w.collision_penetration * coll_cost
-            + w.end_effector * ee_cost
+            + w.target_distance * target_dist
             + w.anchor * anchor_cost
         )
 
         return CostBreakdown(
             joint_limit=jl_cost,
             collision_penetration=coll_cost,
-            end_effector=ee_cost,
+            target_distance=target_dist,
             anchor=anchor_cost,
             total=total,
             raw_contact_count=float(np.sum(rollout.contact_counts)),
@@ -299,11 +323,12 @@ class PhysicsEvaluator:
         init_qvel: np.ndarray,
         action_chunk: np.ndarray,
         prior_action: Optional[np.ndarray] = None,
-        ee_target_xyz: Optional[np.ndarray] = None,
+        target_xyz: Optional[np.ndarray] = None,
+        target_body_id: Optional[int] = None,
     ) -> tuple[RolloutResult, CostBreakdown]:
         """Convenience: rollout + cost in one call."""
-        roll = self.rollout(init_qpos, init_qvel, action_chunk)
-        cost = self.cost(roll, action_chunk, prior_action, ee_target_xyz)
+        roll = self.rollout(init_qpos, init_qvel, action_chunk, target_body_id=target_body_id)
+        cost = self.cost(roll, action_chunk, prior_action, target_xyz)
         return roll, cost
 
     # ------------------------------------------------------------------

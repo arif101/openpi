@@ -122,14 +122,13 @@ def walk_mjcf_for_bodies(mjcf_path: pathlib.Path,
             walk_mjcf_for_bodies(sub_path, bodies, visited)
 
 
-def suggest_target(predicates, body_positions: dict[str, list[float]]) -> tuple[list[float] | None, str]:
-    """Heuristic: pick a target xyz based on the first matchable predicate."""
+def suggest_target(predicates, body_positions: dict[str, list[float]]) -> tuple[dict | None, str]:
+    """Build a target entry (mode + track_bodies + goal_xyz) from BDDL predicates."""
     if not predicates:
         return None, "no predicates"
 
     def find_body(query: str) -> tuple[str, list[float]] | None:
         q = query.lower().rstrip("_0123456789")
-        # Strip trailing numeric IDs (e.g., basket_1 → basket)
         for name, xyz in body_positions.items():
             n_lower = name.lower()
             if q == n_lower or q in n_lower or n_lower in q:
@@ -138,19 +137,38 @@ def suggest_target(predicates, body_positions: dict[str, list[float]]) -> tuple[
 
     relational = {"on", "in", "in-container"}
     unary = {"open", "close", "closed", "turnon", "turnoff", "turn-on", "turn-off"}
+
+    track_bodies: list[str] = []
+    goal: tuple[str, list[float]] | None = None
+    mode = None
+    fired: list[str] = []
     for pred, args in predicates:
         p = pred.lower()
         if p in relational and len(args) >= 2:
-            hit = find_body(args[1])
-            if hit:
-                return hit[1].copy() if hasattr(hit[1], "copy") else list(hit[1]), \
-                    f"derived from ({pred} {' '.join(args)}) → body '{hit[0]}'"
+            obj_hit = find_body(args[0])
+            goal_hit = find_body(args[1])
+            if obj_hit and goal_hit:
+                if goal is None:
+                    goal = goal_hit
+                    mode = "object"
+                if obj_hit[0] not in track_bodies:
+                    track_bodies.append(obj_hit[0])
+                fired.append(f"({pred} {args[0]} {args[1]}) → track {obj_hit[0]}, goal {goal_hit[0]}")
         elif p in unary and len(args) >= 1:
-            hit = find_body(args[0])
-            if hit:
-                return list(hit[1]), f"derived from ({pred} {args[0]}) → body '{hit[0]}'"
+            goal_hit = find_body(args[0])
+            if goal_hit:
+                if goal is None:
+                    goal = goal_hit
+                    mode = "ee"
+                fired.append(f"({pred} {args[0]}) → ee mode, goal {goal_hit[0]}")
 
-    return None, f"no body match for predicates {[p[0] for p in predicates]}"
+    if goal is None:
+        return None, f"no body match for predicates {[p[0] for p in predicates]}"
+
+    out = {"mode": mode, "goal_xyz": list(goal[1])}
+    if mode == "object":
+        out["track_bodies"] = track_bodies
+    return out, "; ".join(fired)
 
 
 def inspect_task(bddl_path: pathlib.Path, libero_root: pathlib.Path,
@@ -191,7 +209,10 @@ def inspect_task(bddl_path: pathlib.Path, libero_root: pathlib.Path,
     suggested, rationale = suggest_target(predicates, object_bodies)
     if verbose:
         if suggested is not None:
-            print(f"suggested: [{suggested[0]:+.3f}, {suggested[1]:+.3f}, {suggested[2]:+.3f}]")
+            print(f"suggested: mode={suggested['mode']} "
+                  f"goal_xyz={[f'{x:+.3f}' for x in suggested['goal_xyz']]}")
+            if "track_bodies" in suggested:
+                print(f"           track_bodies={suggested['track_bodies']}")
             print(f"  rationale: {rationale}")
         else:
             print(f"suggested: NONE — {rationale}")
@@ -201,7 +222,7 @@ def inspect_task(bddl_path: pathlib.Path, libero_root: pathlib.Path,
         "goal_text": raw_goal,
         "predicates": [{"pred": p, "args": a} for p, a in predicates],
         "candidate_objects": object_bodies,
-        "suggested_target_xyz": suggested,
+        "suggested": suggested,
         "rationale": rationale,
     }
 
@@ -244,13 +265,18 @@ def main() -> int:
     if args.output:
         out = {args.task_suite: {}}
         for idx, info in results.items():
-            out[args.task_suite][idx] = {
+            sugg = info.get("suggested") or {}
+            entry = {
                 "description": info["bddl"],
-                "target_xyz": info["suggested_target_xyz"] or [0.0, 0.0, 0.85],
+                "mode": sugg.get("mode", "object"),
+                "goal_xyz": sugg.get("goal_xyz", [0.0, 0.0, 0.85]),
                 "rationale": info["rationale"],
                 "goal_text": info["goal_text"],
                 "candidate_objects": info["candidate_objects"],
             }
+            if "track_bodies" in sugg:
+                entry["track_bodies"] = sugg["track_bodies"]
+            out[args.task_suite][idx] = entry
         pathlib.Path(args.output).write_text(yaml.safe_dump(out, sort_keys=False))
         print(f"\n→ Wrote {args.output}", file=sys.stderr)
     return 0

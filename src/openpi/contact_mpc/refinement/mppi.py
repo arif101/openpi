@@ -86,9 +86,14 @@ class MPPIRefiner:
         init_qpos: np.ndarray,
         init_qvel: np.ndarray,
         prior_action: np.ndarray,           # [H, action_dim]
-        ee_target_xyz: Optional[np.ndarray] = None,
+        target_xyz: Optional[np.ndarray] = None,
+        target_body_id: Optional[int] = None,
     ) -> tuple[np.ndarray, MPPIDiagnostics]:
         """Refine ``prior_action`` via MPPI sampling against physics cost.
+
+        Args:
+            target_xyz: where to drive the tracked body (or EE).
+            target_body_id: MuJoCo body id to track; None → use end-effector.
 
         Returns:
             refined_action: [H, action_dim], same shape as prior_action
@@ -101,7 +106,8 @@ class MPPIRefiner:
         nominal_roll, nominal_cost_breakdown = self.evaluator.evaluate(
             init_qpos, init_qvel, prior_action,
             prior_action=prior_action,           # anchor cost is 0 by definition
-            ee_target_xyz=ee_target_xyz,
+            target_xyz=target_xyz,
+            target_body_id=target_body_id,
         )
         nominal_cost = nominal_cost_breakdown.total
 
@@ -118,7 +124,8 @@ class MPPIRefiner:
                 _, cb = self.evaluator.evaluate(
                     init_qpos, init_qvel, candidates[k],
                     prior_action=prior_action,    # anchor always to ORIGINAL prior
-                    ee_target_xyz=ee_target_xyz,
+                    target_xyz=target_xyz,
+                    target_body_id=target_body_id,
                 )
                 sample_costs[k] = cb.total
 
@@ -138,7 +145,8 @@ class MPPIRefiner:
         _, refined_cost_breakdown = self.evaluator.evaluate(
             init_qpos, init_qvel, nominal,
             prior_action=prior_action,
-            ee_target_xyz=ee_target_xyz,
+            target_xyz=target_xyz,
+            target_body_id=target_body_id,
         )
         refined_cost = refined_cost_breakdown.total
 

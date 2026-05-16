@@ -84,37 +84,69 @@ def parse_bddl_goal(bddl_path: pathlib.Path) -> tuple[str, list[tuple[str, list[
     return raw_goal.strip(), predicates
 
 
-def suggest_target(predicates, body_positions: dict[str, np.ndarray]) -> tuple[np.ndarray | None, str]:
-    """Heuristic: derive a single EE target from the BDDL goal predicates.
+def _match_body(query: str, body_positions: dict) -> tuple[str, "np.ndarray"] | None:
+    q = query.lower()
+    for body_name, xyz in body_positions.items():
+        n = body_name.lower()
+        if q in n or n in q:
+            return body_name, xyz
+    return None
 
-    For each predicate type, suggest where the gripper would end up at success:
-      (on X Y), (in X Y), (in-container X Y) → top/center of Y
-      (open X), (closed X) → near X's handle (X position is a fallback)
-      (turn-on X) → near X
 
-    Returns (xyz, rationale) or (None, "no target") if we can't derive one.
+def suggest_target(predicates, body_positions: dict[str, np.ndarray]) -> tuple[dict | None, str]:
+    """Derive MPPI cost target entry (mode + track_bodies + goal_xyz) from BDDL goal.
+
+    Schema returned:
+      {"mode": "object", "track_bodies": [name1, name2, ...], "goal_xyz": [x, y, z]}
+      {"mode": "ee", "goal_xyz": [x, y, z]}
+      None if no body match found.
+
+    For relational predicates (In/On X Y): X is tracked, Y is the goal. Multiple
+    relational predicates with the same Y → all Xs added to track_bodies (the
+    runtime picks the farthest). Unary predicates (Close/Turnon Y): EE mode,
+    Y is the goal.
     """
     if not predicates:
         return None, "no predicates"
 
-    # BDDL uses capitalized predicates (In, On, Close, Turnon) — lowercase for matching.
-    # Pick the FIRST predicate that names a known body — use Y if it's a relational predicate
     relational = {"on", "in", "in-container"}
     unary = {"open", "close", "closed", "turnon", "turnoff", "turn-on", "turn-off"}
+
+    track_bodies: list[str] = []
+    goal_body: tuple[str, np.ndarray] | None = None
+    fired: list[str] = []
+    mode = None
+
     for pred, args in predicates:
         p = pred.lower()
         if p in relational and len(args) >= 2:
-            target_obj = args[1]
-            for body_name, xyz in body_positions.items():
-                if target_obj.lower() in body_name.lower() or body_name.lower() in target_obj.lower():
-                    return xyz.copy(), f"derived from ({pred} {' '.join(args)}) → body '{body_name}'"
+            obj_hit = _match_body(args[0], body_positions)
+            goal_hit = _match_body(args[1], body_positions)
+            if obj_hit and goal_hit:
+                if goal_body is None:
+                    goal_body = goal_hit
+                    mode = "object"
+                if obj_hit[0] not in track_bodies:
+                    track_bodies.append(obj_hit[0])
+                fired.append(f"({pred} {args[0]} {args[1]}) → track {obj_hit[0]}, goal {goal_hit[0]}")
         elif p in unary and len(args) >= 1:
-            target_obj = args[0]
-            for body_name, xyz in body_positions.items():
-                if target_obj.lower() in body_name.lower() or body_name.lower() in target_obj.lower():
-                    return xyz.copy(), f"derived from ({pred} {target_obj}) → body '{body_name}'"
+            goal_hit = _match_body(args[0], body_positions)
+            if goal_hit:
+                if goal_body is None:
+                    goal_body = goal_hit
+                    mode = "ee"
+                fired.append(f"({pred} {args[0]}) → ee mode, goal {goal_hit[0]}")
 
-    return None, f"no body match for predicates {[p[0] for p in predicates]}"
+    if goal_body is None:
+        return None, f"no body match for predicates {[p[0] for p in predicates]}"
+
+    out = {
+        "mode": mode,
+        "goal_xyz": [float(x) for x in goal_body[1]],
+    }
+    if mode == "object":
+        out["track_bodies"] = track_bodies
+    return out, "; ".join(fired)
 
 
 def inspect_task(task_suite_name: str, task_idx: int, verbose: bool = True) -> dict:
@@ -170,11 +202,15 @@ def inspect_task(task_suite_name: str, task_idx: int, verbose: bool = True) -> d
         for name, xyz in sorted(object_bodies.items()):
             print(f"  {name:35s} → [{xyz[0]:+.3f}, {xyz[1]:+.3f}, {xyz[2]:+.3f}]")
 
-    suggested_xyz, rationale = suggest_target(predicates, object_bodies)
+    suggested, rationale = suggest_target(predicates, object_bodies)
     if verbose:
-        print(f"\n--- suggested EE target ---")
-        if suggested_xyz is not None:
-            print(f"  xyz = [{suggested_xyz[0]:+.3f}, {suggested_xyz[1]:+.3f}, {suggested_xyz[2]:+.3f}]")
+        print(f"\n--- suggested MPPI target ---")
+        if suggested is not None:
+            xyz = suggested["goal_xyz"]
+            print(f"  mode: {suggested['mode']}")
+            print(f"  goal_xyz: [{xyz[0]:+.3f}, {xyz[1]:+.3f}, {xyz[2]:+.3f}]")
+            if "track_bodies" in suggested:
+                print(f"  track_bodies: {suggested['track_bodies']}")
             print(f"  rationale: {rationale}")
         else:
             print(f"  (could not derive automatically: {rationale})")
@@ -189,7 +225,7 @@ def inspect_task(task_suite_name: str, task_idx: int, verbose: bool = True) -> d
         "goal_text": raw_goal,
         "predicates": [{"pred": p, "args": a} for p, a in predicates],
         "object_positions": {n: p.tolist() for n, p in object_bodies.items()},
-        "suggested_target_xyz": suggested_xyz.tolist() if suggested_xyz is not None else None,
+        "suggested": suggested,
         "rationale": rationale,
     }
 
@@ -218,20 +254,24 @@ def main() -> int:
         # Write a YAML in the format reason_v3_targets.yaml expects
         out_dict = {args.task_suite: {}}
         for idx, info in inspections.items():
+            sugg = info.get("suggested") or {}
             entry = {
                 "description": info["description"],
-                "target_xyz": info["suggested_target_xyz"] or [0.0, 0.0, 0.85],
+                "mode": sugg.get("mode", "object"),
+                "goal_xyz": sugg.get("goal_xyz", [0.0, 0.0, 0.85]),
                 "rationale": info["rationale"],
-                # Keep raw inspection data so a human can verify / override
+                # Raw inspection data preserved for manual review / override
                 "goal_text": info["goal_text"],
                 "candidate_objects": info["object_positions"],
             }
+            if "track_bodies" in sugg:
+                entry["track_bodies"] = sugg["track_bodies"]
             out_dict[args.task_suite][idx] = entry
         pathlib.Path(args.output).write_text(yaml.safe_dump(out_dict, sort_keys=False))
         print(f"\n→ Wrote inspection YAML to {args.output}")
-        print(f"  Review each task; if the suggested target is wrong, pick the correct")
-        print(f"  body's xyz from candidate_objects and set target_xyz accordingly.")
-        print(f"  Then copy the cleaned-up file to scripts/reason_v3_targets.yaml")
+        print(f"  Review each task; if the suggestion is wrong, edit goal_xyz /")
+        print(f"  track_bodies using bodies from candidate_objects. Then copy the")
+        print(f"  cleaned-up file to scripts/reason_v3_targets.yaml")
 
     return 0
 

@@ -2,8 +2,10 @@
 
 Each decision point:
   1. Pi0.5 emits initial action chunk a_0 (in EE-delta space, 7 dims).
-  2. MPPI: save env state, sample K perturbations, step each through env,
-     score by (EE-to-target, joint_limit, robot_collision, anchor), restore.
+  2. MPPI: pick which body to track (object-mode tasks: the candidate object
+     currently farthest from its goal_xyz; ee-mode tasks: the end-effector).
+     Save env state, sample K perturbations, step each through env, score by
+     (tracked-body-to-goal, joint_limit, robot_collision, anchor), restore.
   3. Take softmin-weighted average → refined chunk a*.
   4. Execute a*.
 
@@ -11,8 +13,14 @@ Uses LIBERO's env directly for forward sim — guarantees identical
 action-space semantics to the eval execution path. State save/restore
 via robosuite's sim.get_state() / set_state_from_flattened().
 
-Hardcoded EE targets per task in scripts/reason_v3_targets.yaml. Build
-this out by hand for now (Week 3 work: parse BDDL).
+Object-tracking cost handles "put X in Y" tasks without explicit stage
+detection: once the robot grasps X, X's pos tracks the EE, so driving
+X → Y encodes both pick and place. For compound goals ("put both X1 and
+X2 in Y"), MPPI picks the candidate currently farthest from Y at each
+decision step — sequencing emerges from the cost shape.
+
+Targets per task live in scripts/reason_v3_targets.yaml (schema documented
+inline). Generate / update via scripts/inspect_libero_scene.py.
 
 Kill criterion: if MPPI-refined success < Pi0.5 baseline on the gated
 task, MPPI mechanism doesn't help and we tune (K, sigma, lambda, weights).
@@ -85,8 +93,8 @@ def parse_args():
     p.add_argument("--mppi-lambda", type=float, default=1.0, help="Softmin temperature")
     p.add_argument("--mppi-iterations", type=int, default=1)
     p.add_argument("--mppi-trigger", choices=["always", "contact"], default="always")
-    p.add_argument("--w-ee", type=float, default=10.0,
-                   help="Weight for end-effector → target distance term")
+    p.add_argument("--w-target", type=float, default=10.0,
+                   help="Weight for tracked-body → goal distance term")
     p.add_argument("--w-anchor", type=float, default=0.05,
                    help="Weight for ||action - prior||² anchor term")
     p.add_argument("--w-collision", type=float, default=100.0,
@@ -168,7 +176,7 @@ def _robot_geom_mask(model) -> np.ndarray:
     return is_robot_geom
 
 
-def compute_step_cost(sim, is_robot_geom, ee_target_xyz, w_collision, w_joint_limit):
+def compute_step_cost(sim, is_robot_geom, w_collision, w_joint_limit):
     """Compute per-step physics cost terms from current sim state."""
     # Robot-involved penetration depth
     pen = 0.0
@@ -198,15 +206,35 @@ def compute_step_cost(sim, is_robot_geom, ee_target_xyz, w_collision, w_joint_li
     return w_collision * pen + w_joint_limit * jl_viol
 
 
+def _resolve_target_body_id(sim, candidate_body_ids: list[int], goal_xyz: np.ndarray) -> int:
+    """Pick whichever candidate body is currently farthest from ``goal_xyz``.
+
+    This is how staging emerges without explicit stage logic. For "put both X
+    and Y in basket": as soon as X lands in the basket, its distance to
+    goal_xyz drops near 0, and Y (still on the table) becomes the new tracked
+    body — automatically retargeting the cost.
+    """
+    pos = sim.data.body_xpos
+    best_id = candidate_body_ids[0]
+    best_d = -1.0
+    for bid in candidate_body_ids:
+        d = float(np.linalg.norm(pos[bid] - goal_xyz))
+        if d > best_d:
+            best_d = d
+            best_id = bid
+    return best_id
+
+
 def mppi_refine(
     env,
     prior_action: np.ndarray,    # [H, 7] from Pi0.5
-    ee_target_xyz: np.ndarray,
+    goal_xyz: np.ndarray,
+    tracked_body_id: int,        # which body's xyz the target-distance cost measures
     K: int,
     sigma: float,
     lam: float,
     num_iterations: int,
-    w_ee: float,
+    w_target: float,
     w_anchor: float,
     w_collision: float,
     w_joint_limit: float,
@@ -216,6 +244,10 @@ def mppi_refine(
 ):
     """Run MPPI refinement on top of Pi0.5's action chunk using LIBERO env.
 
+    Target-distance cost is measured from ``data.body_xpos[tracked_body_id]``
+    to ``goal_xyz`` at the end of each candidate's replan_steps rollout. Set
+    ``tracked_body_id`` to the EE body for tasks without a movable object.
+
     Returns:
         refined: [H, 7] same shape as prior_action
         diag: dict with mppi diagnostics
@@ -223,7 +255,6 @@ def mppi_refine(
     H, action_dim = prior_action.shape
     sim = env.env.sim
     saved_state = sim.get_state().flatten()
-    saved_obs_state = None  # we restore via sim state only; observation is rebuilt
 
     def evaluate(candidate: np.ndarray) -> float:
         """Step env forward replan_steps using candidate; compute scalar cost; restore."""
@@ -234,15 +265,13 @@ def mppi_refine(
         for action in candidate[:replan_steps]:
             _ = env.step(action.tolist())
             step_cost_sum += compute_step_cost(
-                sim, is_robot_geom, ee_target_xyz, w_collision, w_joint_limit,
+                sim, is_robot_geom, w_collision, w_joint_limit,
             )
 
-        final_ee = sim.data.body_xpos[sim.model.body_name2id("robot0_eef")
-                                       if hasattr(sim.model, "body_name2id")
-                                       else sim.model.nbody - 1]
-        ee_cost = float(np.linalg.norm(final_ee - ee_target_xyz))
+        final_tracked = sim.data.body_xpos[tracked_body_id]
+        target_cost = float(np.linalg.norm(final_tracked - goal_xyz))
         anchor_cost = float(np.sum((candidate - prior_action) ** 2))
-        return step_cost_sum + w_ee * ee_cost + w_anchor * anchor_cost
+        return step_cost_sum + w_target * target_cost + w_anchor * anchor_cost
 
     nominal = prior_action.copy()
     sample_costs = np.zeros(K)
@@ -290,8 +319,8 @@ def mppi_refine(
 
 
 def run_episode(
-    *, policy, env, init_state, task_description, ee_target_xyz, is_robot_geom,
-    perturbation_m, perturb_rng, max_steps, args, mode, mppi_rng,
+    *, policy, env, init_state, task_description, goal_xyz, tracked_body_ids,
+    is_robot_geom, perturbation_m, perturb_rng, max_steps, args, mode, mppi_rng,
 ):
     env.reset()
     init_state_np = init_state.clone() if hasattr(init_state, "clone") else init_state.copy()
@@ -332,11 +361,16 @@ def run_episode(
                     use_mppi = True
 
             if use_mppi:
+                # Pick the tracked body for this decision: among candidates, the
+                # one currently farthest from goal_xyz still needs work most.
+                tracked_id = _resolve_target_body_id(
+                    env.env.sim, tracked_body_ids, goal_xyz,
+                )
                 refined, diag = mppi_refine(
-                    env, initial_action, ee_target_xyz,
+                    env, initial_action, goal_xyz, tracked_body_id=tracked_id,
                     K=args.mppi_K, sigma=args.mppi_sigma, lam=args.mppi_lambda,
                     num_iterations=args.mppi_iterations,
-                    w_ee=args.w_ee, w_anchor=args.w_anchor,
+                    w_target=args.w_target, w_anchor=args.w_anchor,
                     w_collision=args.w_collision, w_joint_limit=args.w_joint_limit,
                     is_robot_geom=is_robot_geom, replan_steps=args.replan_steps,
                     rng=mppi_rng,
@@ -386,27 +420,25 @@ def main():
     if args.task_suite not in MAX_STEPS:
         raise ValueError(f"Unknown task suite: {args.task_suite}")
 
-    # Load hardcoded EE targets from YAML
+    # Load MPPI cost targets from YAML
     targets_path = pathlib.Path(args.targets_yaml)
     if not targets_path.exists():
-        raise FileNotFoundError(
-            f"Targets YAML not found: {targets_path}\n"
-            f"Expected entries like:\n"
-            f"  libero_10:\n"
-            f"    0:\n"
-            f"      target_xyz: [x, y, z]\n"
-            f"      description: 'put both ... in basket'"
-        )
+        raise FileNotFoundError(f"Targets YAML not found: {targets_path}")
     targets = yaml.safe_load(targets_path.read_text())
     suite_targets = (targets or {}).get(args.task_suite, {}) or {}
     entry = suite_targets.get(args.task_idx) or suite_targets.get(str(args.task_idx))
     if entry is None:
         raise KeyError(
-            f"No EE target for {args.task_suite}/task_{args.task_idx} in {targets_path}.\n"
-            f"Add an entry under {args.task_suite}: {args.task_idx}: target_xyz: [x, y, z]"
+            f"No target entry for {args.task_suite}/task_{args.task_idx} in {targets_path}."
         )
-    ee_target_xyz = np.array(entry["target_xyz"], dtype=np.float64)
-    print(f"EE target for {args.task_suite}/task_{args.task_idx}: {ee_target_xyz} "
+    if "goal_xyz" not in entry:
+        raise KeyError(
+            f"Entry {args.task_suite}/{args.task_idx} missing 'goal_xyz'. "
+            f"Schema: mode (object|ee), track_bodies (list, for mode=object), goal_xyz [x,y,z]."
+        )
+    mode = entry.get("mode", "object")
+    goal_xyz = np.array(entry["goal_xyz"], dtype=np.float64)
+    print(f"Target for {args.task_suite}/task_{args.task_idx}: mode={mode} goal_xyz={goal_xyz} "
           f"({entry.get('description', 'no description')})", flush=True)
 
     # Load Pi0.5
@@ -427,9 +459,40 @@ def main():
         camera_heights=LIBERO_ENV_RESOLUTION, camera_widths=LIBERO_ENV_RESOLUTION,
     )
     env.seed(args.seed)
-    is_robot_geom = _robot_geom_mask(env.env.sim.model)
-    print(f"Robot geoms identified: {is_robot_geom.sum()} / {env.env.sim.model.ngeom}",
+    sim_model = env.env.sim.model
+    is_robot_geom = _robot_geom_mask(sim_model)
+    print(f"Robot geoms identified: {is_robot_geom.sum()} / {sim_model.ngeom}",
           flush=True)
+
+    # Resolve tracked-body names → MuJoCo body ids
+    def _body_id(name: str) -> int:
+        if hasattr(sim_model, "body_name2id"):
+            try:
+                return int(sim_model.body_name2id(name))
+            except Exception:
+                pass
+        # Fall back: linear scan
+        for b in range(sim_model.nbody):
+            if (sim_model.body_id2name(b) or "") == name:
+                return b
+        raise KeyError(f"Body '{name}' not found in MuJoCo model for {args.task_suite}/{args.task_idx}")
+
+    if mode == "ee":
+        # Track the end-effector body (matches LIBERO baseline name)
+        ee_name = "robot0_eef"
+        tracked_body_ids = [_body_id(ee_name)]
+        print(f"Tracking EE body '{ee_name}' (id={tracked_body_ids[0]})", flush=True)
+    elif mode == "object":
+        track_names = entry.get("track_bodies") or []
+        if not track_names:
+            raise KeyError(
+                f"mode=object for {args.task_suite}/{args.task_idx} but no 'track_bodies' list."
+            )
+        tracked_body_ids = [_body_id(n) for n in track_names]
+        print(f"Tracking object bodies {list(zip(track_names, tracked_body_ids))} "
+              f"(MPPI picks farthest from goal at each decision)", flush=True)
+    else:
+        raise ValueError(f"Unknown mode '{mode}'; expected 'object' or 'ee'")
 
     max_steps = MAX_STEPS[args.task_suite]
     perturbation_m = args.perturbation_cm / 100.0
@@ -441,19 +504,20 @@ def main():
     print(f"{'='*70}", flush=True)
 
     results = {}
-    for mode in ("baseline", "mppi"):
+    for eval_mode in ("baseline", "mppi"):
         perturb_rng = np.random.default_rng(args.seed + 1000)
         successes = 0
         per_trial = []
-        print(f"\n--- mode={mode} (K={args.mppi_K}, σ={args.mppi_sigma}, λ={args.mppi_lambda}) ---",
+        print(f"\n--- {eval_mode} (K={args.mppi_K}, σ={args.mppi_sigma}, λ={args.mppi_lambda}) ---",
               flush=True)
         for ti in range(trials):
             r = run_episode(
                 policy=policy, env=env, init_state=init_states[ti],
-                task_description=task.language, ee_target_xyz=ee_target_xyz,
+                task_description=task.language,
+                goal_xyz=goal_xyz, tracked_body_ids=tracked_body_ids,
                 is_robot_geom=is_robot_geom, perturbation_m=perturbation_m,
                 perturb_rng=perturb_rng, max_steps=max_steps, args=args,
-                mode=mode, mppi_rng=mppi_rng,
+                mode=eval_mode, mppi_rng=mppi_rng,
             )
             successes += int(r["success"])
             per_trial.append(r)
@@ -461,13 +525,13 @@ def main():
                   f"({r['steps']} steps, {r['refinements_run']} refinements, "
                   f"{r['wall_seconds']:.1f}s)",
                   flush=True)
-        results[mode] = {
+        results[eval_mode] = {
             "successes": successes,
             "trials": trials,
             "success_rate": successes / trials,
             "per_trial": per_trial,
         }
-        print(f"  → {mode}: {successes}/{trials} = {successes/trials*100:.1f}%", flush=True)
+        print(f"  → {eval_mode}: {successes}/{trials} = {successes/trials*100:.1f}%", flush=True)
 
     env.close()
 
@@ -489,10 +553,13 @@ def main():
     payload = {
         "args": vars(args),
         "task_description": task.language,
-        "ee_target_xyz": ee_target_xyz.tolist(),
+        "goal_xyz": goal_xyz.tolist(),
+        "mode": mode,
+        "tracked_body_ids": tracked_body_ids,
+        "tracked_body_names": entry.get("track_bodies") if mode == "object" else ["robot0_eef"],
         "results": {
-            mode: {k: v for k, v in r.items() if k != "per_trial"}
-            for mode, r in results.items()
+            m: {k: v for k, v in r.items() if k != "per_trial"}
+            for m, r in results.items()
         },
         "delta_pp": delta_pp,
     }

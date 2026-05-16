@@ -1,68 +1,94 @@
-# Hardcoded end-effector targets for REASON-VLA v3 MPPI refinement.
+# REASON-VLA v3 MPPI cost targets per LIBERO task.
 #
-# Each entry says: "for THIS task, MPPI should prefer trajectories that
-# end with the gripper near these xyz coordinates."
+# Schema (per task entry):
+#   description:  human-readable task language
+#   mode:         "object"  → MPPI cost tracks an object body toward goal_xyz.
+#                              Naturally handles "put X in Y" multi-stage tasks:
+#                              once the robot grasps X, X tracks the EE, so
+#                              driving X → Y encodes both pick and place.
+#                 "ee"      → cost tracks the end-effector toward goal_xyz.
+#                              Use for tasks with no manipulated object that
+#                              moves to a goal (e.g. push a drawer closed).
+#   track_bodies: [list of MuJoCo body names] (mode="object")
+#                              If >1 body is listed, MPPI picks the one
+#                              currently farthest from goal_xyz at each
+#                              decision step. That gives free task sequencing
+#                              for compound goals ("put both X and Y in basket")
+#                              without explicit stage logic.
+#   goal_xyz:     [x, y, z] world-frame target position
 #
-# This is a Week-2 prototype hack. Week 3 work: replace this YAML with
-# automatic BDDL goal-predicate parsing that derives targets from the
-# task's success criteria programmatically.
-#
-# The targets below are EDUCATED GUESSES. They were inferred from task
-# descriptions; the actual world-frame coordinates would need to be
-# verified against the LIBERO scene. To find the right xyz, you can
-# look at the BDDL file or run the env and inspect object positions.
-#
-# Coordinate frame: world frame (z up). Typical LIBERO tabletop has
-# table surface at z ≈ 0.82, objects at z ≈ 0.86-0.95.
+# Body positions come from scripts/inspect_libero_scene.py output. Verify
+# targets with scripts/verify_libero_targets.py before running MPPI.
 
 libero_10:
-  # Task 0: "put both the alphabet soup and the tomato sauce in the basket"
-  # Target = basket center (approximate; verify with env)
+  # 0: "put both alphabet soup and tomato sauce in basket"
   0:
-    target_xyz: [0.0, 0.20, 0.85]
-    description: "basket center on table"
+    description: "put both the alphabet soup and the tomato sauce in the basket"
+    mode: object
+    track_bodies: [alphabet_soup_1_main, tomato_sauce_1_main]
+    goal_xyz: [-0.002, 0.269, 0.480]   # basket_1_main
 
-  # Task 1: "put both the cream cheese box and the butter in the basket"
+  # 1: "put both cream cheese box and butter in basket"
   1:
-    target_xyz: [0.0, 0.20, 0.85]
-    description: "basket center on table"
+    description: "put both the cream cheese box and the butter in the basket"
+    mode: object
+    track_bodies: [cream_cheese_1_main, butter_1_main]
+    goal_xyz: [0.007, 0.265, 0.480]    # basket_1_main
 
-  # Task 2: "turn on the stove and put the moka pot on it"
+  # 2: "turn on stove + put moka pot on it" — Turnon has no object body.
+  #    Use the moka pot → stove burner; the button-press is a side-effect of
+  #    the policy's prior. (For tasks dominated by Turnon, switch to mode: ee.)
   2:
-    target_xyz: [-0.10, -0.10, 0.95]
-    description: "stove burner location"
+    description: "turn on the stove and put the moka pot on it"
+    mode: object
+    track_bodies: [moka_pot_1_main]
+    goal_xyz: [-0.041, 0.198, 0.905]   # flat_stove_1_burner
 
-  # Task 3: "put the black bowl in the bottom drawer of the cabinet and close it"
+  # 3: "put bowl in bottom drawer + close drawer"
   3:
-    target_xyz: [-0.15, -0.20, 0.75]
-    description: "cabinet bottom drawer interior"
+    description: "put the black bowl in the bottom drawer of the cabinet and close it"
+    mode: object
+    track_bodies: [akita_black_bowl_1_main]
+    goal_xyz: [-0.010, 0.161, 0.905]   # white_cabinet_1_cabinet_bottom
 
-  # Task 4: "put the white mug on the left plate and put the yellow pizza on the right plate"
+  # 4: "white mug on left plate + yellow mug on right plate"
   4:
-    target_xyz: [-0.20, 0.0, 0.88]
-    description: "left plate position"
+    description: "put the white mug on the left plate and put the yellow and white mug on the right plate"
+    mode: object
+    track_bodies: [porcelain_mug_1_main, white_yellow_mug_1_main]
+    goal_xyz: [-0.004, -0.323, 0.480]  # plate_1_main (left); white mug goes here. ymw → plate_2 if we extend schema.
 
-  # Task 5: "pick up the book and place it in the back compartment of the caddy"
+  # 5: "pick up book + place in back compartment of caddy"
   5:
-    target_xyz: [0.10, -0.20, 0.90]
-    description: "back compartment of caddy"
+    description: "pick up the book and place it in the back compartment of the caddy"
+    mode: object
+    track_bodies: [black_book_1_main]
+    goal_xyz: [-0.391, -0.142, 0.887]  # desk_caddy_1_main (approx — back compartment)
 
-  # Task 6: "put the white mug on the plate and put the chocolate pudding to the right of the plate"
+  # 6: "white mug on plate + chocolate pudding to right of plate"
   6:
-    target_xyz: [0.0, 0.0, 0.90]
-    description: "plate center"
+    description: "put the white mug on the plate and put the chocolate pudding to the right of the plate"
+    mode: object
+    track_bodies: [porcelain_mug_1_main, chocolate_pudding_1_main]
+    goal_xyz: [0.149, 0.006, 0.480]    # plate_1_main
 
-  # Task 7: "put both the alphabet soup and the cream cheese box in the basket"
+  # 7: "put alphabet soup and cream cheese box in basket"
   7:
-    target_xyz: [0.0, 0.20, 0.85]
-    description: "basket center"
+    description: "put both the alphabet soup and the cream cheese box in the basket"
+    mode: object
+    track_bodies: [alphabet_soup_1_main, cream_cheese_1_main]
+    goal_xyz: [-0.000, 0.267, 0.480]   # basket_1_main
 
-  # Task 8: "put both moka pots on the stove"
+  # 8: "put both moka pots on stove + turn on"
   8:
-    target_xyz: [-0.10, -0.10, 0.95]
-    description: "stove burner location"
+    description: "put both moka pots on the stove"
+    mode: object
+    track_bodies: [moka_pot_1_main, moka_pot_2_main]
+    goal_xyz: [-0.044, -0.199, 0.905]  # flat_stove_1_burner
 
-  # Task 9: "put the yellow and white mug in the microwave and close it"
+  # 9: "mug in microwave + close microwave"
   9:
-    target_xyz: [0.20, -0.10, 0.95]
-    description: "microwave interior"
+    description: "put the yellow and white mug in the microwave and close it"
+    mode: object
+    track_bodies: [white_yellow_mug_1_main]
+    goal_xyz: [-0.010, 0.357, 0.920]   # microwave_1_main interior

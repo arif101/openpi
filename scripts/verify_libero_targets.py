@@ -1,14 +1,18 @@
-"""Verify suggested EE targets against actual end-effector trajectories.
+"""Verify configured MPPI cost targets against actual baseline trajectories.
 
 Loads a LIBERO task, runs Pi0.5 baseline for one episode, and logs:
-  - The EE xyz at every timestep
-  - The EE xyz at success (if achieved)
+  - The tracked body's xyz at every timestep
   - All non-robot body positions (so you can compare candidates)
-  - The currently configured target_xyz from reason_v3_targets.yaml
+  - The configured target from reason_v3_targets.yaml (mode + goal_xyz +
+    track_bodies)
 
-This lets you sanity-check: is the YAML's target_xyz close to where the EE
-actually ends up during a successful trajectory? If yes, the target is good.
-If no (EE goes somewhere very different), the target is probably wrong.
+For mode=object tasks, the tracked body is whichever candidate is currently
+farthest from goal_xyz at each step (matches MPPI's runtime selection). For
+mode=ee, tracks the end-effector.
+
+Verdict logic: if the tracked body got within 10cm of goal_xyz during the
+trajectory, the target is reachable and relevant. Within 20cm = roughly
+right. Otherwise probably wrong.
 
 Usage:
     PYTHONPATH=src:third_party/libero uv run python3 -u \\
@@ -94,21 +98,27 @@ def main() -> int:
     init_states = bm.get_task_init_states(args.task_idx)
 
     # Load configured target (if any)
-    configured_target = None
+    configured_goal = None
+    configured_mode = None
+    configured_track_names: list[str] = []
     targets_path = pathlib.Path(args.targets_yaml)
     if targets_path.exists():
         targets = yaml.safe_load(targets_path.read_text()) or {}
         suite = targets.get(args.task_suite) or {}
         entry = suite.get(args.task_idx) or suite.get(str(args.task_idx))
-        if entry is not None and "target_xyz" in entry:
-            configured_target = np.array(entry["target_xyz"], dtype=np.float64)
+        if entry is not None and "goal_xyz" in entry:
+            configured_goal = np.array(entry["goal_xyz"], dtype=np.float64)
+            configured_mode = entry.get("mode", "object")
+            configured_track_names = entry.get("track_bodies") or []
 
     print(f"\n{'='*70}")
     print(f"Task: {task.language}")
     print(f"BDDL: {bddl.name}")
     print(f"{'='*70}")
-    if configured_target is not None:
-        print(f"Configured target_xyz from YAML: {configured_target}")
+    if configured_goal is not None:
+        print(f"Configured: mode={configured_mode} goal_xyz={configured_goal}")
+        if configured_track_names:
+            print(f"            track_bodies={configured_track_names}")
     else:
         print(f"No configured target in {args.targets_yaml}")
 
@@ -138,11 +148,25 @@ def main() -> int:
             object_init[name] = sim.data.body_xpos[b].copy()
     for name, xyz in sorted(object_init.items()):
         marker = ""
-        if configured_target is not None:
-            dist = np.linalg.norm(xyz - configured_target)
+        if configured_goal is not None:
+            dist = np.linalg.norm(xyz - configured_goal)
             if dist < 0.05:
-                marker = "  ← matches configured target"
+                marker = "  ← matches configured goal_xyz"
         print(f"  {name:35s} [{xyz[0]:+.3f}, {xyz[1]:+.3f}, {xyz[2]:+.3f}]{marker}")
+
+    # Resolve tracked body ids (for mode=object) so we can log per-step pos
+    tracked_ids: list[int] = []
+    if configured_mode == "object" and configured_track_names:
+        for nm in configured_track_names:
+            try:
+                tracked_ids.append(int(model.body_name2id(nm)))
+            except Exception:
+                print(f"  [warn] track body '{nm}' not found in model")
+    ee_body_id = -1
+    try:
+        ee_body_id = int(model.body_name2id("robot0_eef"))
+    except Exception:
+        ee_body_id = model.nbody - 1
 
     perturb_m = args.perturbation_cm / 100.0
     perturb_rng = np.random.default_rng(args.seed + 1000)
@@ -167,7 +191,8 @@ def main() -> int:
         plan = collections.deque()
         done = False
         t = 0
-        ee_history = []  # (t, xyz)
+        ee_history = []      # (t, xyz)
+        tracked_history = [] # (t, body_name, xyz) — whichever body MPPI would track
         episode_start = time.time()
 
         while t < args.max_steps + 10:
@@ -184,12 +209,22 @@ def main() -> int:
 
             action = plan.popleft()
             obs, _, done, _ = env.step(action.tolist())
-            ee_xyz = sim.data.body_xpos[
-                model.body_name2id("robot0_eef")
-                if hasattr(model, "body_name2id")
-                else model.nbody - 1
-            ].copy()
+            ee_xyz = sim.data.body_xpos[ee_body_id].copy()
             ee_history.append((t, ee_xyz))
+            # Pick whichever tracked body is farthest from goal (matches MPPI logic).
+            if configured_mode == "object" and tracked_ids and configured_goal is not None:
+                best_id = tracked_ids[0]
+                best_d = -1.0
+                for bid in tracked_ids:
+                    d = float(np.linalg.norm(sim.data.body_xpos[bid] - configured_goal))
+                    if d > best_d:
+                        best_d, best_id = d, bid
+                tracked_history.append(
+                    (t, model.body_id2name(best_id) or f"body_{best_id}",
+                     sim.data.body_xpos[best_id].copy())
+                )
+            elif configured_mode == "ee":
+                tracked_history.append((t, "robot0_eef", ee_xyz))
             if done:
                 break
             t += 1
@@ -209,22 +244,41 @@ def main() -> int:
                 tt, xyz = ee_history[idx - 1]
                 print(f"  t={tt:4d}  [{xyz[0]:+.3f}, {xyz[1]:+.3f}, {xyz[2]:+.3f}]")
 
-        if configured_target is not None:
-            d_start = np.linalg.norm(ee_history[0][1] - configured_target)
-            d_final = np.linalg.norm(ee_history[-1][1] - configured_target)
-            d_min = min(np.linalg.norm(xyz - configured_target) for _, xyz in ee_history)
-            print(f"\nDistance from EE to configured target_xyz {configured_target}:")
-            print(f"  start: {d_start:.3f}m")
-            print(f"  final: {d_final:.3f}m")
-            print(f"  min over trajectory: {d_min:.3f}m")
+        if configured_goal is not None:
+            # Always report EE distance (informative even in object mode).
+            ee_d_min = min(np.linalg.norm(xyz - configured_goal) for _, xyz in ee_history)
+            ee_d_final = float(np.linalg.norm(ee_history[-1][1] - configured_goal))
+            print(f"\nEE → goal_xyz: final {ee_d_final:.3f}m, min {ee_d_min:.3f}m")
 
-            print(f"\nVerdict:")
-            if d_min < 0.10:
-                print(f"  ✓ EE got within 10cm of target — target is reachable + relevant")
-            elif d_min < 0.20:
-                print(f"  ≈ EE got within 20cm — target is roughly right, may want to refine")
+            # The MPPI-equivalent metric: tracked body → goal.
+            if tracked_history:
+                t_min = min(float(np.linalg.norm(xyz - configured_goal)) for _, _, xyz in tracked_history)
+                t_final_t, t_final_name, t_final_xyz = tracked_history[-1]
+                t_final = float(np.linalg.norm(t_final_xyz - configured_goal))
+                # Stage transitions: report when the "currently farthest" body switches
+                switches = sum(
+                    1 for i in range(1, len(tracked_history))
+                    if tracked_history[i][1] != tracked_history[i - 1][1]
+                )
+                print(f"tracked body → goal: final {t_final:.3f}m ({t_final_name}), "
+                      f"min {t_min:.3f}m over trajectory; "
+                      f"{switches} body switches")
+
+                print(f"\nVerdict (tracked-body metric, what MPPI sees):")
+                if t_min < 0.10:
+                    print(f"  ✓ tracked body got within 10cm of goal — target is reachable + relevant")
+                elif t_min < 0.20:
+                    print(f"  ≈ within 20cm — target is roughly right, may want to refine")
+                else:
+                    print(f"  ✗ never within 20cm — goal_xyz or track_bodies probably wrong")
             else:
-                print(f"  ✗ EE never got within 20cm — target may be wrong for this task")
+                print(f"\nVerdict (EE metric):")
+                if ee_d_min < 0.10:
+                    print(f"  ✓ EE got within 10cm of goal — target is reachable + relevant")
+                elif ee_d_min < 0.20:
+                    print(f"  ≈ EE within 20cm — target is roughly right")
+                else:
+                    print(f"  ✗ EE never within 20cm — target may be wrong")
 
     env.close()
     return 0

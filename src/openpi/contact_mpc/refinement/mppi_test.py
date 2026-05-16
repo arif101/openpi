@@ -44,7 +44,7 @@ TEST_XML = """
 @pytest.fixture
 def evaluator():
     weights = CostWeights(
-        joint_limit=10.0, collision_penetration=100.0, end_effector=1.0, anchor=0.05,
+        joint_limit=10.0, collision_penetration=100.0, target_distance=1.0, anchor=0.05,
     )
     return PhysicsEvaluator.from_xml_string(TEST_XML, ee_body_name="eef", weights=weights)
 
@@ -56,7 +56,7 @@ def test_refine_returns_correct_shape(evaluator):
     init_qpos = np.zeros(evaluator.model.nq)
     init_qvel = np.zeros(evaluator.model.nv)
     prior = np.zeros((H, evaluator.model.nu), dtype=np.float32)
-    refined, diag = refiner.refine(init_qpos, init_qvel, prior, ee_target_xyz=None)
+    refined, diag = refiner.refine(init_qpos, init_qvel, prior, target_xyz=None)
     assert refined.shape == prior.shape
     assert refined.dtype == prior.dtype
     assert diag.num_samples == 8
@@ -77,7 +77,7 @@ def test_refine_produces_valid_diagnostics(evaluator):
     initial_ee = init_roll.ee_pose_traj[0, :3]
     target = initial_ee + np.array([0.1, 0.0, 0.0])
 
-    refined, diag = refiner.refine(init_qpos, init_qvel, prior, ee_target_xyz=target)
+    refined, diag = refiner.refine(init_qpos, init_qvel, prior, target_xyz=target)
 
     # Sanity checks (not strong correctness assertions — MPPI in 1 iter on
     # random Gaussian samples isn't guaranteed to beat the nominal).
@@ -99,7 +99,7 @@ def test_weights_sum_to_one_implicitly(evaluator):
     init_qpos = np.zeros(evaluator.model.nq)
     init_qvel = np.zeros(evaluator.model.nv)
     prior = np.zeros((H, evaluator.model.nu), dtype=np.float32)
-    _, diag = refiner.refine(init_qpos, init_qvel, prior, ee_target_xyz=None)
+    _, diag = refiner.refine(init_qpos, init_qvel, prior, target_xyz=None)
     # Entropy of uniform K=16 is log(16) ≈ 2.77. Bounded above.
     assert diag.weight_entropy <= np.log(16) + 1e-6
     # And bounded below at 0 (would require perfectly peaked weights).
@@ -116,7 +116,7 @@ def test_iterating_multiple_times_doesnt_explode(evaluator):
         evaluator, num_samples=32, noise_std=0.2, temperature=0.5,
         num_iterations=10, rng=np.random.default_rng(0),
     )
-    refined, diag = refiner.refine(init_qpos, init_qvel, prior, ee_target_xyz=None)
+    refined, diag = refiner.refine(init_qpos, init_qvel, prior, target_xyz=None)
     assert refined.shape == prior.shape
     assert (refined >= -1.0).all() and (refined <= 1.0).all()
     assert np.isfinite(refined).all()
@@ -134,7 +134,7 @@ def test_no_target_anchors_to_prior(evaluator):
     init_qpos = np.zeros(evaluator.model.nq)
     init_qvel = np.zeros(evaluator.model.nv)
     prior = np.zeros((H, evaluator.model.nu), dtype=np.float32)
-    refined, diag = refiner.refine(init_qpos, init_qvel, prior, ee_target_xyz=None)
+    refined, diag = refiner.refine(init_qpos, init_qvel, prior, target_xyz=None)
 
     # A typical random sample has L2 norm ≈ sigma · sqrt(H · action_dim)
     typical_sample_norm = sigma * np.sqrt(H * evaluator.model.nu)
@@ -158,7 +158,7 @@ def test_action_bounds_respected(evaluator):
     init_qpos = np.zeros(evaluator.model.nq)
     init_qvel = np.zeros(evaluator.model.nv)
     prior = np.zeros((H, evaluator.model.nu), dtype=np.float32)
-    refined, _ = refiner.refine(init_qpos, init_qvel, prior, ee_target_xyz=None)
+    refined, _ = refiner.refine(init_qpos, init_qvel, prior, target_xyz=None)
     assert (refined >= -0.5).all()
     assert (refined <= 0.5).all()
 
@@ -189,7 +189,7 @@ def test_more_iterations_reduces_or_maintains_cost(evaluator):
             evaluator, num_samples=32, noise_std=0.2, temperature=0.5,
             num_iterations=N, rng=np.random.default_rng(0),
         )
-        _, diag = refiner.refine(init_qpos, init_qvel, prior, ee_target_xyz=target)
+        _, diag = refiner.refine(init_qpos, init_qvel, prior, target_xyz=target)
         costs.append(diag.refined_cost)
     # Each successive iteration should not WORSEN the cost (within tolerance for rng noise)
     # Strictly monotonic isn't guaranteed by MPPI, but successive iterations *typically* improve.

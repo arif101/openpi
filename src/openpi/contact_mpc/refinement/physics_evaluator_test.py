@@ -131,11 +131,11 @@ def test_cost_zero_action_zero_anchor(evaluator):
     prior_action = action_chunk.copy()
 
     roll, cost = evaluator.evaluate(
-        init_qpos, init_qvel, action_chunk, prior_action, ee_target_xyz=None,
+        init_qpos, init_qvel, action_chunk, prior_action, target_xyz=None,
     )
     assert cost.joint_limit == 0.0
     assert cost.anchor == 0.0
-    assert cost.end_effector == 0.0
+    assert cost.target_distance == 0.0
     # contact_count may be nonzero if gravity creates contacts; just assert finite
     assert np.isfinite(cost.total)
 
@@ -162,9 +162,37 @@ def test_cost_ee_target_distance(evaluator):
     actual_xyz = roll.ee_pose_traj[-1, :3]
     far_target = actual_xyz + np.array([1.0, 0.0, 0.0])
 
-    cost = evaluator.cost(roll, action_chunk, prior_action=None, ee_target_xyz=far_target)
+    cost = evaluator.cost(roll, action_chunk, prior_action=None, target_xyz=far_target)
     # The EE is at actual_xyz; target is 1m away on x. Distance should be ~1.
-    assert cost.end_effector == pytest.approx(1.0, abs=1e-2)
+    assert cost.target_distance == pytest.approx(1.0, abs=1e-2)
+
+
+def test_cost_tracks_body_when_id_given(evaluator):
+    """When target_body_id is set, distance is measured from that body, not the EE."""
+    import mujoco
+    H = 1
+    init_qpos = np.zeros(evaluator.model.nq)
+    init_qvel = np.zeros(evaluator.model.nv)
+    action_chunk = np.zeros((H, evaluator.model.nu))
+
+    # Track the static "box" body (at pos="0.7 0 0.15" in TEST_XML)
+    box_id = mujoco.mj_name2id(evaluator.model, mujoco.mjtObj.mjOBJ_BODY, "box")
+    assert box_id >= 0
+    roll, _ = evaluator.evaluate(
+        init_qpos, init_qvel, action_chunk, target_body_id=box_id,
+    )
+    assert roll.tracked_body_pos_traj is not None
+    assert roll.tracked_body_pos_traj.shape == (H + 1, 3)
+    # Box is static; tracked trajectory should be ~constant near (0.7, 0, 0.15)
+    box_pos = roll.tracked_body_pos_traj[-1]
+    assert abs(box_pos[0] - 0.7) < 0.05
+    assert abs(box_pos[2] - 0.15) < 0.05
+
+    # target_xyz coincides with box → distance ~0; far from box → distance ~1
+    cost_at_box = evaluator.cost(roll, action_chunk, target_xyz=box_pos)
+    cost_far = evaluator.cost(roll, action_chunk, target_xyz=box_pos + np.array([1.0, 0, 0]))
+    assert cost_at_box.target_distance == pytest.approx(0.0, abs=1e-3)
+    assert cost_far.target_distance == pytest.approx(1.0, abs=1e-2)
 
 
 def test_weighted_total_matches_components(evaluator):
@@ -176,14 +204,14 @@ def test_weighted_total_matches_components(evaluator):
     prior_action = np.zeros_like(action_chunk)
 
     weights = CostWeights(
-        joint_limit=10.0, collision_penetration=200.0, end_effector=3.0, anchor=4.0,
+        joint_limit=10.0, collision_penetration=200.0, target_distance=3.0, anchor=4.0,
     )
     ev = PhysicsEvaluator.from_xml_string(TEST_XML, ee_body_name="eef", weights=weights)
     roll, cost = ev.evaluate(init_qpos, init_qvel, action_chunk, prior_action)
     expected = (
         weights.joint_limit * cost.joint_limit
         + weights.collision_penetration * cost.collision_penetration
-        + weights.end_effector * cost.end_effector
+        + weights.target_distance * cost.target_distance
         + weights.anchor * cost.anchor
     )
     assert cost.total == pytest.approx(expected, rel=1e-6)
