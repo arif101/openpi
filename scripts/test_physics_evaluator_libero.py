@@ -25,6 +25,17 @@ import sys
 import time
 
 import numpy as np
+import torch
+
+# PyTorch 2.6 changed torch.load default to weights_only=True. LIBERO's
+# get_task_init_states pickles a numpy-containing dict, so we patch torch.load
+# back to the pre-2.6 behavior. Mirror of run_libero_pro_mcts.py's patch.
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 
 
 def parse_args():
