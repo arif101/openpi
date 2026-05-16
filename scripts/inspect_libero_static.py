@@ -136,13 +136,16 @@ def suggest_target(predicates, body_positions: dict[str, list[float]]) -> tuple[
                 return name, xyz
         return None
 
+    relational = {"on", "in", "in-container"}
+    unary = {"open", "close", "closed", "turnon", "turnoff", "turn-on", "turn-off"}
     for pred, args in predicates:
-        if pred in ("on", "in", "in-container") and len(args) >= 2:
+        p = pred.lower()
+        if p in relational and len(args) >= 2:
             hit = find_body(args[1])
             if hit:
                 return hit[1].copy() if hasattr(hit[1], "copy") else list(hit[1]), \
                     f"derived from ({pred} {' '.join(args)}) → body '{hit[0]}'"
-        elif pred in ("open", "closed", "turn-on", "turn-off") and len(args) >= 1:
+        elif p in unary and len(args) >= 1:
             hit = find_body(args[0])
             if hit:
                 return list(hit[1]), f"derived from ({pred} {args[0]}) → body '{hit[0]}'"

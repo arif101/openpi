@@ -97,16 +97,18 @@ def suggest_target(predicates, body_positions: dict[str, np.ndarray]) -> tuple[n
     if not predicates:
         return None, "no predicates"
 
+    # BDDL uses capitalized predicates (In, On, Close, Turnon) — lowercase for matching.
     # Pick the FIRST predicate that names a known body — use Y if it's a relational predicate
+    relational = {"on", "in", "in-container"}
+    unary = {"open", "close", "closed", "turnon", "turnoff", "turn-on", "turn-off"}
     for pred, args in predicates:
-        if pred in ("on", "in", "in-container") and len(args) >= 2:
+        p = pred.lower()
+        if p in relational and len(args) >= 2:
             target_obj = args[1]
             for body_name, xyz in body_positions.items():
-                # Loose matching: BDDL names often differ from MuJoCo body names
-                # (e.g., "basket_1" vs "basket"). Match by substring either way.
                 if target_obj.lower() in body_name.lower() or body_name.lower() in target_obj.lower():
                     return xyz.copy(), f"derived from ({pred} {' '.join(args)}) → body '{body_name}'"
-        elif pred in ("open", "closed", "turn-on", "turn-off") and len(args) >= 1:
+        elif p in unary and len(args) >= 1:
             target_obj = args[0]
             for body_name, xyz in body_positions.items():
                 if target_obj.lower() in body_name.lower() or body_name.lower() in target_obj.lower():
