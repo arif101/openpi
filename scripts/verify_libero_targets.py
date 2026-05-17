@@ -133,15 +133,16 @@ def main() -> int:
     env = OffScreenRenderEnv(bddl_file_name=str(bddl),
                               camera_heights=256, camera_widths=256)
     env.seed(args.seed)
-    sim = env.env.sim
-    model = sim.model
 
-    # Get initial body positions for context
+    # Get initial body positions for context. Robosuite rebuilds the underlying
+    # MjSim during env.reset(), so we re-fetch sim+model after reset.
     print("\n--- Non-robot bodies at init (reference) ---")
     robot_prefixes = ("robot0_", "gripper0_", "panda", "link", "world")
     object_init = {}
     env.reset()
     env.set_init_state(init_states[0])
+    sim = env.env.sim
+    model = sim.model
     for b in range(1, model.nbody):
         name = model.body_id2name(b) or ""
         if name and not any(name.startswith(p) for p in robot_prefixes):
@@ -177,6 +178,9 @@ def main() -> int:
         print(f"{'-'*70}")
 
         env.reset()
+        # MjSim may have been rebuilt by reset(); re-fetch the live handles.
+        sim = env.env.sim
+        model = sim.model
         init = init_states[trial_idx]
         if perturb_m > 0:
             state = init.clone() if hasattr(init, "clone") else init.copy()
