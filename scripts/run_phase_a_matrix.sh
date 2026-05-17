@@ -34,6 +34,9 @@ mkdir -p "$ROLLOUT_DIR" "$TRACE_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 PYBIN="uv run python3 -u"
 export PYTHONPATH="src:third_party/libero"
+# Headless GL for MuJoCo offscreen rendering. Without this, OffScreenRenderEnv
+# tries to open an X display and fails on container GPU boxes.
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 # Common args used by every run
 COMMON_ARGS=(
