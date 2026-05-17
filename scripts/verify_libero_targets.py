@@ -163,11 +163,8 @@ def main() -> int:
                 tracked_ids.append(int(model.body_name2id(nm)))
             except Exception:
                 print(f"  [warn] track body '{nm}' not found in model")
-    ee_body_id = -1
-    try:
-        ee_body_id = int(model.body_name2id("robot0_eef"))
-    except Exception:
-        ee_body_id = model.nbody - 1
+    # EE position is read from obs["robot0_eef_pos"] (robosuite observation key)
+    # rather than a body lookup — "robot0_eef" is an obs key, not a body name.
 
     perturb_m = args.perturbation_cm / 100.0
     perturb_rng = np.random.default_rng(args.seed + 1000)
@@ -213,7 +210,7 @@ def main() -> int:
 
             action = plan.popleft()
             obs, _, done, _ = env.step(action.tolist())
-            ee_xyz = sim.data.body_xpos[ee_body_id].copy()
+            ee_xyz = np.asarray(obs["robot0_eef_pos"], dtype=np.float64).copy()
             ee_history.append((t, ee_xyz))
             # Pick whichever tracked body is farthest from goal (matches MPPI logic).
             if configured_mode == "object" and tracked_ids and configured_goal is not None:

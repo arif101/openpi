@@ -478,10 +478,20 @@ def main():
         raise KeyError(f"Body '{name}' not found in MuJoCo model for {args.task_suite}/{args.task_idx}")
 
     if mode == "ee":
-        # Track the end-effector body (matches LIBERO baseline name)
-        ee_name = "robot0_eef"
-        tracked_body_ids = [_body_id(ee_name)]
-        print(f"Tracking EE body '{ee_name}' (id={tracked_body_ids[0]})", flush=True)
+        # The robosuite obs key "robot0_eef_pos" isn't a body name; the wrist
+        # body is typically "robot0_right_hand". Try a few aliases.
+        ee_aliases = ("robot0_right_hand", "gripper0_eef", "robot0_link7", "robot0_eef", "eef")
+        resolved = None
+        for nm in ee_aliases:
+            try:
+                resolved = (nm, _body_id(nm))
+                break
+            except KeyError:
+                continue
+        if resolved is None:
+            raise KeyError(f"No EE body found among {ee_aliases}")
+        tracked_body_ids = [resolved[1]]
+        print(f"Tracking EE body '{resolved[0]}' (id={resolved[1]})", flush=True)
     elif mode == "object":
         track_names = entry.get("track_bodies") or []
         if not track_names:
