@@ -847,6 +847,55 @@ _CONFIGS = [
         num_train_steps=2_000,
     ),
     #
+    # Phase B distillation: LoRA fine-tune Pi0.5 on MPPI-refined rollouts.
+    #
+    # Trains LoRA-only on top of the pi05_libero LIBERO-finetuned checkpoint,
+    # using the refined-rollout corpus produced by scripts/run_reason_v3_mppi.py
+    # (gate-off matrix produced 33 successful episodes, ~50 frames each).
+    #
+    # The supervised target is the MPPI-refined action chunk, given the same
+    # obs Pi0.5 saw at the decision point. The model learns to emit the
+    # physics-grounded correction natively → no inference-time search needed.
+    #
+    # Acceptance gate: Pi0.5 + LoRA (no MPPI) ≥ Pi0.5 + MPPI on LIBERO-PRO
+    # task 3 across 3 seeds at N=10. If yes, capability gain validated.
+    #
+    TrainConfig(
+        name="pi05_libero_phase_b_distill",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotLiberoDataConfig(
+            # Set after running scripts/convert_refined_rollouts_to_lerobot.py
+            # with --push-to-hub. Update repo_id to point at your HF push.
+            repo_id="arif101/openpi_refined_rollouts_libero10_phase_b",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=1e-4,
+            decay_steps=2_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_libero/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=2_000,
+    ),
+    #
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
