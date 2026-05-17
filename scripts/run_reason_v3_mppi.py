@@ -217,6 +217,24 @@ def parse_args():
                         "location) from 'right intent / bad control' (EE near "
                         "object but misses). Drives Phase B vs guided-exploration "
                         "choice as the capability fix.")
+    # PhysVLA: per-step physics-rich trace logger. Captures (image, wrist,
+    # state, action, body poses, contact wrenches, gripper qpos, contact
+    # summary) at every env.step for every episode (success AND failure).
+    # This is the foundation dataset for training the latent dynamics model
+    # + physics-supervised aux heads. Distinct from --log-refined-rollouts
+    # (per-decision MPPI input/output) and --log-failure-traces (failed
+    # episodes only, downsampled).
+    p.add_argument("--log-physics-traces", default=None,
+                   help="Directory to write per-step physics-rich .npz files "
+                        "for ALL episodes. Captures the supervision data for "
+                        "the PhysVLA latent dynamics model + aux heads "
+                        "(contact wrenches, object poses, slip velocities, "
+                        "contact normals).")
+    p.add_argument("--physics-trace-image-stride", type=int, default=5,
+                   help="Save images every N steps to keep dataset size "
+                        "manageable. Physics-state arrays are still saved "
+                        "per-step regardless. Default 5 → ~30MB/episode "
+                        "at 500 steps with 224x224 images.")
     p.add_argument("--mppi-early-exit-calls", type=int, default=6,
                    help="Number of consecutive MPPI calls with no signal "
                         "(spread<eps AND |refined-nominal|<eps) before giving "
@@ -585,6 +603,18 @@ def run_episode(
     trace_step: list[dict] = []
     trace_frames: list[dict] = []
     FRAME_EVERY = 50
+    # PhysVLA: full per-step physics-rich trace. Captures the supervision
+    # signals for the latent dynamics model + aux heads. Saved for every
+    # episode (success or failure). Images are stored every Nth step to
+    # keep dataset size manageable; physics scalars saved per step.
+    phys_step: list[dict] = []
+    phys_images: list[dict] = []
+    # Build the list of all body ids whose pose we'll track. These are the
+    # non-robot, non-mount, non-table bodies (the actual movable scene
+    # objects). Resolved lazily on first env.step because env.env.sim is
+    # rebuilt at reset.
+    phys_object_body_ids: list[tuple[int, str]] | None = None
+    phys_ee_body_id: int | None = None
     # Early-exit state: track consecutive no-signal MPPI calls within this
     # episode. If we hit the threshold we stop trying MPPI for the rest of
     # the episode (executes pure Pi0.5 prior instead). Resets per-episode.
@@ -718,6 +748,75 @@ def run_episode(
         action = plan.popleft()
         obs, _, done, _ = env.step(action.tolist())
 
+        # PhysVLA physics trace: per-step contact wrenches, body poses, etc.
+        # Saved for every episode (success or failure). This is the dataset
+        # the latent dynamics model + aux heads train on.
+        if args.log_physics_traces:
+            sim_now = env.env.sim
+            mdl = sim_now.model
+            d = sim_now.data
+            if phys_object_body_ids is None:
+                # First step: resolve which bodies to log. Anything not the
+                # robot, the mount, the floor, or the table is a "scene object."
+                skip_prefixes = ("robot0_", "gripper0_", "panda", "link",
+                                 "world", "mount0_", "floor", "table")
+                phys_object_body_ids = []
+                for b in range(1, mdl.nbody):
+                    name = mdl.body_id2name(b) or ""
+                    if not any(name.startswith(p) for p in skip_prefixes):
+                        phys_object_body_ids.append((b, name))
+                # EE body: try common robosuite Franka names
+                for nm in ("robot0_right_hand", "gripper0_eef", "robot0_link7"):
+                    try:
+                        phys_ee_body_id = int(mdl.body_name2id(nm))
+                        break
+                    except Exception:
+                        continue
+                if phys_ee_body_id is None:
+                    phys_ee_body_id = mdl.nbody - 1
+
+            ee_wrench = d.cfrc_ext[phys_ee_body_id].copy()  # [6] force+torque
+            obj_states = []
+            for bid, _ in phys_object_body_ids:
+                obj_states.append({
+                    "pos": d.body_xpos[bid].copy(),
+                    "quat": d.body_xquat[bid].copy(),
+                    "wrench": d.cfrc_ext[bid].copy(),
+                })
+
+            # Per-contact summary — small structured list (active contacts only)
+            contacts = []
+            for ci in range(int(d.ncon)):
+                c = d.contact[ci]
+                depth = max(0.0, -float(c.dist))
+                if depth < 1e-6:
+                    continue
+                contacts.append({
+                    "geom1": int(c.geom1),
+                    "geom2": int(c.geom2),
+                    "pos": np.array(c.pos, dtype=np.float64).copy(),
+                    "depth": depth,
+                })
+
+            phys_step.append({
+                "t": t,
+                "ee_pos": np.asarray(obs["robot0_eef_pos"], dtype=np.float64).copy(),
+                "ee_quat": np.asarray(obs["robot0_eef_quat"], dtype=np.float64).copy(),
+                "ee_wrench": ee_wrench,
+                "gripper_qpos": np.asarray(obs["robot0_gripper_qpos"], dtype=np.float64).copy(),
+                "action": np.asarray(action, dtype=np.float64).copy(),
+                "qpos": d.qpos.copy(),
+                "qvel": d.qvel.copy(),
+                "objects": obj_states,
+                "contacts": contacts,
+            })
+            if t % args.physics_trace_image_stride == 0:
+                phys_images.append({
+                    "t": t,
+                    "image": np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]).copy(),
+                    "wrist_image": np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1]).copy(),
+                })
+
         # Failure trace: cheap per-step data + occasional camera snapshots.
         # We always collect during the episode; only persist if it fails.
         if args.log_failure_traces:
@@ -770,6 +869,67 @@ def run_episode(
             steps=t,
         )
 
+    # PhysVLA physics trace: dump for every episode (success and failure).
+    # This is the foundation dataset for the latent dynamics model.
+    phys_path = None
+    if args.log_physics_traces and phys_step:
+        phys_dir = pathlib.Path(args.log_physics_traces)
+        phys_dir.mkdir(parents=True, exist_ok=True)
+        outcome = "OK" if bool(done) else "FAIL"
+        stem = (f"PHYS_{outcome}_{args.task_suite}_task{args.task_idx}_"
+                f"seed{args.seed}_pert{args.perturbation_cm}cm_"
+                f"{mode}_ts{int(time.time()*1000)}")
+        phys_path = phys_dir / f"{stem}.npz"
+        # Pack per-step physics arrays
+        ts = np.array([s["t"] for s in phys_step], dtype=np.int32)
+        ee_pos = np.stack([s["ee_pos"] for s in phys_step])
+        ee_quat = np.stack([s["ee_quat"] for s in phys_step])
+        ee_wrench = np.stack([s["ee_wrench"] for s in phys_step])
+        gripper_qpos = np.stack([s["gripper_qpos"] for s in phys_step])
+        actions = np.stack([s["action"] for s in phys_step])
+        qpos = np.stack([s["qpos"] for s in phys_step])
+        qvel = np.stack([s["qvel"] for s in phys_step])
+        # Per-object trajectories, keyed by body id+name
+        obj_names = [n for _, n in (phys_object_body_ids or [])]
+        obj_pos = np.stack([
+            np.stack([s["objects"][i]["pos"] for i in range(len(obj_names))])
+            for s in phys_step
+        ]) if obj_names else np.zeros((len(phys_step), 0, 3))
+        obj_quat = np.stack([
+            np.stack([s["objects"][i]["quat"] for i in range(len(obj_names))])
+            for s in phys_step
+        ]) if obj_names else np.zeros((len(phys_step), 0, 4))
+        obj_wrench = np.stack([
+            np.stack([s["objects"][i]["wrench"] for i in range(len(obj_names))])
+            for s in phys_step
+        ]) if obj_names else np.zeros((len(phys_step), 0, 6))
+        # Contacts: variable-length per step → save as object array of dicts
+        contact_records = np.array([s["contacts"] for s in phys_step], dtype=object)
+        # Images at sparse stride
+        img_ts = np.array([f["t"] for f in phys_images], dtype=np.int32) \
+            if phys_images else np.zeros(0, dtype=np.int32)
+        imgs = (np.stack([f["image"] for f in phys_images])
+                if phys_images else np.zeros((0, 0, 0, 3), dtype=np.uint8))
+        wrist_imgs = (np.stack([f["wrist_image"] for f in phys_images])
+                      if phys_images else np.zeros((0, 0, 0, 3), dtype=np.uint8))
+        np.savez_compressed(
+            phys_path,
+            t=ts,
+            ee_pos=ee_pos, ee_quat=ee_quat, ee_wrench=ee_wrench,
+            gripper_qpos=gripper_qpos, action=actions,
+            qpos=qpos, qvel=qvel,
+            object_names=np.array(obj_names, dtype=object),
+            object_pos=obj_pos, object_quat=obj_quat, object_wrench=obj_wrench,
+            contacts=contact_records,
+            image_t=img_ts, image=imgs, wrist_image=wrist_imgs,
+            task_description=str(task_description),
+            prompt=str(task_description),
+            success=bool(done),
+            steps_total=t, mode=mode,
+            ee_body_id=int(phys_ee_body_id) if phys_ee_body_id is not None else -1,
+            image_stride=int(args.physics_trace_image_stride),
+        )
+
     # Failure trace: dump only if episode failed. Successful trajectories are
     # the Phase B distillation target; failed ones get traced for diagnosis.
     trace_path = None
@@ -814,6 +974,7 @@ def run_episode(
         "cost_improvements": cost_improvements,
         "rollout_log_path": str(saved_path) if saved_path is not None else None,
         "failure_trace_path": str(trace_path) if trace_path is not None else None,
+        "physics_trace_path": str(phys_path) if phys_path is not None else None,
         "mppi_early_exit": bool(mppi_disabled_this_episode),
     }
 
