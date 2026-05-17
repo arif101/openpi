@@ -30,6 +30,8 @@ ROLLOUT_DIR="data/contact_mpc/refined_rollouts_libero10"
 TRACE_DIR="data/contact_mpc/failure_traces_libero10"
 mkdir -p "$ROLLOUT_DIR" "$TRACE_DIR"
 
+# Make sure uv is reachable in non-interactive shells (nohup, cron, etc.)
+export PATH="$HOME/.local/bin:$PATH"
 PYBIN="uv run python3 -u"
 export PYTHONPATH="src:third_party/libero"
 
