@@ -168,13 +168,19 @@ def parse_args():
     p.add_argument("--w-anchor", type=float, default=0.05,
                    help="Weight for ||action - prior||² anchor term")
     p.add_argument("--w-grip", type=float, default=20.0,
-                   help="Weight for grip-stability term. Penalizes trajectories "
-                        "where the EE-to-tracked-object distance grows during "
-                        "the rollout (object was grasped, then lost). Failure "
-                        "traces showed 71%% of failures are this mode — the "
-                        "policy reaches the object, grasps, then drops it. "
-                        "Target/approach terms don't see this because they're "
-                        "near-min once EE is at the object. Set 0 to disable.")
+                   help="Weight for grip-stability term. Penalizes positive "
+                        "growth of ||EE - tracked_obj|| ONLY when the previous "
+                        "step's offset was within --grip-radius (i.e., EE was "
+                        "in / near grasp range). This prevents the term from "
+                        "firing during approach-phase jitter (which broke the "
+                        "first grip matrix iteration: pooled -13.3pp on the "
+                        "task 3 cells). Set 0 to disable.")
+    p.add_argument("--grip-radius", type=float, default=0.05,
+                   help="EE-object distance (m) below which the grip-stability "
+                        "term activates. Default 0.05m = 5cm, the rough size of "
+                        "LIBERO objects + gripper closing range. Above this, the "
+                        "EE is in 'approach' phase and natural trajectory jitter "
+                        "shouldn't be penalized.")
     p.add_argument("--w-collision", type=float, default=100.0,
                    help="Weight for robot-involved penetration depth (in meters)")
     p.add_argument("--w-joint-limit", type=float, default=10.0,
@@ -372,6 +378,7 @@ def mppi_refine(
     w_collision: float,
     w_joint_limit: float,
     w_grip: float,
+    grip_radius: float,
     is_robot_geom: np.ndarray,
     replan_steps: int,
     rng: np.random.Generator,
@@ -459,16 +466,18 @@ def mppi_refine(
             approach_cost = float(np.linalg.norm(last_ee_pos - final_tracked))
         else:
             approach_cost = 0.0
-        # Grip-instability: total positive growth of the EE-object offset across
-        # the rollout. If the offset stays constant (object held) → 0 cost.
-        # If it grows (object slipping) → cost increases. Negative growths
-        # (object getting closer, e.g. during approach) are clipped to 0 so
-        # this term only penalizes loss-of-grip, never reward-approach (the
-        # w_approach term already handles approach).
+        # Grip-instability: penalize positive growth of ||EE - obj|| but
+        # ONLY when the previous step's offset was within `grip_radius` —
+        # i.e., the EE was actually in grasp range, so a growth means
+        # "object slipping out of grasp," not "EE jittering during approach."
+        # The first matrix iteration without this gating gave −13.3pp pooled
+        # because approach-phase jitter dominated the cost.
         grip_cost = 0.0
         if len(ee_obj_offsets) >= 2:
-            deltas = np.diff(np.array(ee_obj_offsets))
-            grip_cost = float(np.sum(np.clip(deltas, 0.0, None)))
+            offsets = np.array(ee_obj_offsets)
+            deltas = np.diff(offsets)
+            in_grasp = (offsets[:-1] < grip_radius).astype(np.float64)
+            grip_cost = float(np.sum(np.clip(deltas, 0.0, None) * in_grasp))
         anchor_cost = float(np.sum(
             (candidate[:noised_horizon] - prior_action[:noised_horizon]) ** 2
         ))
@@ -630,6 +639,7 @@ def run_episode(
                     num_iterations=args.mppi_iterations,
                     w_target=args.w_target, w_approach=args.w_approach,
                     w_anchor=args.w_anchor, w_grip=args.w_grip,
+                    grip_radius=args.grip_radius,
                     w_collision=args.w_collision, w_joint_limit=args.w_joint_limit,
                     is_robot_geom=is_robot_geom, replan_steps=args.replan_steps,
                     rng=mppi_rng,
