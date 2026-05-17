@@ -273,18 +273,32 @@ def mppi_refine(
     H, action_dim = prior_action.shape
     sim = env.env.sim
     saved_state = sim.get_state().flatten()
+    # Robosuite increments env.env.timestep on every step. Candidate
+    # evaluations call env.step → timestep grows by K*replan_steps per MPPI
+    # call. After enough MPPI calls it exceeds env.env.horizon and `done`
+    # latches True — set_state_from_flattened restores physics but NOT the
+    # step counter, so the crash persists. Save+restore these scalars
+    # alongside the sim state.
+    saved_timestep = getattr(env.env, "timestep", None)
+    saved_cur_time = getattr(env.env, "cur_time", None)
+    saved_done = getattr(env.env, "done", False)
     # Only the first `noised_horizon` actions are actually executed during a
     # rollout (we replan every replan_steps), so noising beyond that wastes
     # exploration and adds garbage to the anchor term.
     noised_horizon = min(replan_steps, H)
 
+    def _restore_env_scalars():
+        if saved_timestep is not None:
+            env.env.timestep = saved_timestep
+        if saved_cur_time is not None:
+            env.env.cur_time = saved_cur_time
+        env.env.done = saved_done
+
     def evaluate(candidate: np.ndarray) -> float:
         """Step env forward over the noised window; compute scalar cost; restore."""
         sim.set_state_from_flattened(saved_state)
         sim.forward()
-        # Clear the latched termination flag from any prior candidate that
-        # happened to satisfy the BDDL goal.
-        env.env.done = False
+        _restore_env_scalars()
 
         step_cost_sum = 0.0
         last_ee_pos = None
@@ -343,10 +357,9 @@ def mppi_refine(
     refined_cost = evaluate(nominal)
 
     # Restore env to pre-MPPI state so the outer execution proceeds normally.
-    # Also clear the done flag in case the final evaluate triggered it.
     sim.set_state_from_flattened(saved_state)
     sim.forward()
-    env.env.done = False
+    _restore_env_scalars()
 
     diag = {
         "K": K,
@@ -427,12 +440,19 @@ def run_episode(
                 refinements_run += 1
                 cost_improvements.append((diag["nominal_cost"], diag["refined_cost"]))
                 if args.verbose_mppi:
+                    import math as _m
+                    log_K = _m.log(args.mppi_K)
+                    # Entropy gap from uniform: log(K) - entropy. 0 = uniform
+                    # weights (MPPI noop), large = peaked weights (MPPI active).
+                    ent_gap = log_K - diag["weight_entropy"]
                     print(
                         f"    [MPPI t={t}] nominal={diag['nominal_cost']:.3f} "
                         f"refined={diag['refined_cost']:.3f} "
-                        f"best_sample={diag['best_sample_cost']:.3f} "
-                        f"spread={diag['cost_spread']:.3f} "
-                        f"entropy={diag['weight_entropy']:.2f} "
+                        f"best={diag['best_sample_cost']:.3f} "
+                        f"spread={diag['cost_spread']:.4f} "
+                        f"ent_gap_from_uniform={ent_gap:.4f} "
+                        f"(refined-nominal={diag['refined_cost']-diag['nominal_cost']:+.3f}, "
+                        f"best-nominal={diag['best_sample_cost']-diag['nominal_cost']:+.3f}) "
                         f"wall={diag['wall_seconds']*1000:.0f}ms",
                         flush=True,
                     )
