@@ -214,6 +214,19 @@ def parse_args():
                    help="Spread threshold for early-exit no-signal detection.")
     p.add_argument("--mppi-early-exit-delta", type=float, default=0.01,
                    help="|refined-nominal| threshold for early-exit detection.")
+    # Trust-region gate: only commit MPPI when it claims a meaningful win.
+    # Without this, MPPI averages noise from K candidates around an already-
+    # correct prior and can derail trials that baseline would have solved.
+    # The 3-seed matrix at N=10 showed MPPI's lift is monotonic in baseline
+    # weakness — +30pp when baseline=40%, but -20pp when baseline=90%. The
+    # gate suppresses the regression at high baselines without losing the
+    # rescue at low baselines.
+    p.add_argument("--mppi-trust-threshold", type=float, default=0.0,
+                   help="Only use MPPI's refined chunk if "
+                        "best_sample_cost < nominal_cost * (1 - threshold). "
+                        "0.0 disables the gate (current behaviour). Try 0.03 "
+                        "to suppress noise-level refinements. Higher = "
+                        "more conservative (use prior more often).")
     return p.parse_args()
 
 
@@ -595,7 +608,17 @@ def run_episode(
                     scorer_type=args.scorer_type, q_fn=q_fn,
                     hidden_state=hidden_state, device=device,
                 )
-                action_chunk = refined
+                # Trust-region gate: only commit MPPI's refined chunk if its
+                # best candidate beat the nominal by a meaningful margin. The
+                # N=10 matrix showed MPPI's softmin-average of K candidates
+                # introduces noise that can derail trials Pi0.5 was solving
+                # — the gate keeps us on the prior unless MPPI's best sample
+                # claims a real win.
+                trust = args.mppi_trust_threshold
+                claimed_win = diag["nominal_cost"] - diag["best_sample_cost"]
+                trust_floor = trust * abs(diag["nominal_cost"])
+                gate_passed = (trust <= 0.0) or (claimed_win >= trust_floor)
+                action_chunk = refined if gate_passed else initial_action
                 refinements_run += 1
                 cost_improvements.append((diag["nominal_cost"], diag["refined_cost"]))
                 if args.log_refined_rollouts:
@@ -616,6 +639,7 @@ def run_episode(
                     # Entropy gap from uniform: log(K) - entropy. 0 = uniform
                     # weights (MPPI noop), large = peaked weights (MPPI active).
                     ent_gap = log_K - diag["weight_entropy"]
+                    gate_tag = "" if gate_passed else " GATE-REJECT→prior"
                     print(
                         f"    [MPPI t={t}] nominal={diag['nominal_cost']:.3f} "
                         f"refined={diag['refined_cost']:.3f} "
@@ -624,7 +648,7 @@ def run_episode(
                         f"ent_gap_from_uniform={ent_gap:.4f} "
                         f"(refined-nominal={diag['refined_cost']-diag['nominal_cost']:+.3f}, "
                         f"best-nominal={diag['best_sample_cost']-diag['nominal_cost']:+.3f}) "
-                        f"wall={diag['wall_seconds']*1000:.0f}ms",
+                        f"wall={diag['wall_seconds']*1000:.0f}ms{gate_tag}",
                         flush=True,
                     )
 
