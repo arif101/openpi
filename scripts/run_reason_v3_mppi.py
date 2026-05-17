@@ -203,6 +203,17 @@ def parse_args():
                         "location) from 'right intent / bad control' (EE near "
                         "object but misses). Drives Phase B vs guided-exploration "
                         "choice as the capability fix.")
+    p.add_argument("--mppi-early-exit-calls", type=int, default=6,
+                   help="Number of consecutive MPPI calls with no signal "
+                        "(spread<eps AND |refined-nominal|<eps) before giving "
+                        "up MPPI for the rest of this episode and executing "
+                        "the Pi0.5 prior directly. Saves ~150s/trial on the "
+                        "unrescuable stuck-policy failure mode at high "
+                        "perturbations. Set to 0 to disable.")
+    p.add_argument("--mppi-early-exit-spread", type=float, default=0.08,
+                   help="Spread threshold for early-exit no-signal detection.")
+    p.add_argument("--mppi-early-exit-delta", type=float, default=0.01,
+                   help="|refined-nominal| threshold for early-exit detection.")
     return p.parse_args()
 
 
@@ -524,6 +535,12 @@ def run_episode(
     trace_step: list[dict] = []
     trace_frames: list[dict] = []
     FRAME_EVERY = 50
+    # Early-exit state: track consecutive no-signal MPPI calls within this
+    # episode. If we hit the threshold we stop trying MPPI for the rest of
+    # the episode (executes pure Pi0.5 prior instead). Resets per-episode.
+    no_signal_streak = 0
+    mppi_disabled_this_episode = False
+    early_exit_threshold = max(0, int(args.mppi_early_exit_calls))
 
     while t < max_steps + args.num_steps_wait:
         if time.time() - episode_start > args.episode_timeout:
@@ -553,7 +570,7 @@ def run_episode(
                 hidden_state = np.asarray(result["vlm_features"], dtype=np.float32)
 
             use_mppi = False
-            if mode == "mppi":
+            if mode == "mppi" and not mppi_disabled_this_episode:
                 if args.mppi_trigger == "always":
                     use_mppi = True
                 elif (args.mppi_trigger == "contact" and last_action_chunk is not None
@@ -610,6 +627,26 @@ def run_episode(
                         f"wall={diag['wall_seconds']*1000:.0f}ms",
                         flush=True,
                     )
+
+                # Early-exit accounting: if this call shows no useful signal
+                # (cost barely varies across candidates AND refined is barely
+                # different from nominal), bump the no-signal streak. After N
+                # consecutive no-signal calls, give up MPPI for the rest of
+                # this episode — Pi0.5 is stuck out-of-workspace and MPPI
+                # cannot help.
+                if early_exit_threshold > 0:
+                    abs_delta = abs(diag["refined_cost"] - diag["nominal_cost"])
+                    if (diag["cost_spread"] < args.mppi_early_exit_spread
+                            and abs_delta < args.mppi_early_exit_delta):
+                        no_signal_streak += 1
+                    else:
+                        no_signal_streak = 0
+                    if no_signal_streak >= early_exit_threshold:
+                        mppi_disabled_this_episode = True
+                        print(f"    [MPPI t={t}] early-exit: {no_signal_streak} "
+                              f"consecutive no-signal calls. Falling back to "
+                              f"Pi0.5 prior for the rest of the episode.",
+                              flush=True)
             else:
                 action_chunk = initial_action
 
@@ -715,6 +752,7 @@ def run_episode(
         "cost_improvements": cost_improvements,
         "rollout_log_path": str(saved_path) if saved_path is not None else None,
         "failure_trace_path": str(trace_path) if trace_path is not None else None,
+        "mppi_early_exit": bool(mppi_disabled_this_episode),
     }
 
 
@@ -852,9 +890,11 @@ def main():
             )
             successes += int(r["success"])
             per_trial.append(r)
-            print(f"  trial {ti+1}/{trials}: {'OK' if r['success'] else 'FAIL'} "
+            tag = "OK" if r['success'] else "FAIL"
+            extra = " early-exit" if r.get("mppi_early_exit") else ""
+            print(f"  trial {ti+1}/{trials}: {tag} "
                   f"({r['steps']} steps, {r['refinements_run']} refinements, "
-                  f"{r['wall_seconds']:.1f}s)",
+                  f"{r['wall_seconds']:.1f}s{extra})",
                   flush=True)
         results[eval_mode] = {
             "successes": successes,
