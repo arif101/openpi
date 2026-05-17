@@ -95,6 +95,12 @@ def parse_args():
     p.add_argument("--mppi-trigger", choices=["always", "contact"], default="always")
     p.add_argument("--w-target", type=float, default=10.0,
                    help="Weight for tracked-body → goal distance term")
+    p.add_argument("--w-approach", type=float, default=5.0,
+                   help="Weight for EE → tracked-body distance. Provides MPPI a "
+                        "gradient signal before the robot grasps the object — "
+                        "when the bowl is on the table 100ms of physics can't "
+                        "move it, but the EE moves several cm so ||EE - bowl|| "
+                        "discriminates candidates.")
     p.add_argument("--w-anchor", type=float, default=0.05,
                    help="Weight for ||action - prior||² anchor term")
     p.add_argument("--w-collision", type=float, default=100.0,
@@ -235,6 +241,7 @@ def mppi_refine(
     lam: float,
     num_iterations: int,
     w_target: float,
+    w_approach: float,
     w_anchor: float,
     w_collision: float,
     w_joint_limit: float,
@@ -244,9 +251,20 @@ def mppi_refine(
 ):
     """Run MPPI refinement on top of Pi0.5's action chunk using LIBERO env.
 
-    Target-distance cost is measured from ``data.body_xpos[tracked_body_id]``
-    to ``goal_xyz`` at the end of each candidate's replan_steps rollout. Set
-    ``tracked_body_id`` to the EE body for tasks without a movable object.
+    Cost decomposition (in priority of providing gradient signal):
+        - target_distance: ||tracked_body - goal_xyz|| (final step). The
+          end-state objective.
+        - approach: ||EE - tracked_body|| (final step). When the object isn't
+          moving yet (no grasp), the target term is constant across candidates;
+          the approach term gives discriminative signal toward the object.
+        - collision_penetration / joint_limit: per-step robot-only physics
+          violations.
+        - anchor: ||candidate - prior||² over the noised window only.
+
+    Robosuite's done-flag is latched: a candidate that satisfies the BDDL goal
+    sets ``env.env.done = True``, and a subsequent ``env.step`` raises. We
+    clear the flag after every state restore and also break out of a
+    candidate's rollout on done so the partial cost is kept.
 
     Returns:
         refined: [H, 7] same shape as prior_action
@@ -255,23 +273,46 @@ def mppi_refine(
     H, action_dim = prior_action.shape
     sim = env.env.sim
     saved_state = sim.get_state().flatten()
+    # Only the first `noised_horizon` actions are actually executed during a
+    # rollout (we replan every replan_steps), so noising beyond that wastes
+    # exploration and adds garbage to the anchor term.
+    noised_horizon = min(replan_steps, H)
 
     def evaluate(candidate: np.ndarray) -> float:
-        """Step env forward replan_steps using candidate; compute scalar cost; restore."""
+        """Step env forward over the noised window; compute scalar cost; restore."""
         sim.set_state_from_flattened(saved_state)
         sim.forward()
+        # Clear the latched termination flag from any prior candidate that
+        # happened to satisfy the BDDL goal.
+        env.env.done = False
 
         step_cost_sum = 0.0
-        for action in candidate[:replan_steps]:
-            _ = env.step(action.tolist())
+        last_ee_pos = None
+        for action in candidate[:noised_horizon]:
+            try:
+                obs_local, _, d_flag, _ = env.step(action.tolist())
+            except ValueError:
+                break  # defensive: robosuite still raised despite the reset
+            last_ee_pos = np.asarray(obs_local["robot0_eef_pos"], dtype=np.float64)
             step_cost_sum += compute_step_cost(
                 sim, is_robot_geom, w_collision, w_joint_limit,
             )
+            if d_flag:
+                break  # candidate completed the task; partial cost is fine
 
         final_tracked = sim.data.body_xpos[tracked_body_id]
         target_cost = float(np.linalg.norm(final_tracked - goal_xyz))
-        anchor_cost = float(np.sum((candidate - prior_action) ** 2))
-        return step_cost_sum + w_target * target_cost + w_anchor * anchor_cost
+        if last_ee_pos is not None:
+            approach_cost = float(np.linalg.norm(last_ee_pos - final_tracked))
+        else:
+            approach_cost = 0.0
+        anchor_cost = float(np.sum(
+            (candidate[:noised_horizon] - prior_action[:noised_horizon]) ** 2
+        ))
+        return (step_cost_sum
+                + w_target * target_cost
+                + w_approach * approach_cost
+                + w_anchor * anchor_cost)
 
     nominal = prior_action.copy()
     sample_costs = np.zeros(K)
@@ -280,7 +321,11 @@ def mppi_refine(
 
     t0 = time.time()
     for it in range(num_iterations):
-        noise = rng.standard_normal((K, H, action_dim)) * sigma
+        # Noise only the first noised_horizon positions (rest is unchanged prior).
+        noise = np.zeros((K, H, action_dim), dtype=prior_action.dtype)
+        noise[:, :noised_horizon] = (
+            rng.standard_normal((K, noised_horizon, action_dim)) * sigma
+        ).astype(prior_action.dtype)
         candidates = np.clip(nominal[None, ...] + noise, -1.0, 1.0)
         for k in range(K):
             sample_costs[k] = evaluate(candidates[k])
@@ -297,9 +342,11 @@ def mppi_refine(
 
     refined_cost = evaluate(nominal)
 
-    # Restore env to pre-MPPI state so the outer execution proceeds normally
+    # Restore env to pre-MPPI state so the outer execution proceeds normally.
+    # Also clear the done flag in case the final evaluate triggered it.
     sim.set_state_from_flattened(saved_state)
     sim.forward()
+    env.env.done = False
 
     diag = {
         "K": K,
@@ -370,7 +417,8 @@ def run_episode(
                     env, initial_action, goal_xyz, tracked_body_id=tracked_id,
                     K=args.mppi_K, sigma=args.mppi_sigma, lam=args.mppi_lambda,
                     num_iterations=args.mppi_iterations,
-                    w_target=args.w_target, w_anchor=args.w_anchor,
+                    w_target=args.w_target, w_approach=args.w_approach,
+                    w_anchor=args.w_anchor,
                     w_collision=args.w_collision, w_joint_limit=args.w_joint_limit,
                     is_robot_geom=is_robot_geom, replan_steps=args.replan_steps,
                     rng=mppi_rng,
