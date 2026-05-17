@@ -186,6 +186,15 @@ def parse_args():
                         "--scorer-type=learned-wm.")
     p.add_argument("--q-function-config", default=None,
                    help="Optional explicit config path; defaults to <ckpt>_config.pt.")
+    # Phase B distillation data engine: capture (obs, prior, refined) per MPPI
+    # call so a downstream LoRA fine-tune can train Pi0.5 to anticipate the
+    # physics-grounded correction. Each saved file is one successful episode.
+    p.add_argument("--log-refined-rollouts", default=None,
+                   help="Directory to write per-episode .npz files containing "
+                        "(obs, prior_action, refined_action) tuples per MPPI "
+                        "decision. Only successful episodes are saved (no point "
+                        "distilling failures). Set to a path under data/ to "
+                        "build the Phase B fine-tune dataset.")
     return p.parse_args()
 
 
@@ -497,6 +506,10 @@ def run_episode(
     refinements_run = 0
     total_decisions = 0
     cost_improvements: list[tuple[float, float]] = []
+    # Phase B logging buffer: appended per MPPI call. Each entry is (obs at the
+    # decision point, the Pi0.5 prior chunk, the refined chunk produced by
+    # MPPI). The Pi0.5 LoRA target = refined chunk, given the same obs.
+    refined_log: list[dict] = []
 
     while t < max_steps + args.num_steps_wait:
         if time.time() - episode_start > args.episode_timeout:
@@ -554,6 +567,18 @@ def run_episode(
                 action_chunk = refined
                 refinements_run += 1
                 cost_improvements.append((diag["nominal_cost"], diag["refined_cost"]))
+                if args.log_refined_rollouts:
+                    refined_log.append({
+                        "t": t,
+                        "image": obs_element["observation/image"].copy(),
+                        "wrist_image": obs_element["observation/wrist_image"].copy(),
+                        "state": obs_element["observation/state"].copy(),
+                        "prompt": obs_element["prompt"],
+                        "prior_action": initial_action.copy(),
+                        "refined_action": refined.copy(),
+                        "nominal_cost": float(diag["nominal_cost"]),
+                        "refined_cost": float(diag["refined_cost"]),
+                    })
                 if args.verbose_mppi:
                     import math as _m
                     log_K = _m.log(args.mppi_K)
@@ -583,6 +608,32 @@ def run_episode(
             break
         t += 1
 
+    # Phase B: only save successful trajectories — failed episodes don't tell us
+    # what the policy *should* have done, just that it didn't. Distilling
+    # failures would teach Pi0.5 to imitate bad rollouts.
+    saved_path = None
+    if args.log_refined_rollouts and bool(done) and refined_log:
+        log_dir = pathlib.Path(args.log_refined_rollouts)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stem = (f"{args.task_suite}_task{args.task_idx}_"
+                f"seed{args.seed}_pert{args.perturbation_cm}cm_"
+                f"ts{int(time.time()*1000)}")
+        saved_path = log_dir / f"{stem}.npz"
+        np.savez_compressed(
+            saved_path,
+            t=np.array([e["t"] for e in refined_log], dtype=np.int32),
+            image=np.stack([e["image"] for e in refined_log]),
+            wrist_image=np.stack([e["wrist_image"] for e in refined_log]),
+            state=np.stack([e["state"] for e in refined_log]),
+            prompt=np.array([e["prompt"] for e in refined_log], dtype=object),
+            prior_action=np.stack([e["prior_action"] for e in refined_log]),
+            refined_action=np.stack([e["refined_action"] for e in refined_log]),
+            nominal_cost=np.array([e["nominal_cost"] for e in refined_log]),
+            refined_cost=np.array([e["refined_cost"] for e in refined_log]),
+            task_description=str(task_description),
+            steps=t,
+        )
+
     return {
         "success": bool(done),
         "steps": t,
@@ -590,6 +641,7 @@ def run_episode(
         "total_decisions": total_decisions,
         "wall_seconds": time.time() - episode_start,
         "cost_improvements": cost_improvements,
+        "rollout_log_path": str(saved_path) if saved_path is not None else None,
     }
 
 
