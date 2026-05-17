@@ -26,12 +26,22 @@ Kill criterion: if MPPI-refined success < Pi0.5 baseline on the gated
 task, MPPI mechanism doesn't help and we tune (K, sigma, lambda, weights).
 
 Usage:
+    # Default (physics scorer) — forward-sim K candidates in MuJoCo
     PYTHONPATH=src:third_party/libero uv run python3 -u \\
         scripts/run_reason_v3_mppi.py \\
-        --task-suite libero_10 --task-idx 0 \\
-        --num-trials 10 --perturbation-cm 5.0 --seed 7 \\
-        --mppi-K 16 --mppi-sigma 0.1 --mppi-lambda 1.0 \\
-        --output-dir data/contact_mpc/reason_v3_mppi
+        --task-suite libero_10 --task-idx 3 \\
+        --num-trials 5 --perturbation-cm 5.0 --seed 7 \\
+        --mppi-K 16 --mppi-sigma 0.1 --mppi-lambda 0.1 \\
+        --scorer-type physics
+
+    # Head-to-head — same loop, learned Q(h, a) scorer
+    PYTHONPATH=src:third_party/libero uv run python3 -u \\
+        scripts/run_reason_v3_mppi.py \\
+        --task-suite libero_10 --task-idx 3 \\
+        --num-trials 5 --perturbation-cm 5.0 --seed 7 \\
+        --mppi-K 16 --mppi-sigma 0.1 --mppi-lambda 0.1 \\
+        --scorer-type learned-wm \\
+        --q-function data/contact_mpc/q_function_libero90/q_function.pt
 """
 
 from __future__ import annotations
@@ -61,6 +71,60 @@ from openpi_client import image_tools
 
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
+from openpi.contact_mpc.value_function.architecture import ActionConditionalValueFunction
+
+
+def load_q_function(ckpt_path: str, cfg_path: str | None, device) -> ActionConditionalValueFunction:
+    """Load a trained ActionConditionalValueFunction Q(h, a)."""
+    if cfg_path is None:
+        p = pathlib.Path(ckpt_path)
+        cfg_path = str(p.parent / (p.stem + "_config.pt"))
+    cfg = torch.load(cfg_path, weights_only=False)
+    if cfg.get("type") and cfg["type"] != "ActionConditionalValueFunction":
+        raise ValueError(
+            f"Expected ActionConditionalValueFunction at {cfg_path}, got {cfg.get('type')!r}"
+        )
+    q = ActionConditionalValueFunction(
+        hidden_state_dim=cfg["hidden_state_dim"],
+        action_chunk_horizon=cfg["action_chunk_horizon"],
+        action_dim=cfg["action_dim"],
+        action_emb_dim=cfg.get("action_emb_dim", 128),
+        hidden_dim=cfg.get("hidden_dim", 256),
+        dropout=0.0,
+    )
+    q.load_state_dict(torch.load(ckpt_path, weights_only=True))
+    return q.to(device).eval()
+
+
+def score_chunks_with_q(
+    q_fn: ActionConditionalValueFunction,
+    hidden_state: np.ndarray,    # [hidden_state_dim] from Pi0.5 vlm_features
+    chunks: np.ndarray,          # [K, H, action_dim]
+    device,
+) -> np.ndarray:
+    """Batch-score K action chunks with Q(h, a). Returns [K] scores.
+
+    Pads / truncates each chunk to the Q-function's expected horizon. Higher Q
+    = better candidate; we negate to produce a "cost" so MPPI softmin logic
+    treats higher-Q candidates as preferred (the physics path produces costs
+    where lower is better).
+    """
+    Hq = q_fn.action_chunk_horizon
+    Aq = q_fn.action_dim
+    K, H, A = chunks.shape
+    if A != Aq:
+        raise ValueError(f"action_dim mismatch: chunks have {A}, Q wants {Aq}")
+    if H >= Hq:
+        chunks_fit = chunks[:, :Hq]
+    else:
+        pad = np.zeros((K, Hq - H, A), dtype=chunks.dtype)
+        chunks_fit = np.concatenate([chunks, pad], axis=1)
+    h = torch.tensor(hidden_state, dtype=torch.float32, device=device).unsqueeze(0).expand(K, -1)
+    a = torch.tensor(chunks_fit, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        q_vals = q_fn(h, a).squeeze(-1).cpu().numpy()
+    # Return cost = -Q so MPPI's softmin (prefer low cost) prefers high Q.
+    return -q_vals.astype(np.float64)
 
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
@@ -109,6 +173,19 @@ def parse_args():
                    help="Weight for joint-limit violations")
     p.add_argument("--verbose-mppi", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # Head-to-head ablation: physics-grounded scorer (default) vs learned-WM scorer.
+    # The paper's core differentiator vs SITCOM / VLAPS / VLA-Reasoner is that
+    # physics scores generalize where learned ones drift. To prove that we need
+    # the same MPPI loop run with both scorers, on the same seeds.
+    p.add_argument("--scorer-type", choices=["physics", "learned-wm"], default="physics",
+                   help="physics: forward-sim each candidate in MuJoCo, score by "
+                        "collision+joint_limit+target+approach. learned-wm: score "
+                        "each candidate via a trained Q(h, action_chunk) — no sim.")
+    p.add_argument("--q-function",
+                   help="Path to a trained ActionConditionalValueFunction .pt for "
+                        "--scorer-type=learned-wm.")
+    p.add_argument("--q-function-config", default=None,
+                   help="Optional explicit config path; defaults to <ckpt>_config.pt.")
     return p.parse_args()
 
 
@@ -248,6 +325,10 @@ def mppi_refine(
     is_robot_geom: np.ndarray,
     replan_steps: int,
     rng: np.random.Generator,
+    scorer_type: str = "physics",
+    q_fn=None,
+    hidden_state: np.ndarray = None,
+    device=None,
 ):
     """Run MPPI refinement on top of Pi0.5's action chunk using LIBERO env.
 
@@ -328,9 +409,22 @@ def mppi_refine(
                 + w_approach * approach_cost
                 + w_anchor * anchor_cost)
 
+    def score_batch_learned(chunks: np.ndarray) -> np.ndarray:
+        """Learned-WM scorer path: no env simulation, just Q(h, candidate)."""
+        # Anchor term still matters — without it Q can pick arbitrarily far actions.
+        learned_cost = score_chunks_with_q(q_fn, hidden_state, chunks, device)
+        anchor = np.sum(
+            (chunks[:, :noised_horizon] - prior_action[None, :noised_horizon]) ** 2,
+            axis=(1, 2),
+        )
+        return learned_cost + w_anchor * anchor
+
     nominal = prior_action.copy()
     sample_costs = np.zeros(K)
-    nominal_cost = evaluate(nominal)
+    if scorer_type == "physics":
+        nominal_cost = evaluate(nominal)
+    else:  # learned-wm
+        nominal_cost = float(score_batch_learned(nominal[None, ...])[0])
     final_weights = None
 
     t0 = time.time()
@@ -341,8 +435,11 @@ def mppi_refine(
             rng.standard_normal((K, noised_horizon, action_dim)) * sigma
         ).astype(prior_action.dtype)
         candidates = np.clip(nominal[None, ...] + noise, -1.0, 1.0)
-        for k in range(K):
-            sample_costs[k] = evaluate(candidates[k])
+        if scorer_type == "physics":
+            for k in range(K):
+                sample_costs[k] = evaluate(candidates[k])
+        else:  # learned-wm: one batched forward pass
+            sample_costs[:] = score_batch_learned(candidates)
 
         costs_shifted = sample_costs - sample_costs.min()
         weights = np.exp(-costs_shifted / lam)
@@ -354,7 +451,10 @@ def mppi_refine(
         )
         nominal = np.clip(nominal + weighted_perturbation, -1.0, 1.0).astype(prior_action.dtype)
 
-    refined_cost = evaluate(nominal)
+    if scorer_type == "physics":
+        refined_cost = evaluate(nominal)
+    else:
+        refined_cost = float(score_batch_learned(nominal[None, ...])[0])
 
     # Restore env to pre-MPPI state so the outer execution proceeds normally.
     sim.set_state_from_flattened(saved_state)
@@ -381,6 +481,7 @@ def mppi_refine(
 def run_episode(
     *, policy, env, init_state, task_description, goal_xyz, tracked_body_ids,
     is_robot_geom, perturbation_m, perturb_rng, max_steps, args, mode, mppi_rng,
+    q_fn=None, device=None,
 ):
     env.reset()
     init_state_np = init_state.clone() if hasattr(init_state, "clone") else init_state.copy()
@@ -411,6 +512,18 @@ def run_episode(
             obs_element = build_obs_element(obs, task_description)
             result = policy.infer(dict(obs_element))
             initial_action = np.asarray(result["actions"], dtype=np.float32)
+            # vlm_features = Pi0.5's hidden state for Q(h, a) scoring.
+            # Physics path doesn't need it, but pull it conditionally so the
+            # cost of extraction is paid only when needed.
+            hidden_state = None
+            if args.scorer_type == "learned-wm":
+                if "vlm_features" not in result:
+                    raise KeyError(
+                        "Policy did not return 'vlm_features' — required for "
+                        "scorer-type=learned-wm. Make sure the openpi build "
+                        "exposes vlm hidden states."
+                    )
+                hidden_state = np.asarray(result["vlm_features"], dtype=np.float32)
 
             use_mppi = False
             if mode == "mppi":
@@ -435,6 +548,8 @@ def run_episode(
                     w_collision=args.w_collision, w_joint_limit=args.w_joint_limit,
                     is_robot_geom=is_robot_geom, replan_steps=args.replan_steps,
                     rng=mppi_rng,
+                    scorer_type=args.scorer_type, q_fn=q_fn,
+                    hidden_state=hidden_state, device=device,
                 )
                 action_chunk = refined
                 refinements_run += 1
@@ -518,6 +633,18 @@ def main():
     policy = _policy_config.create_trained_policy(train_cfg, args.checkpoint)
     print("Policy loaded.", flush=True)
 
+    # Load learned Q(h, a) if running the learned-WM head-to-head ablation.
+    q_fn = None
+    if args.scorer_type == "learned-wm":
+        if not args.q_function:
+            raise ValueError("--scorer-type=learned-wm requires --q-function <ckpt>.pt")
+        device = torch.device(args.device)
+        print(f"Loading Q(h, a) from {args.q_function} (device={device})...", flush=True)
+        q_fn = load_q_function(args.q_function, args.q_function_config, device)
+        print(f"Q loaded: hidden_state_dim={q_fn.hidden_state_dim} "
+              f"horizon={q_fn.action_chunk_horizon} action_dim={q_fn.action_dim}", flush=True)
+    device = torch.device(args.device) if args.scorer_type == "learned-wm" else torch.device("cpu")
+
     bm = benchmark.get_benchmark_dict()[args.task_suite]()
     task = bm.get_task(args.task_idx)
     init_states = bm.get_task_init_states(args.task_idx)
@@ -596,6 +723,7 @@ def main():
                 is_robot_geom=is_robot_geom, perturbation_m=perturbation_m,
                 perturb_rng=perturb_rng, max_steps=max_steps, args=args,
                 mode=eval_mode, mppi_rng=mppi_rng,
+                q_fn=q_fn, device=device,
             )
             successes += int(r["success"])
             per_trial.append(r)
@@ -643,7 +771,8 @@ def main():
     }
     out = (output_dir
            / f"v3mppi_{args.task_suite}_task{args.task_idx}_"
-             f"{args.perturbation_cm}cm_seed{args.seed}_K{args.mppi_K}.json")
+             f"{args.perturbation_cm}cm_seed{args.seed}_K{args.mppi_K}_"
+             f"scorer-{args.scorer_type}.json")
     out.write_text(json.dumps(payload, indent=2, default=str))
     print(f"\nSaved to {out}", flush=True)
 
