@@ -167,6 +167,14 @@ def parse_args():
                         "discriminates candidates.")
     p.add_argument("--w-anchor", type=float, default=0.05,
                    help="Weight for ||action - prior||² anchor term")
+    p.add_argument("--w-grip", type=float, default=20.0,
+                   help="Weight for grip-stability term. Penalizes trajectories "
+                        "where the EE-to-tracked-object distance grows during "
+                        "the rollout (object was grasped, then lost). Failure "
+                        "traces showed 71%% of failures are this mode — the "
+                        "policy reaches the object, grasps, then drops it. "
+                        "Target/approach terms don't see this because they're "
+                        "near-min once EE is at the object. Set 0 to disable.")
     p.add_argument("--w-collision", type=float, default=100.0,
                    help="Weight for robot-involved penetration depth (in meters)")
     p.add_argument("--w-joint-limit", type=float, default=10.0,
@@ -363,6 +371,7 @@ def mppi_refine(
     w_anchor: float,
     w_collision: float,
     w_joint_limit: float,
+    w_grip: float,
     is_robot_geom: np.ndarray,
     replan_steps: int,
     rng: np.random.Generator,
@@ -424,12 +433,20 @@ def mppi_refine(
 
         step_cost_sum = 0.0
         last_ee_pos = None
+        # Grip-stability: track ||EE - tracked_obj|| per step. If the offset
+        # grows (object slipping away from EE), we penalize. The penalty
+        # rewards candidates that *keep* the object near the EE — the dominant
+        # failure mode (71% of trace verdicts) is "reached object, then lost it."
+        ee_obj_offsets: list[float] = []
         for action in candidate[:noised_horizon]:
             try:
                 obs_local, _, d_flag, _ = env.step(action.tolist())
             except ValueError:
                 break  # defensive: robosuite still raised despite the reset
             last_ee_pos = np.asarray(obs_local["robot0_eef_pos"], dtype=np.float64)
+            ee_obj_offsets.append(float(
+                np.linalg.norm(last_ee_pos - sim.data.body_xpos[tracked_body_id])
+            ))
             step_cost_sum += compute_step_cost(
                 sim, is_robot_geom, w_collision, w_joint_limit,
             )
@@ -442,12 +459,23 @@ def mppi_refine(
             approach_cost = float(np.linalg.norm(last_ee_pos - final_tracked))
         else:
             approach_cost = 0.0
+        # Grip-instability: total positive growth of the EE-object offset across
+        # the rollout. If the offset stays constant (object held) → 0 cost.
+        # If it grows (object slipping) → cost increases. Negative growths
+        # (object getting closer, e.g. during approach) are clipped to 0 so
+        # this term only penalizes loss-of-grip, never reward-approach (the
+        # w_approach term already handles approach).
+        grip_cost = 0.0
+        if len(ee_obj_offsets) >= 2:
+            deltas = np.diff(np.array(ee_obj_offsets))
+            grip_cost = float(np.sum(np.clip(deltas, 0.0, None)))
         anchor_cost = float(np.sum(
             (candidate[:noised_horizon] - prior_action[:noised_horizon]) ** 2
         ))
         return (step_cost_sum
                 + w_target * target_cost
                 + w_approach * approach_cost
+                + w_grip * grip_cost
                 + w_anchor * anchor_cost)
 
     def score_batch_learned(chunks: np.ndarray) -> np.ndarray:
@@ -601,7 +629,7 @@ def run_episode(
                     K=args.mppi_K, sigma=args.mppi_sigma, lam=args.mppi_lambda,
                     num_iterations=args.mppi_iterations,
                     w_target=args.w_target, w_approach=args.w_approach,
-                    w_anchor=args.w_anchor,
+                    w_anchor=args.w_anchor, w_grip=args.w_grip,
                     w_collision=args.w_collision, w_joint_limit=args.w_joint_limit,
                     is_robot_geom=is_robot_geom, replan_steps=args.replan_steps,
                     rng=mppi_rng,
