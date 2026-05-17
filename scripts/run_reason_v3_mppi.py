@@ -195,6 +195,14 @@ def parse_args():
                         "decision. Only successful episodes are saved (no point "
                         "distilling failures). Set to a path under data/ to "
                         "build the Phase B fine-tune dataset.")
+    p.add_argument("--log-failure-traces", default=None,
+                   help="Directory to write per-step traces for FAILED episodes "
+                        "only. Captures EE position, tracked-object positions, "
+                        "gripper command, plus a camera frame every ~50 steps. "
+                        "Lets us distinguish 'wrong intent' (EE drifts to phantom "
+                        "location) from 'right intent / bad control' (EE near "
+                        "object but misses). Drives Phase B vs guided-exploration "
+                        "choice as the capability fix.")
     return p.parse_args()
 
 
@@ -510,6 +518,12 @@ def run_episode(
     # decision point, the Pi0.5 prior chunk, the refined chunk produced by
     # MPPI). The Pi0.5 LoRA target = refined chunk, given the same obs.
     refined_log: list[dict] = []
+    # Failure trace buffer: per-step EE + object positions + gripper command.
+    # Camera frames at periodic snapshots only (full per-step frames would
+    # produce ~500MB per failed episode). Used to diagnose stuck-policy mode.
+    trace_step: list[dict] = []
+    trace_frames: list[dict] = []
+    FRAME_EVERY = 50
 
     while t < max_steps + args.num_steps_wait:
         if time.time() - episode_start > args.episode_timeout:
@@ -604,6 +618,29 @@ def run_episode(
 
         action = plan.popleft()
         obs, _, done, _ = env.step(action.tolist())
+
+        # Failure trace: cheap per-step data + occasional camera snapshots.
+        # We always collect during the episode; only persist if it fails.
+        if args.log_failure_traces:
+            sim_now = env.env.sim
+            object_xyz = {
+                f"body_{bid}_{sim_now.model.body_id2name(bid) or bid}":
+                    sim_now.data.body_xpos[bid].copy().tolist()
+                for bid in tracked_body_ids
+            }
+            trace_step.append({
+                "t": t,
+                "ee_pos": [float(x) for x in obs["robot0_eef_pos"]],
+                "gripper_cmd": float(action[-1]) if hasattr(action, "__len__") else None,
+                "ee_action_delta": [float(x) for x in action[:6]],
+                "objects": object_xyz,
+            })
+            if t % FRAME_EVERY == 0:
+                trace_frames.append({
+                    "t": t,
+                    "agentview": np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]).copy(),
+                })
+
         if done:
             break
         t += 1
@@ -634,6 +671,41 @@ def run_episode(
             steps=t,
         )
 
+    # Failure trace: dump only if episode failed. Successful trajectories are
+    # the Phase B distillation target; failed ones get traced for diagnosis.
+    trace_path = None
+    if args.log_failure_traces and not bool(done) and trace_step:
+        trace_dir = pathlib.Path(args.log_failure_traces)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        stem = (f"FAIL_{args.task_suite}_task{args.task_idx}_"
+                f"seed{args.seed}_pert{args.perturbation_cm}cm_"
+                f"{mode}_ts{int(time.time()*1000)}")
+        trace_path = trace_dir / f"{stem}.npz"
+        # Flatten per-step records into arrays for cheap loading
+        ts = np.array([s["t"] for s in trace_step], dtype=np.int32)
+        ee_pos = np.array([s["ee_pos"] for s in trace_step], dtype=np.float64)
+        gripper = np.array([s["gripper_cmd"] for s in trace_step], dtype=np.float64)
+        ee_delta = np.array([s["ee_action_delta"] for s in trace_step], dtype=np.float64)
+        # Object xyz keyed by body name
+        obj_keys = list(trace_step[0]["objects"].keys()) if trace_step else []
+        obj_xyz = {
+            k: np.array([s["objects"][k] for s in trace_step], dtype=np.float64)
+            for k in obj_keys
+        }
+        frame_ts = np.array([f["t"] for f in trace_frames], dtype=np.int32) \
+            if trace_frames else np.zeros(0, dtype=np.int32)
+        frame_images = (np.stack([f["agentview"] for f in trace_frames])
+                        if trace_frames else np.zeros((0, 0, 0, 3), dtype=np.uint8))
+        np.savez_compressed(
+            trace_path,
+            t=ts, ee_pos=ee_pos, gripper_cmd=gripper, ee_action_delta=ee_delta,
+            frame_t=frame_ts, frame_images=frame_images,
+            mode=mode, task_description=str(task_description),
+            steps_total=t, refinements_run=refinements_run,
+            tracked_body_names=np.array(obj_keys, dtype=object),
+            **{f"obj_{k}_xyz": v for k, v in obj_xyz.items()},
+        )
+
     return {
         "success": bool(done),
         "steps": t,
@@ -642,6 +714,7 @@ def run_episode(
         "wall_seconds": time.time() - episode_start,
         "cost_improvements": cost_improvements,
         "rollout_log_path": str(saved_path) if saved_path is not None else None,
+        "failure_trace_path": str(trace_path) if trace_path is not None else None,
     }
 
 
