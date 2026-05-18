@@ -393,14 +393,70 @@ def main() -> int:
     ap.add_argument("--pert-max", type=float, default=10.0,
                     help="Max perturbation cm to include. Use 5.0 for the "
                          "publishable matrix regime; 10.0 for hard cases.")
-    ap.add_argument("--mode", choices=["failure", "controlled"], default="failure",
+    ap.add_argument("--mode", choices=["failure", "controlled", "replay-sanity"], default="failure",
                     help="failure: try primitives from grip-loss failure states. "
                          "controlled: try primitives from mid-trajectory of a "
                          "SUCCESSFUL trace — tests whether primitives are "
-                         "functional at all, independent of replay drift.")
+                         "functional at all, independent of replay drift. "
+                         "replay-sanity: just replay the FULL recorded action "
+                         "sequence end-to-end and check if done=True. Tests "
+                         "whether replay itself is faithful before anything else.")
     args = ap.parse_args()
 
     traces_dir = pathlib.Path(args.traces_dir)
+
+    if args.mode == "replay-sanity":
+        # Just replay full action sequences and check done.
+        traces = find_successful_traces(
+            traces_dir, args.n_failures,
+            task_filter=args.task_filter, pert_max=args.pert_max,
+        )
+        if not traces:
+            print("No successful traces found.")
+            return 1
+        import re
+        bm = benchmark.get_benchmark_dict()[args.task_suite]()
+        n_replay_succeed = 0
+        for trace_path in traces:
+            m = re.search(r"task(\d+)", trace_path.name)
+            if not m: continue
+            tidx = int(m.group(1))
+            task = bm.get_task(tidx)
+            bddl = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+            env = OffScreenRenderEnv(bddl_file_name=str(bddl), camera_heights=128, camera_widths=128)
+            env.seed(0)
+            try:
+                d = np.load(trace_path, allow_pickle=True)
+                actions = d["action"]
+                env.reset()
+                done = False
+                steps = 0
+                for i in range(actions.shape[0]):
+                    try:
+                        _, _, done, _ = env.step(actions[i].tolist())
+                    except ValueError:
+                        break
+                    steps += 1
+                    if done: break
+                replay_ok = bool(done)
+                if replay_ok: n_replay_succeed += 1
+                print(f"  {trace_path.name[:70]}  replay_done={replay_ok}  steps={steps}/{actions.shape[0]}  "
+                      f"(original trace success={bool(d['success'])})")
+            finally:
+                env.close()
+        print(f"\nReplay sanity: {n_replay_succeed}/{len(traces)} replays reproduced success")
+        if n_replay_succeed == 0:
+            print("→ REPLAY IS BROKEN. Recorded action sequences do not reproduce the original")
+            print("  outcome under env.reset() + env.step. The entire diagnostic is invalid")
+            print("  until we save init_state alongside actions. Fix: extend the physics-trace")
+            print("  logger to capture sim.get_state().flatten() at episode start.")
+        elif n_replay_succeed < len(traces):
+            print("→ PARTIAL REPLAY. Some traces replay faithfully; others don't.")
+            print("  Likely a stochastic-init issue. Init-state save would fix it.")
+        else:
+            print("→ REPLAY IS FAITHFUL. We can trust replay-to-T-60 states.")
+            print("  Original primitive-failure verdicts stand.")
+        return 0
 
     if args.mode == "controlled":
         traces = find_successful_traces(
