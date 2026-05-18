@@ -112,15 +112,33 @@ class PhysVLAFrameDataset(Dataset):
         img_t = _normalize_image(d["image"][img_idx_t], self.image_size)
         img_tp1 = _normalize_image(d["image"][img_idx_tp1], self.image_size)
 
-        # Proprio at t / tp1: concat (qpos, qvel, ee_pos, ee_quat, gripper_qpos).
+        # Proprio at t / tp1: fixed-size, but with robot velocity info preserved.
+        # We can't include full qpos/qvel because their dimensionality varies
+        # by scene (free bodies → variable nq, nv). But the *robot's* qpos/qvel
+        # is always the first 9 entries (7 arm hinges + 2 gripper slides) in
+        # LIBERO's MuJoCo setup. That gives us:
+        #   - robot_qpos (9)  : joint angles
+        #   - robot_qvel (9)  : joint velocities — the bit that's NOT in the image
+        #   - ee_pos    (3)   : world-frame end-effector position (FK convenience)
+        #   - ee_quat   (4)   : world-frame end-effector orientation
+        #   - gripper_qpos (2): redundant with robot_qpos but standard convention
+        # Total 27 dims, consistent across all LIBERO tasks.
+        # Object velocities (needed for full physics) are accessible to the
+        # model via temporal image differencing in a future revision.
+        ROBOT_NQ = 9
+        ROBOT_NV = 9
         proprio_t = np.concatenate([
-            d["qpos"][t], d["qvel"][t],
-            d["ee_pos"][t], d["ee_quat"][t],
+            d["qpos"][t, :ROBOT_NQ],
+            d["qvel"][t, :ROBOT_NV],
+            d["ee_pos"][t],
+            d["ee_quat"][t],
             d["gripper_qpos"][t],
         ]).astype(np.float32)
         proprio_tp1 = np.concatenate([
-            d["qpos"][tp1], d["qvel"][tp1],
-            d["ee_pos"][tp1], d["ee_quat"][tp1],
+            d["qpos"][tp1, :ROBOT_NQ],
+            d["qvel"][tp1, :ROBOT_NV],
+            d["ee_pos"][tp1],
+            d["ee_quat"][tp1],
             d["gripper_qpos"][tp1],
         ]).astype(np.float32)
 
