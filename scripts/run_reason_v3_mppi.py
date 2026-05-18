@@ -746,6 +746,18 @@ def run_episode(
             max_retries=args.validation_max_retries,
         )
     obs = env.set_init_state(init_state_np)
+    # Capture the actual MjSim state right after init. This is the only way
+    # to make perturbed episodes reproducible — perturbation sampling is
+    # deterministic given the rng, but env.set_init_state's effect on the
+    # raw MjData state depends on robosuite internals we don't control. The
+    # validity-check perturb_object_positions also calls sim.forward() and
+    # extra steps during settling; capturing the post-settle state is what
+    # we need for any future state-restoration diagnostic (and the planner's
+    # save/restore loop).
+    try:
+        episode_init_sim_state = env.env.sim.get_state().flatten().copy()
+    except Exception:
+        episode_init_sim_state = None
 
     plan = collections.deque()
     done = False
@@ -1090,6 +1102,16 @@ def run_episode(
             steps_total=t, mode=mode,
             ee_body_id=int(phys_ee_body_id) if phys_ee_body_id is not None else -1,
             image_stride=int(args.physics_trace_image_stride),
+            # Episode initial MjSim state — captured right after set_init_state,
+            # post validity-check settling. Enables deterministic replay via
+            # sim.set_state_from_flattened(init_sim_state). Required for any
+            # state-restoration diagnostic or planner that needs to revisit
+            # the same physical state across runs.
+            init_sim_state=(episode_init_sim_state
+                            if episode_init_sim_state is not None
+                            else np.zeros(0, dtype=np.float64)),
+            init_state_libero=np.asarray(init_state_np, dtype=np.float64),
+            perturbation_cm=float(args.perturbation_cm),
         )
 
     # Failure trace: dump only if episode failed. Successful trajectories are
