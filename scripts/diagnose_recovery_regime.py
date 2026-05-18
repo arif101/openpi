@@ -206,6 +206,38 @@ def primitive_retry_grasp(env, target_xyz, n_steps: int = 100):
     return _execute_actions(env, actions)
 
 
+def primitive_privileged_retry_grasp(env, body_id: int, n_close_steps: int = 10):
+    """Privileged primitive: query current object xyz from sim, approach,
+    grasp. Unlike retry_grasp(fixed_xyz), this uses live sim state — which
+    is what a privileged planner with ground-truth observation would do.
+    Tests whether primitives can recover when given perfect target info.
+    """
+    obs = env.env._get_observations()
+    actions = []
+    # Open + move up
+    for _ in range(10):
+        actions.append(_ee_delta_action(0, 0, 0.02, gripper=1.0))
+    _execute_actions(env, actions); actions = []
+    # Re-read object position AFTER it has settled
+    obj_xyz = env.env.sim.data.body_xpos[body_id].copy()
+    cur_ee = np.asarray(env.env._get_observations()["robot0_eef_pos"], dtype=np.float64)
+    # Approach object xyz, ending ~2cm above (then descend)
+    above = obj_xyz + np.array([0, 0, 0.05])
+    delta = (above - cur_ee) / 40
+    for _ in range(40):
+        actions.append(_ee_delta_action(delta[0], delta[1], delta[2], gripper=1.0))
+    # Descend onto object
+    for _ in range(20):
+        actions.append(_ee_delta_action(0, 0, -0.005, gripper=1.0))
+    # Close gripper
+    for _ in range(n_close_steps):
+        actions.append(_ee_delta_action(0, 0, 0, gripper=-1.0))
+    # Lift
+    for _ in range(30):
+        actions.append(_ee_delta_action(0, 0, 0.03, gripper=-1.0))
+    return _execute_actions(env, actions)
+
+
 def primitive_push_and_regrasp(env, target_xyz, push_direction, n_steps: int = 120):
     """Small nudge in push_direction, then retry_grasp at target_xyz."""
     obs = env.env._get_observations()
@@ -390,12 +422,25 @@ def diagnose_one_injection(env, trace_path: pathlib.Path,
     print(f"  goal_xyz: {None if goal_xyz is None else np.round(goal_xyz, 3)}")
     print(f"{'='*70}")
 
+    # Resolve the body id for the first tracked object — the privileged
+    # primitive uses this to query CURRENT position from sim, not the
+    # pre-drop position.
+    obj_name = str(d["object_names"][0]) if "object_names" in d.files else None
+    obj_body_id = None
+    try:
+        obj_body_id = int(env.env.sim.model.body_name2id(obj_name))
+    except Exception:
+        pass
+
     primitives = [
-        ("retry_grasp@obj",  lambda obj_xyz: primitive_retry_grasp(env, obj_xyz)),
-        ("retry_grasp@goal", lambda obj_xyz: primitive_retry_grasp(env, goal_xyz) if goal_xyz is not None else (None, False)),
-        ("lift_then_move",   lambda obj_xyz: primitive_lift_then_move(env, goal_xyz) if goal_xyz is not None else (None, False)),
-        ("push_and_regrasp", lambda obj_xyz: primitive_push_and_regrasp(env, obj_xyz, [0, 0.1, 0])),
+        ("retry_grasp@obj_static", lambda obj_xyz: primitive_retry_grasp(env, obj_xyz)),
+        ("retry_grasp@goal",       lambda obj_xyz: primitive_retry_grasp(env, goal_xyz) if goal_xyz is not None else (None, False)),
+        ("lift_then_move",         lambda obj_xyz: primitive_lift_then_move(env, goal_xyz) if goal_xyz is not None else (None, False)),
+        ("push_and_regrasp",       lambda obj_xyz: primitive_push_and_regrasp(env, obj_xyz, [0, 0.1, 0])),
     ]
+    if obj_body_id is not None:
+        primitives.append(("PRIVILEGED_retry_grasp",
+                           lambda obj_xyz: primitive_privileged_retry_grasp(env, obj_body_id)))
 
     results = {}
     for name, fn in primitives:
