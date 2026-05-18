@@ -235,37 +235,58 @@ def physvla_loss(
     batch: dict[str, torch.Tensor],
     *,
     w_dyn: float = 1.0,
-    w_wrench: float = 0.5,
+    w_wrench: float = 2.0,
     w_pose: float = 1.0,
-    w_slip: float = 0.5,
+    w_slip: float = 1.0,
+    contact_emphasis: float = 5.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Single-step training loss with physics-supervised aux heads.
+    """Future-step aux supervision: aux heads predict t+1 physics from the
+    DYNAMICS-OUTPUT latent, not current physics from the encoded current state.
+
+    This fixes the tautology problem of v1: in v1 the encoder saw current
+    object_pos in proprio, then the pose head read it back from z_t. The
+    aux loss was trivially zero. In v2:
+
+        z_t      = encode(obs_t)
+        z_tp1    = dynamics(z_t, a_t)
+        wrench_pred = wrench_head(z_tp1)   # predicts t+1 wrench
+        pose_pred   = pose_head(z_tp1)     # predicts t+1 pose
+        slip_pred   = slip_head(z_tp1)     # predicts t+1 slip
+
+    Now the dynamics module MUST produce a latent that encodes future physics
+    to satisfy the loss. The encoder + dynamics together are forced to
+    represent the physical state in a way that the heads can decode.
+
+    Also: contact_emphasis weights the wrench loss by 1+α·||wrench_target||,
+    so contact moments (where wrench is large) contribute more than the
+    common no-contact baseline (where wrench≈0).
 
     batch contains:
-      image_t:    [B, 3, H, W] in [0, 1]
+      image_t:    [B, 3, H, W]
       proprio_t:  [B, P]
       action_t:   [B, A]
       image_tp1:  [B, 3, H, W]
       proprio_tp1:[B, P]
-      wrench_t:   [B, 6]
-      pose_t:     [B, n_objects, 7]   (xyz+quat, zero-padded for absent objects)
-      slip_t:     [B, 3]
-
-    Returns:
-      total_loss (scalar), breakdown_dict for logging
+      wrench_tp1: [B, 6]              <-- TARGETS AT t+1 NOW
+      pose_tp1:   [B, n_objects, 7]
+      slip_tp1:   [B, 3]
     """
     z_t = model.encode(batch["image_t"], batch["proprio_t"])
-    z_pred = model.step(z_t, batch["action_t"])
+    z_tp1_pred = model.step(z_t, batch["action_t"])
     z_tp1_target = model.encode(batch["image_tp1"], batch["proprio_tp1"])
-    # We want z_pred to match the target encoding under fresh forward, but
-    # we don't want gradients through z_tp1_target to leak (we want the
-    # encoder to be stable, not to chase the dynamics output). Detach.
-    L_dyn = nn.functional.mse_loss(z_pred, z_tp1_target.detach())
+    L_dyn = nn.functional.mse_loss(z_tp1_pred, z_tp1_target.detach())
 
-    preds = model.aux_predictions(z_t)
-    L_wrench = nn.functional.mse_loss(preds["wrench"], batch["wrench_t"])
-    pose_target_flat = batch["pose_t"].reshape(batch["pose_t"].shape[0], -1)
-    # Pad / truncate pose_target_flat to match n_objects*7
+    # Aux heads consume the DYNAMICS-OUTPUT latent.
+    preds = model.aux_predictions(z_tp1_pred)
+
+    # Wrench at t+1, with contact-emphasis weighting.
+    wrench_target = batch["wrench_tp1"]
+    wrench_mag = torch.linalg.norm(wrench_target, dim=-1, keepdim=True)
+    sample_weights = 1.0 + contact_emphasis * wrench_mag
+    L_wrench = (((preds["wrench"] - wrench_target) ** 2) * sample_weights).mean()
+
+    # Pose at t+1.
+    pose_target_flat = batch["pose_tp1"].reshape(batch["pose_tp1"].shape[0], -1)
     expected = model.cfg.n_objects * 7
     if pose_target_flat.shape[-1] < expected:
         pad = torch.zeros(
@@ -276,7 +297,9 @@ def physvla_loss(
     else:
         pose_target_flat = pose_target_flat[:, :expected]
     L_pose = nn.functional.mse_loss(preds["pose"], pose_target_flat)
-    L_slip = nn.functional.mse_loss(preds["slip"], batch["slip_t"])
+
+    # Slip at t+1.
+    L_slip = nn.functional.mse_loss(preds["slip"], batch["slip_tp1"])
 
     total = w_dyn * L_dyn + w_wrench * L_wrench + w_pose * L_pose + w_slip * L_slip
     return total, {

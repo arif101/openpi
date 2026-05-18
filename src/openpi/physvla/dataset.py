@@ -175,24 +175,30 @@ class PhysVLAFrameDataset(Dataset):
         ]).astype(np.float32)
 
         action = d["action"][t].astype(np.float32)
-        wrench = d["ee_wrench"][t].astype(np.float32)
 
-        # Pad/truncate per-object pose to n_objects × 7
-        obj_pos = d["object_pos"][t]    # [n_obj_in_file, 3]
-        obj_quat = d["object_quat"][t]
-        n_in_file = obj_pos.shape[0]
-        pose = np.zeros((self.n_objects, 7), dtype=np.float32)
+        # Aux targets at t+1 (not t). The dynamics output latent has to encode
+        # future physics to satisfy these losses — pose at t is in the proprio
+        # input so predicting it would be tautological.
+        wrench_tp1 = d["ee_wrench"][tp1].astype(np.float32)
+
+        # Pad per-object pose at t+1 to n_objects × 7
+        obj_pos_tp1_arr = d["object_pos"][tp1]
+        obj_quat_tp1_arr = d["object_quat"][tp1]
+        n_in_file = obj_pos_tp1_arr.shape[0]
+        pose_tp1 = np.zeros((self.n_objects, 7), dtype=np.float32)
         n = min(n_in_file, self.n_objects)
-        pose[:n, :3] = obj_pos[:n]
-        pose[:n, 3:] = obj_quat[:n]
+        pose_tp1[:n, :3] = obj_pos_tp1_arr[:n]
+        pose_tp1[:n, 3:] = obj_quat_tp1_arr[:n]
 
-        # Slip velocity: object linear velocity in EE frame.
-        # Approximation: (object_pos[t+1] - object_pos[t]) / dt for the first
-        # tracked object, then transformed to be relative to EE motion.
-        # For PhysVLA v1 we just use world-frame relative velocity of obj_0.
-        obj_v = (d["object_pos"][tp1, 0] - d["object_pos"][t, 0])
-        ee_v = (d["ee_pos"][tp1] - d["ee_pos"][t])
-        slip = (obj_v - ee_v).astype(np.float32)
+        # Slip velocity at t+1: object velocity relative to EE motion. Uses
+        # central difference around t+1 if available, else forward-diff t→t+1.
+        if tp1 + 1 < int(d["t"].shape[0]):
+            obj_v_tp1 = (d["object_pos"][tp1 + 1, 0] - d["object_pos"][tp1, 0])
+            ee_v_tp1 = (d["ee_pos"][tp1 + 1] - d["ee_pos"][tp1])
+        else:
+            obj_v_tp1 = (d["object_pos"][tp1, 0] - d["object_pos"][t, 0])
+            ee_v_tp1 = (d["ee_pos"][tp1] - d["ee_pos"][t])
+        slip_tp1 = (obj_v_tp1 - ee_v_tp1).astype(np.float32)
 
         return {
             "image_t":    torch.from_numpy(img_t),
@@ -200,7 +206,7 @@ class PhysVLAFrameDataset(Dataset):
             "proprio_t":  torch.from_numpy(proprio_t),
             "proprio_tp1":torch.from_numpy(proprio_tp1),
             "action_t":   torch.from_numpy(action),
-            "wrench_t":   torch.from_numpy(wrench),
-            "pose_t":     torch.from_numpy(pose),
-            "slip_t":     torch.from_numpy(slip),
+            "wrench_tp1": torch.from_numpy(wrench_tp1),
+            "pose_tp1":   torch.from_numpy(pose_tp1),
+            "slip_tp1":   torch.from_numpy(slip_tp1),
         }
