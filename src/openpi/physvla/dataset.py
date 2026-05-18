@@ -112,34 +112,66 @@ class PhysVLAFrameDataset(Dataset):
         img_t = _normalize_image(d["image"][img_idx_t], self.image_size)
         img_tp1 = _normalize_image(d["image"][img_idx_tp1], self.image_size)
 
-        # Proprio at t / tp1: fixed-size, but with robot velocity info preserved.
-        # We can't include full qpos/qvel because their dimensionality varies
-        # by scene (free bodies → variable nq, nv). But the *robot's* qpos/qvel
-        # is always the first 9 entries (7 arm hinges + 2 gripper slides) in
-        # LIBERO's MuJoCo setup. That gives us:
-        #   - robot_qpos (9)  : joint angles
-        #   - robot_qvel (9)  : joint velocities — the bit that's NOT in the image
-        #   - ee_pos    (3)   : world-frame end-effector position (FK convenience)
-        #   - ee_quat   (4)   : world-frame end-effector orientation
-        #   - gripper_qpos (2): redundant with robot_qpos but standard convention
-        # Total 27 dims, consistent across all LIBERO tasks.
-        # Object velocities (needed for full physics) are accessible to the
-        # model via temporal image differencing in a future revision.
+        # Proprio at t / tp1: full physical state, padded to fixed dims so the
+        # DataLoader can batch across scenes with different object counts.
+        #
+        # Includes:
+        #   robot_qpos (9)             : joint angles (Franka 7 + gripper 2)
+        #   robot_qvel (9)             : joint velocities
+        #   ee_pos (3) / ee_quat (4)   : FK convenience
+        #   gripper_qpos (2)           : redundant with robot_qpos but standard
+        #   object_pos (n_obj×3)       : per-object world position, padded to n_obj
+        #   object_quat (n_obj×4)      : per-object orientation
+        #   object_lin_vel (n_obj×3)   : derived from finite-difference of object_pos
+        #
+        # Object linear velocity is critical: from a single image the model
+        # cannot infer how fast objects are moving, and dynamics prediction
+        # without velocity is degenerate. We compute it via finite difference
+        # on the trace (always available since we have t and t+1 in the same
+        # episode for the dynamics pairs).
         ROBOT_NQ = 9
         ROBOT_NV = 9
+        n_obj = self.n_objects  # fixed cap (default 12) across all tasks
+
+        def _pad_obj_2d(arr2d, target_n, axis_dim):
+            out = np.zeros((target_n, axis_dim), dtype=np.float32)
+            n_in = min(arr2d.shape[0], target_n)
+            out[:n_in] = arr2d[:n_in]
+            return out
+
+        obj_pos_t  = _pad_obj_2d(d["object_pos"][t],  n_obj, 3)
+        obj_quat_t = _pad_obj_2d(d["object_quat"][t], n_obj, 4)
+        obj_pos_tp1  = _pad_obj_2d(d["object_pos"][tp1],  n_obj, 3)
+        obj_quat_tp1 = _pad_obj_2d(d["object_quat"][tp1], n_obj, 4)
+        # Linear velocity via simple finite difference (per timestep, not per
+        # second — the model just needs a velocity signal, not SI units).
+        obj_lin_vel_t   = obj_pos_tp1 - obj_pos_t
+        # For t+1's velocity we'd need t+2; fall back to t→t+1 estimate (same).
+        # The dynamics loss only consumes proprio_t (current state) and an
+        # encoder of proprio_tp1 for the self-consistency target; the latter
+        # doesn't need velocity to be exactly right since the encoder learns
+        # whatever helps prediction.
+        obj_lin_vel_tp1 = obj_lin_vel_t
+
         proprio_t = np.concatenate([
-            d["qpos"][t, :ROBOT_NQ],
-            d["qvel"][t, :ROBOT_NV],
-            d["ee_pos"][t],
-            d["ee_quat"][t],
-            d["gripper_qpos"][t],
+            d["qpos"][t, :ROBOT_NQ].astype(np.float32),
+            d["qvel"][t, :ROBOT_NV].astype(np.float32),
+            d["ee_pos"][t].astype(np.float32),
+            d["ee_quat"][t].astype(np.float32),
+            d["gripper_qpos"][t].astype(np.float32),
+            obj_pos_t.flatten(),
+            obj_quat_t.flatten(),
+            obj_lin_vel_t.flatten(),
         ]).astype(np.float32)
         proprio_tp1 = np.concatenate([
-            d["qpos"][tp1, :ROBOT_NQ],
-            d["qvel"][tp1, :ROBOT_NV],
-            d["ee_pos"][tp1],
-            d["ee_quat"][tp1],
-            d["gripper_qpos"][tp1],
+            d["qpos"][tp1, :ROBOT_NQ].astype(np.float32),
+            d["qvel"][tp1, :ROBOT_NV].astype(np.float32),
+            d["ee_pos"][tp1].astype(np.float32),
+            d["ee_quat"][tp1].astype(np.float32),
+            d["gripper_qpos"][tp1].astype(np.float32),
+            obj_pos_tp1.flatten(),
+            obj_quat_tp1.flatten(),
+            obj_lin_vel_tp1.flatten(),
         ]).astype(np.float32)
 
         action = d["action"][t].astype(np.float32)
