@@ -61,6 +61,31 @@ from libero.libero.envs import OffScreenRenderEnv
 LIBERO_DUMMY = [0.0] * 6 + [-1.0]
 
 
+def find_successful_traces(traces_dir: pathlib.Path, n: int,
+                            task_filter: str | None = None,
+                            pert_max: float = 10.0) -> list[pathlib.Path]:
+    """Find PHYS_OK_*.npz traces where the task succeeded. Used by the
+    controlled diagnostic: replay to T-60 of a SUCCESSFUL trace and see if
+    primitives can complete the rest of the task from there.
+
+    If primitives can complete a known-recoverable mid-trajectory state,
+    they're functional. If they can't, they're inadequate regardless of
+    replay drift.
+    """
+    import re
+    candidates = []
+    for p in sorted(traces_dir.glob("PHYS_OK_*.npz")):
+        if task_filter and task_filter not in p.name:
+            continue
+        m = re.search(r"pert([\d.]+)cm", p.name)
+        if m and float(m.group(1)) > pert_max:
+            continue
+        candidates.append(p)
+        if len(candidates) >= n:
+            break
+    return candidates
+
+
 def find_grip_loss_failures(traces_dir: pathlib.Path, n: int,
                               task_filter: str | None = None,
                               pert_max: float = 10.0) -> list[pathlib.Path]:
@@ -289,6 +314,74 @@ def diagnose_one(env, trace_path: pathlib.Path, obj_idx: int) -> dict:
             "results": results, "any_success": any_success}
 
 
+def diagnose_one_controlled(env, trace_path: pathlib.Path) -> dict:
+    """Controlled: replay a SUCCESSFUL trace to T-60, then run primitives
+    instead of the recorded actions. If the primitive can complete the
+    task from a known-recoverable state, the primitive is functional.
+
+    This rules out the 'replay drift' confound in the failure-diagnostic:
+    if primitives work here, then the 0/5 on real failures is real
+    repertoire inadequacy AND replay drift; if they don't work here, the
+    primitives are simply inadequate.
+    """
+    d = np.load(trace_path, allow_pickle=True)
+    task_desc = str(d["task_description"])
+    # The original policy succeeded on this trace, so the state at T-60 is
+    # known to be on a successful path. From there, can a primitive finish?
+    obj_pos_at_freeze = d["object_pos"][-60, 0] if d["object_pos"].shape[0] > 60 \
+        else d["object_pos"][0, 0]
+
+    # Pull goal from yaml
+    import yaml
+    goal_yaml = pathlib.Path("/openpi/scripts/reason_v3_targets.yaml")
+    goal_xyz = None
+    if goal_yaml.exists():
+        cfg = yaml.safe_load(goal_yaml.read_text())
+        import re
+        m = re.search(r"task(\d+)", trace_path.name)
+        if m:
+            tidx = int(m.group(1))
+            entry = (cfg.get("libero_10", {}).get(tidx)
+                     or cfg.get("libero_10", {}).get(str(tidx)))
+            if entry:
+                goal_xyz = np.array(entry["goal_xyz"], dtype=np.float64)
+    if goal_xyz is None:
+        goal_xyz = obj_pos_at_freeze + np.array([0, 0.3, 0])
+
+    print(f"\n{'='*70}")
+    print(f"CONTROLLED — successful trace, replay to T-60, run primitives")
+    print(f"trace: {trace_path.name}")
+    print(f"  task: {task_desc}")
+    print(f"  object xyz at freeze: {np.round(obj_pos_at_freeze, 3)}")
+    print(f"  goal_xyz: {np.round(goal_xyz, 3)}")
+    print(f"{'='*70}")
+
+    primitives = [
+        ("retry_grasp@obj",  lambda: primitive_retry_grasp(env, obj_pos_at_freeze)),
+        ("retry_grasp@goal", lambda: primitive_retry_grasp(env, goal_xyz)),
+        ("lift_then_move",   lambda: primitive_lift_then_move(env, goal_xyz)),
+        ("noop_continue",    lambda: _execute_actions(env, [LIBERO_DUMMY] * 200)),
+    ]
+
+    results = {}
+    for name, fn in primitives:
+        print(f"\n  Trying {name}...", flush=True)
+        replay_to_failure_point(env, trace_path, restore_steps_before_end=60)
+        try:
+            _, done = fn()
+        except Exception as e:
+            print(f"    error: {type(e).__name__}: {e}")
+            results[name] = False
+            continue
+        print(f"    after primitive: success={done}")
+        results[name] = bool(done)
+
+    any_success = any(results.values())
+    print(f"\n  → completed by primitives: {any_success}   ({sum(results.values())}/{len(results)})")
+    return {"trace": trace_path.name, "task": task_desc,
+            "results": results, "any_success": any_success}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--traces-dir", required=True)
@@ -300,20 +393,39 @@ def main() -> int:
     ap.add_argument("--pert-max", type=float, default=10.0,
                     help="Max perturbation cm to include. Use 5.0 for the "
                          "publishable matrix regime; 10.0 for hard cases.")
+    ap.add_argument("--mode", choices=["failure", "controlled"], default="failure",
+                    help="failure: try primitives from grip-loss failure states. "
+                         "controlled: try primitives from mid-trajectory of a "
+                         "SUCCESSFUL trace — tests whether primitives are "
+                         "functional at all, independent of replay drift.")
     args = ap.parse_args()
 
     traces_dir = pathlib.Path(args.traces_dir)
-    failures = find_grip_loss_failures(
-        traces_dir, args.n_failures,
-        task_filter=args.task_filter, pert_max=args.pert_max,
-    )
-    print(f"Found {len(failures)} grip-loss failures to diagnose.\n")
-    for p, obj_idx, dist in failures:
-        print(f"  {p.name}  obj_idx={obj_idx}  closest_approach={dist*100:.1f}cm")
 
-    if not failures:
-        print("\nNo grip-loss failures found. Exiting.")
-        return 1
+    if args.mode == "controlled":
+        traces = find_successful_traces(
+            traces_dir, args.n_failures,
+            task_filter=args.task_filter, pert_max=args.pert_max,
+        )
+        if not traces:
+            print("No successful traces found.")
+            return 1
+        print(f"Found {len(traces)} successful traces for controlled diagnostic.")
+        for p in traces:
+            print(f"  {p.name}")
+        # Convert to (path, obj_idx, dist) shape so the env-build loop below works
+        failures = [(p, 0, 0.0) for p in traces]
+    else:
+        failures = find_grip_loss_failures(
+            traces_dir, args.n_failures,
+            task_filter=args.task_filter, pert_max=args.pert_max,
+        )
+        print(f"Found {len(failures)} grip-loss failures to diagnose.\n")
+        for p, obj_idx, dist in failures:
+            print(f"  {p.name}  obj_idx={obj_idx}  closest_approach={dist*100:.1f}cm")
+        if not failures:
+            print("\nNo grip-loss failures found. Exiting.")
+            return 1
 
     # Build an env once per task (env init is the slow part). Group failures
     # by task_idx, run them sequentially per task.
@@ -330,7 +442,10 @@ def main() -> int:
         env = OffScreenRenderEnv(bddl_file_name=str(bddl), camera_heights=128, camera_widths=128)
         env.seed(0)
         try:
-            r = diagnose_one(env, trace_path, obj_idx)
+            if args.mode == "controlled":
+                r = diagnose_one_controlled(env, trace_path)
+            else:
+                r = diagnose_one(env, trace_path, obj_idx)
             results.append(r)
         finally:
             env.close()
@@ -347,6 +462,31 @@ def main() -> int:
         prims = ",".join(k for k, v in r["results"].items() if v) or "none"
         print(f"  [{flag}] {r['trace'][:50]}  succeeded: {prims}")
     print()
+    if args.mode == "controlled":
+        # Different verdict logic for controlled mode.
+        if n_recovered >= max(2, len(results) - 1):
+            print("CONTROLLED VERDICT: PRIMITIVES FUNCTIONAL")
+            print("  Primitives can complete the task from mid-trajectory of a")
+            print("  successful trace. → The 0/5 result on real failures is")
+            print("  likely due to replay-state-drift (we never reached the")
+            print("  actual failure state). Need to add init_state save to the")
+            print("  physics-trace logger and re-run failure diagnostic.")
+        elif n_recovered == 0:
+            print("CONTROLLED VERDICT: PRIMITIVES INADEQUATE")
+            print("  Primitives can't complete the task even from a known-good")
+            print("  mid-trajectory state. → The primitives themselves are too")
+            print("  weak to be a recovery basis. Original REPERTOIRE-LIMITED")
+            print("  verdict on failures is consistent with this. Two options:")
+            print("  (a) expand the primitive library aggressively, (b) accept")
+            print("  that scripted primitives aren't the right proposal mechanism")
+            print("  and pivot to a learned proposal bootstrapped from successful")
+            print("  trajectories.")
+        else:
+            print("CONTROLLED VERDICT: PARTIAL")
+            print("  Some primitives work, others don't. Worth diagnosing why")
+            print("  before committing to a planner architecture.")
+        return 0
+
     if n_recovered >= 3:
         print("VERDICT: PERCEPTION-LIMITED regime")
         print("  Primitives can recover most failures. Privileged-state planning")
