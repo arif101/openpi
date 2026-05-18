@@ -247,16 +247,22 @@ def parse_args():
     p.add_argument("--no-validate-perturbations", dest="validate_perturbations",
                    action="store_false",
                    help="Disable perturbation validity check (old behaviour).")
-    p.add_argument("--validation-settle-steps", type=int, default=15,
-                   help="Number of zero-action settling steps before checking "
-                        "validity. Should be long enough for contact resolver "
-                        "to either find rest or visibly launch the object.")
-    p.add_argument("--validation-max-launch", type=float, default=0.05,
-                   help="Per-step max position change (m) any movable object "
-                        "is allowed during the settling window. Larger means "
-                        "the resolver had to apply violent forces, indicating "
-                        "an invalid initial state. 5cm is generous; smaller "
-                        "= stricter.")
+    p.add_argument("--validation-settle-steps", type=int, default=20,
+                   help="Zero-action settling steps before the end-state "
+                        "check. 20 is enough for any non-pathological initial "
+                        "condition to come to rest in LIBERO.")
+    p.add_argument("--validation-max-final-speed", type=float, default=0.02,
+                   help="After settling, all movable bodies must have linear "
+                        "speed below this (m/s). Means the object came to rest "
+                        "instead of continuing to bounce / fall. Default 2cm/s.")
+    p.add_argument("--validation-min-table-z", type=float, default=0.40,
+                   help="No movable body's final z may be below this. Catches "
+                        "objects that fell through the floor.")
+    p.add_argument("--validation-max-drift", type=float, default=0.10,
+                   help="After settling, body position must be within this "
+                        "distance (m) of where we wrote it in the perturbed "
+                        "qpos. Larger drift = resolver had to shove the body, "
+                        "implying invalid initial penetration.")
     p.add_argument("--validation-max-retries", type=int, default=15,
                    help="Max perturbation resamples before giving up and "
                         "using the unperturbed init state for this trial.")
@@ -307,34 +313,62 @@ def _candidate_perturbed_state(init_state, free_joint_addrs, perturbation_m, rng
     return state
 
 
-def _state_is_settled(env, free_body_ids, settle_steps: int, max_launch_per_step: float) -> tuple[bool, str]:
-    """After perturbation has been applied, settle the env and check validity.
+def _state_is_settled(env, free_body_ids, settle_steps: int,
+                       max_final_speed: float, min_table_z: float,
+                       max_drift_from_intended: float,
+                       intended_positions: dict | None = None) -> tuple[bool, str]:
+    """After perturbation, settle and check that the FINAL state is valid.
 
-    Returns (is_valid, reason). is_valid=True only if no movable body's
-    per-step position change exceeds max_launch_per_step at any point during
-    the settling window. That single threshold catches both 'object launched
-    by resolver' (huge step) and 'object falls from mid-air' (mostly clipped
-    by max-launch-per-step too — gravity gives ~5mm/step at LIBERO's dt).
+    We can't use per-step motion as the gate (the resolver's first-step
+    correction is ~7cm even on unperturbed states). Instead check the
+    end-state:
+      1. Final velocity of every movable body is below `max_final_speed`
+         (the object has settled, isn't bouncing around)
+      2. No movable body's final z is below `min_table_z` (didn't fall
+         through the floor)
+      3. If we know what position we INTENDED for each body (the perturbed
+         qpos write), the settled position is within `max_drift_from_intended`
+         of that intent (resolver didn't have to shove it far)
     """
     sim = env.env.sim
     if not free_body_ids:
         return True, "no movable bodies to check"
-    prev = {bid: sim.data.body_xpos[bid].copy() for bid in free_body_ids}
     for _ in range(settle_steps):
         env.step(LIBERO_DUMMY_ACTION)
-        for bid in free_body_ids:
-            cur = sim.data.body_xpos[bid]
-            step = float(np.linalg.norm(cur - prev[bid]))
-            if step > max_launch_per_step:
-                return False, f"body {bid} moved {step*100:.1f}cm in one step (>{max_launch_per_step*100:.0f}cm)"
-            prev[bid] = cur.copy()
+
+    # End-state velocity: free joint qvel for each body's free joint
+    # gives 6-DoF (linear 3 + angular 3) twist. Use linear component magnitude.
+    mdl = sim.model
+    d = sim.data
+    for bid in free_body_ids:
+        # Find the qvel slice for this body's free joint.
+        for j in range(mdl.njnt):
+            if mdl.jnt_type[j] == 0 and int(mdl.jnt_bodyid[j]) == bid:
+                qvel_addr = int(mdl.jnt_dofadr[j])  # free joint is 6 DOFs
+                v_lin = d.qvel[qvel_addr:qvel_addr+3]
+                speed = float(np.linalg.norm(v_lin))
+                if speed > max_final_speed:
+                    return False, f"body {bid} settled at speed {speed*100:.1f}cm/s (>{max_final_speed*100:.0f}cm/s)"
+                break
+
+        z = float(d.body_xpos[bid][2])
+        if z < min_table_z:
+            return False, f"body {bid} below table (z={z:.3f} < {min_table_z:.3f})"
+
+        if intended_positions is not None and bid in intended_positions:
+            drift = float(np.linalg.norm(d.body_xpos[bid] - intended_positions[bid]))
+            if drift > max_drift_from_intended:
+                return False, f"body {bid} drifted {drift*100:.1f}cm from intended ({max_drift_from_intended*100:.0f}cm cap)"
+
     return True, "ok"
 
 
 def perturb_object_positions(env, init_state, perturbation_m, rng,
                               validate: bool = True,
-                              settle_steps: int = 15,
-                              max_launch_per_step: float = 0.05,
+                              settle_steps: int = 20,
+                              max_final_speed: float = 0.02,
+                              min_table_z: float = 0.40,
+                              max_drift_from_intended: float = 0.10,
                               max_retries: int = 15):
     """Sample a perturbed init state that survives a settling check.
 
@@ -360,21 +394,36 @@ def perturb_object_positions(env, init_state, perturbation_m, rng,
         return state
 
     last_state = None
+    last_reason = ""
     for attempt in range(max_retries):
         candidate = _candidate_perturbed_state(init_state, free_joint_addrs, perturbation_m, rng)
-        # Apply it. set_init_state replaces qpos+qvel; we then settle.
+        # Read the candidate's intended xyz for each free body so the validity
+        # check can verify the resolver didn't move it far during settling.
+        intended = {}
+        for j in range(model.njnt):
+            if model.jnt_type[j] == 0:
+                addr = int(model.jnt_qposadr[j])
+                bid = int(model.jnt_bodyid[j])
+                intended[bid] = np.array(candidate[addr:addr+3], dtype=np.float64)
         env.set_init_state(candidate)
-        ok, reason = _state_is_settled(env, free_body_ids, settle_steps, max_launch_per_step)
+        ok, reason = _state_is_settled(
+            env, free_body_ids, settle_steps,
+            max_final_speed=max_final_speed,
+            min_table_z=min_table_z,
+            max_drift_from_intended=max_drift_from_intended,
+            intended_positions=intended,
+        )
         if ok:
             # Restore the env to the candidate so the caller can use it as the
             # "starting state" — we re-apply set_init_state to undo settling.
             env.set_init_state(candidate)
             return candidate
         last_state = candidate
+        last_reason = reason
         # else: loop; the env will be re-set with a fresh candidate next attempt.
 
     print(f"  [perturb] no valid sample after {max_retries} retries "
-          f"(perturbation σ={perturbation_m*100:.1f}cm). "
+          f"(perturbation σ={perturbation_m*100:.1f}cm; last reason: {last_reason}). "
           f"Using last sample anyway.", flush=True)
     # Re-apply the last attempt's state so the caller's env is in a consistent
     # state. We accept whatever it is — bias toward returning *some* perturbation
@@ -686,7 +735,9 @@ def run_episode(
             env, init_state_np, perturbation_m, perturb_rng,
             validate=args.validate_perturbations,
             settle_steps=args.validation_settle_steps,
-            max_launch_per_step=args.validation_max_launch,
+            max_final_speed=args.validation_max_final_speed,
+            min_table_z=args.validation_min_table_z,
+            max_drift_from_intended=args.validation_max_drift,
             max_retries=args.validation_max_retries,
         )
     obs = env.set_init_state(init_state_np)
