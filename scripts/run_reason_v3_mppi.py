@@ -258,13 +258,14 @@ def parse_args():
     p.add_argument("--validation-min-table-z", type=float, default=0.40,
                    help="No movable body's final z may be below this. Catches "
                         "objects that fell through the floor.")
-    p.add_argument("--validation-max-drift", type=float, default=0.15,
-                   help="After settling, body position must be within this "
-                        "distance (m) of where we wrote it in the perturbed "
-                        "qpos. Larger drift = resolver had to shove the body, "
-                        "implying invalid initial penetration. 15cm accommodates "
-                        "natural multi-object settling jostle (ketchup/oj/milk "
-                        "in the canonical LIBERO init shifts ~8cm via resolver).")
+    p.add_argument("--validation-max-drift", type=float, default=10.0,
+                   help="DISABLED by default (very large value). After settling, "
+                        "body position can be far from where we wrote it as long "
+                        "as it's stable (speed) and above the table (z). The "
+                        "resolver moving an object to a different stable resting "
+                        "spot is fine — the policy / dynamics model see the "
+                        "actual sim state. Set this low (e.g. 0.15) to enforce "
+                        "intent-matching.")
     p.add_argument("--validation-max-retries", type=int, default=40,
                    help="Max perturbation resamples before giving up and "
                         "using the last sample anyway. Multi-object scenes "
@@ -372,7 +373,7 @@ def perturb_object_positions(env, init_state, perturbation_m, rng,
                               settle_steps: int = 20,
                               max_final_speed: float = 0.02,
                               min_table_z: float = 0.40,
-                              max_drift_from_intended: float = 0.15,
+                              max_drift_from_intended: float = 10.0,
                               max_retries: int = 40):
     """Sample a perturbed init state that survives a settling check.
 
