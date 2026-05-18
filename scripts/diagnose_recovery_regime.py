@@ -314,6 +314,120 @@ def diagnose_one(env, trace_path: pathlib.Path, obj_idx: int) -> dict:
             "results": results, "any_success": any_success}
 
 
+def _restore_to_step(env, trace_npz, target_step_relative_to_end: int = 60):
+    """Restore env via init_sim_state, do 10 wait steps, replay recorded
+    actions up to target_step from end. Requires the trace to have
+    init_sim_state (recent traces only).
+
+    Returns (success, steps_replayed). success=False if init_sim_state
+    not present.
+    """
+    d = np.load(trace_npz, allow_pickle=True)
+    if "init_sim_state" not in d.files or d["init_sim_state"].size == 0:
+        return False, 0
+    env.reset()
+    env.env.sim.set_state_from_flattened(d["init_sim_state"])
+    env.env.sim.forward()
+    for _ in range(10):
+        env.step(LIBERO_DUMMY)
+    actions = d["action"]
+    target_step = max(0, actions.shape[0] - target_step_relative_to_end)
+    for i in range(target_step):
+        try:
+            env.step(actions[i].tolist())
+        except Exception:
+            return False, i
+    return True, target_step
+
+
+def _inject_grip_loss(env, n_steps: int = 8):
+    """Force the gripper open for `n_steps` to simulate grip loss.
+
+    This drops any held object. Returns (final_obs, action_count_consumed).
+    """
+    for _ in range(n_steps):
+        env.step(_ee_delta_action(0, 0, 0, gripper=1.0))   # gripper=+1 → open
+    return n_steps
+
+
+def diagnose_one_injection(env, trace_path: pathlib.Path,
+                            restore_steps_before_end: int = 80,
+                            inject_steps: int = 8) -> dict:
+    """Failure-injection diagnostic: restore a successful trace mid-trajectory
+    using init_sim_state, INJECT a grip loss (force gripper open ~8 steps),
+    then try each recovery primitive. The injection creates an artificial
+    failure at a state we definitely reached, decoupling 'are primitives
+    adequate' from 'can we even reach the right state'.
+
+    Requires the trace to have init_sim_state (use traces collected after
+    the init-state-save commit).
+    """
+    d = np.load(trace_path, allow_pickle=True)
+    if "init_sim_state" not in d.files or d["init_sim_state"].size == 0:
+        return {"trace": trace_path.name, "skipped": "no init_sim_state",
+                "results": {}, "any_success": False}
+    task_desc = str(d["task_description"])
+
+    # Read goal_xyz from yaml
+    import yaml
+    goal_yaml = pathlib.Path("/openpi/scripts/reason_v3_targets.yaml")
+    goal_xyz = None
+    if goal_yaml.exists():
+        cfg = yaml.safe_load(goal_yaml.read_text())
+        import re
+        m = re.search(r"task(\d+)", trace_path.name)
+        if m:
+            tidx = int(m.group(1))
+            entry = (cfg.get("libero_10", {}).get(tidx)
+                     or cfg.get("libero_10", {}).get(str(tidx)))
+            if entry:
+                goal_xyz = np.array(entry["goal_xyz"], dtype=np.float64)
+
+    print(f"\n{'='*70}")
+    print(f"INJECTION — restore mid-trajectory, force grip loss, try recovery")
+    print(f"trace: {trace_path.name}")
+    print(f"  task: {task_desc}")
+    print(f"  goal_xyz: {None if goal_xyz is None else np.round(goal_xyz, 3)}")
+    print(f"{'='*70}")
+
+    primitives = [
+        ("retry_grasp@obj",  lambda obj_xyz: primitive_retry_grasp(env, obj_xyz)),
+        ("retry_grasp@goal", lambda obj_xyz: primitive_retry_grasp(env, goal_xyz) if goal_xyz is not None else (None, False)),
+        ("lift_then_move",   lambda obj_xyz: primitive_lift_then_move(env, goal_xyz) if goal_xyz is not None else (None, False)),
+        ("push_and_regrasp", lambda obj_xyz: primitive_push_and_regrasp(env, obj_xyz, [0, 0.1, 0])),
+    ]
+
+    results = {}
+    for name, fn in primitives:
+        print(f"\n  Trying {name}...", flush=True)
+        # Restore to N steps before end
+        ok, steps_replayed = _restore_to_step(env, trace_path, restore_steps_before_end)
+        if not ok:
+            print(f"    restore failed; skipping")
+            results[name] = False
+            continue
+        # Read object position AFTER restore (we're at the right state now)
+        obs = env.env._get_observations()
+        # Identify the tracked object from physics trace (object_pos[0,0] = first body's xyz)
+        obj_xyz_at_inject = np.asarray(d["object_pos"][steps_replayed, 0], dtype=np.float64)
+        # Inject grip loss
+        _inject_grip_loss(env, inject_steps)
+        # Now try the primitive (object should be on the table near where we lost it)
+        try:
+            _, done = fn(obj_xyz_at_inject)
+        except Exception as e:
+            print(f"    error: {type(e).__name__}: {e}")
+            results[name] = False
+            continue
+        print(f"    after grip-loss + primitive: success={done}")
+        results[name] = bool(done)
+
+    any_success = any(results.values())
+    print(f"\n  → recovery succeeded: {any_success}   ({sum(results.values())}/{len(results)})")
+    return {"trace": trace_path.name, "task": task_desc,
+            "results": results, "any_success": any_success}
+
+
 def diagnose_one_controlled(env, trace_path: pathlib.Path) -> dict:
     """Controlled: replay a SUCCESSFUL trace to T-60, then run primitives
     instead of the recorded actions. If the primitive can complete the
@@ -393,7 +507,7 @@ def main() -> int:
     ap.add_argument("--pert-max", type=float, default=10.0,
                     help="Max perturbation cm to include. Use 5.0 for the "
                          "publishable matrix regime; 10.0 for hard cases.")
-    ap.add_argument("--mode", choices=["failure", "controlled", "replay-sanity"], default="failure",
+    ap.add_argument("--mode", choices=["failure", "controlled", "replay-sanity", "injection"], default="failure",
                     help="failure: try primitives from grip-loss failure states. "
                          "controlled: try primitives from mid-trajectory of a "
                          "SUCCESSFUL trace — tests whether primitives are "
@@ -458,7 +572,7 @@ def main() -> int:
             print("  Original primitive-failure verdicts stand.")
         return 0
 
-    if args.mode == "controlled":
+    if args.mode in ("controlled", "injection"):
         traces = find_successful_traces(
             traces_dir, args.n_failures,
             task_filter=args.task_filter, pert_max=args.pert_max,
@@ -466,7 +580,12 @@ def main() -> int:
         if not traces:
             print("No successful traces found.")
             return 1
-        print(f"Found {len(traces)} successful traces for controlled diagnostic.")
+        # Filter to baseline-mode traces only (MPPI traces have replay drift).
+        traces = [p for p in traces if "_baseline_" in p.name]
+        if not traces:
+            print("No baseline-mode successful traces found (replay drift on mppi mode).")
+            return 1
+        print(f"Found {len(traces)} baseline-mode successful traces.")
         for p in traces:
             print(f"  {p.name}")
         # Convert to (path, obj_idx, dist) shape so the env-build loop below works
@@ -500,6 +619,8 @@ def main() -> int:
         try:
             if args.mode == "controlled":
                 r = diagnose_one_controlled(env, trace_path)
+            elif args.mode == "injection":
+                r = diagnose_one_injection(env, trace_path)
             else:
                 r = diagnose_one(env, trace_path, obj_idx)
             results.append(r)
@@ -518,6 +639,28 @@ def main() -> int:
         prims = ",".join(k for k, v in r["results"].items() if v) or "none"
         print(f"  [{flag}] {r['trace'][:50]}  succeeded: {prims}")
     print()
+    if args.mode == "injection":
+        # The decisive verdict. Injected grip-loss + primitives.
+        if n_recovered >= max(2, len(results) - 1):
+            print("INJECTION VERDICT: PRIMITIVES RECOVER")
+            print("  Primitives successfully recovered injected grip losses.")
+            print("  → Failures of this type ARE in the primitive repertoire.")
+            print("  → Privileged-state planning is viable. Build data engine.")
+        elif n_recovered == 0:
+            print("INJECTION VERDICT: PRIMITIVES INADEQUATE")
+            print("  Primitives cannot recover even artificial, recently-grasped")
+            print("  grip losses with full state knowledge. This is strong evidence")
+            print("  that the open-loop primitive vocabulary is too weak. Two paths:")
+            print("  (a) Expand vocabulary substantially (closed-loop primitives,")
+            print("      richer parameterization, learned per-task scripts).")
+            print("  (b) Skip scripted primitives — go directly to learned-proposal")
+            print("      bootstrapped from successful trajectories, accepting the")
+            print("      cold-start problem.")
+        else:
+            print("INJECTION VERDICT: PARTIAL")
+            print("  Mixed results. Investigate which task/seed combos work.")
+        return 0
+
     if args.mode == "controlled":
         # Different verdict logic for controlled mode.
         if n_recovered >= max(2, len(results) - 1):
