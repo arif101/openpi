@@ -61,15 +61,26 @@ from libero.libero.envs import OffScreenRenderEnv
 LIBERO_DUMMY = [0.0] * 6 + [-1.0]
 
 
-def find_grip_loss_failures(traces_dir: pathlib.Path, n: int) -> list[pathlib.Path]:
+def find_grip_loss_failures(traces_dir: pathlib.Path, n: int,
+                              task_filter: str | None = None,
+                              pert_max: float = 10.0) -> list[pathlib.Path]:
     """Find FAIL_*.npz traces where the EE got close to the object then lost it.
 
     Definition of grip-loss failure: min(EE-object distance) over trajectory
     < 8cm, AND the object never moved >5cm (so it was approached but not
     delivered).
+
+    task_filter: substring that must appear in the filename (e.g. "task3").
+    pert_max: only accept traces with perturbation cm <= this.
     """
+    import re
     candidates = []
     for p in sorted(traces_dir.glob("PHYS_FAIL_*.npz")):
+        if task_filter and task_filter not in p.name:
+            continue
+        m = re.search(r"pert([\d.]+)cm", p.name)
+        if m and float(m.group(1)) > pert_max:
+            continue
         d = np.load(p, allow_pickle=True)
         obj_pos = d["object_pos"]
         ee_pos = d["ee_pos"]
@@ -283,10 +294,19 @@ def main() -> int:
     ap.add_argument("--traces-dir", required=True)
     ap.add_argument("--n-failures", type=int, default=5)
     ap.add_argument("--task-suite", default="libero_10")
+    ap.add_argument("--task-filter", default=None,
+                    help="Filename substring filter (e.g. 'task3') to focus "
+                         "the diagnostic on a specific task.")
+    ap.add_argument("--pert-max", type=float, default=10.0,
+                    help="Max perturbation cm to include. Use 5.0 for the "
+                         "publishable matrix regime; 10.0 for hard cases.")
     args = ap.parse_args()
 
     traces_dir = pathlib.Path(args.traces_dir)
-    failures = find_grip_loss_failures(traces_dir, args.n_failures)
+    failures = find_grip_loss_failures(
+        traces_dir, args.n_failures,
+        task_filter=args.task_filter, pert_max=args.pert_max,
+    )
     print(f"Found {len(failures)} grip-loss failures to diagnose.\n")
     for p, obj_idx, dist in failures:
         print(f"  {p.name}  obj_idx={obj_idx}  closest_approach={dist*100:.1f}cm")
