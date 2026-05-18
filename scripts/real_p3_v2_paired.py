@@ -170,8 +170,8 @@ def step_collision_cost(sim, is_robot_geom):
 
 
 def evaluate_candidate(env, candidate, is_robot_geom, ee_body_id, tracked_body_id,
-                       goal_xyz, prior_action, w_target, w_approach, w_wrench,
-                       w_collision, w_anchor):
+                       goal_xyz, w_target, w_approach, w_wrench,
+                       w_collision, w_anchor, prior_action):
     """Forward-sim a candidate action chunk, return privileged-physics cost.
 
     Cost components:
