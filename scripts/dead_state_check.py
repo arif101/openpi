@@ -74,7 +74,7 @@ def find_drawer_joints(sim_model) -> list[tuple[int, str, float]]:
         name = sim_model.joint_id2name(j) if hasattr(sim_model, "joint_id2name") else None
         if not name: continue
         nl = name.lower()
-        if "drawer" in nl or "slide" in nl or ("cabinet" in nl and "door" in nl):
+        if "drawer" in nl or "slide" in nl or ("cabinet" in nl and ("door" in nl or "level" in nl)):
             # closed qpos: lower limit if limited, else 0
             if sim_model.jnt_limited[j]:
                 lo, hi = sim_model.jnt_range[j]
