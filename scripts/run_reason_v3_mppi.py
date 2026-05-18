@@ -235,6 +235,31 @@ def parse_args():
                         "manageable. Physics-state arrays are still saved "
                         "per-step regardless. Default 5 → ~30MB/episode "
                         "at 500 steps with 224x224 images.")
+    # Perturbation validity. Audit of the first 160 traces showed ~50% of
+    # 5cm episodes had pathological initial conditions (objects launched by
+    # contact resolver or spawned mid-air). Reject-sample until a clean
+    # perturbation passes the settling test.
+    p.add_argument("--validate-perturbations", action="store_true", default=True,
+                   help="After perturbing free-body xyz, settle the env for "
+                        "--validation-settle-steps and check that no movable "
+                        "body moved >--validation-max-launch m. Resample on "
+                        "failure. Default ON.")
+    p.add_argument("--no-validate-perturbations", dest="validate_perturbations",
+                   action="store_false",
+                   help="Disable perturbation validity check (old behaviour).")
+    p.add_argument("--validation-settle-steps", type=int, default=15,
+                   help="Number of zero-action settling steps before checking "
+                        "validity. Should be long enough for contact resolver "
+                        "to either find rest or visibly launch the object.")
+    p.add_argument("--validation-max-launch", type=float, default=0.05,
+                   help="Per-step max position change (m) any movable object "
+                        "is allowed during the settling window. Larger means "
+                        "the resolver had to apply violent forces, indicating "
+                        "an invalid initial state. 5cm is generous; smaller "
+                        "= stricter.")
+    p.add_argument("--validation-max-retries", type=int, default=15,
+                   help="Max perturbation resamples before giving up and "
+                        "using the unperturbed init state for this trial.")
     p.add_argument("--mppi-early-exit-calls", type=int, default=6,
                    help="Number of consecutive MPPI calls with no signal "
                         "(spread<eps AND |refined-nominal|<eps) before giving "
@@ -274,15 +299,90 @@ def _quat2axisangle(quat):
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
-def perturb_object_positions(env, init_state, perturbation_m, rng):
+def _candidate_perturbed_state(init_state, free_joint_addrs, perturbation_m, rng):
+    """Sample one perturbed init state without applying it to the env."""
     state = init_state.clone() if hasattr(init_state, "clone") else init_state.copy()
+    for addr in free_joint_addrs:
+        state[addr:addr + 3] += rng.normal(0, perturbation_m, size=3)
+    return state
+
+
+def _state_is_settled(env, free_body_ids, settle_steps: int, max_launch_per_step: float) -> tuple[bool, str]:
+    """After perturbation has been applied, settle the env and check validity.
+
+    Returns (is_valid, reason). is_valid=True only if no movable body's
+    per-step position change exceeds max_launch_per_step at any point during
+    the settling window. That single threshold catches both 'object launched
+    by resolver' (huge step) and 'object falls from mid-air' (mostly clipped
+    by max-launch-per-step too — gravity gives ~5mm/step at LIBERO's dt).
+    """
+    sim = env.env.sim
+    if not free_body_ids:
+        return True, "no movable bodies to check"
+    prev = {bid: sim.data.body_xpos[bid].copy() for bid in free_body_ids}
+    for _ in range(settle_steps):
+        env.step(LIBERO_DUMMY_ACTION)
+        for bid in free_body_ids:
+            cur = sim.data.body_xpos[bid]
+            step = float(np.linalg.norm(cur - prev[bid]))
+            if step > max_launch_per_step:
+                return False, f"body {bid} moved {step*100:.1f}cm in one step (>{max_launch_per_step*100:.0f}cm)"
+            prev[bid] = cur.copy()
+    return True, "ok"
+
+
+def perturb_object_positions(env, init_state, perturbation_m, rng,
+                              validate: bool = True,
+                              settle_steps: int = 15,
+                              max_launch_per_step: float = 0.05,
+                              max_retries: int = 15):
+    """Sample a perturbed init state that survives a settling check.
+
+    Iterates: sample → set_init_state → settle for `settle_steps` zero-action
+    steps → check that no movable body moved >`max_launch_per_step` per step.
+    If invalid, resample. After `max_retries`, fall back to the unperturbed
+    init_state (rare, only happens at very large σ).
+    """
     sim = env.env.sim
     model = sim.model
-    for joint_idx in range(model.njnt):
-        if model.jnt_type[joint_idx] == 0:
-            pos_start = model.jnt_qposadr[joint_idx]
-            state[pos_start:pos_start + 3] += rng.normal(0, perturbation_m, size=3)
-    return state
+    free_joint_addrs = [
+        int(model.jnt_qposadr[j]) for j in range(model.njnt) if model.jnt_type[j] == 0
+    ]
+    # Resolve free-joint body ids by walking joint→body map.
+    free_body_ids: list[int] = []
+    for j in range(model.njnt):
+        if model.jnt_type[j] == 0:
+            free_body_ids.append(int(model.jnt_bodyid[j]))
+
+    if not validate or perturbation_m <= 0.0:
+        # Legacy path: single sample, no validation, no env-step side effects.
+        state = _candidate_perturbed_state(init_state, free_joint_addrs, perturbation_m, rng)
+        return state
+
+    last_state = None
+    for attempt in range(max_retries):
+        candidate = _candidate_perturbed_state(init_state, free_joint_addrs, perturbation_m, rng)
+        # Apply it. set_init_state replaces qpos+qvel; we then settle.
+        env.set_init_state(candidate)
+        ok, reason = _state_is_settled(env, free_body_ids, settle_steps, max_launch_per_step)
+        if ok:
+            # Restore the env to the candidate so the caller can use it as the
+            # "starting state" — we re-apply set_init_state to undo settling.
+            env.set_init_state(candidate)
+            return candidate
+        last_state = candidate
+        # else: loop; the env will be re-set with a fresh candidate next attempt.
+
+    print(f"  [perturb] no valid sample after {max_retries} retries "
+          f"(perturbation σ={perturbation_m*100:.1f}cm). "
+          f"Using last sample anyway.", flush=True)
+    # Re-apply the last attempt's state so the caller's env is in a consistent
+    # state. We accept whatever it is — bias toward returning *some* perturbation
+    # over collapsing to the unperturbed init state.
+    if last_state is None:
+        last_state = _candidate_perturbed_state(init_state, free_joint_addrs, perturbation_m, rng)
+    env.set_init_state(last_state)
+    return last_state
 
 
 def build_obs_element(obs, task_description):
@@ -582,7 +682,13 @@ def run_episode(
     env.reset()
     init_state_np = init_state.clone() if hasattr(init_state, "clone") else init_state.copy()
     if perturbation_m > 0:
-        init_state_np = perturb_object_positions(env, init_state_np, perturbation_m, perturb_rng)
+        init_state_np = perturb_object_positions(
+            env, init_state_np, perturbation_m, perturb_rng,
+            validate=args.validate_perturbations,
+            settle_steps=args.validation_settle_steps,
+            max_launch_per_step=args.validation_max_launch,
+            max_retries=args.validation_max_retries,
+        )
     obs = env.set_init_state(init_state_np)
 
     plan = collections.deque()
