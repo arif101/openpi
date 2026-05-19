@@ -79,12 +79,24 @@ def sample_joint_config(rng: np.random.Generator, mdl, traj_configs: list[np.nda
 
 
 def sample_action(rng: np.random.Generator) -> np.ndarray:
-    """Mix uniform-in-[-1,1] and Gaussian-near-0."""
-    if rng.random() < 0.5:
+    """Bias toward large-magnitude actions so realized EE motion is observable.
+
+    Empirically, σ=0.5 Gaussian + uniform actions produce median EE displacement
+    of 0mm over K=5 steps — too concentrated at zero to train on. Bias toward
+    actions with at least one dominant axis at |a| > 0.5.
+    """
+    r = rng.random()
+    if r < 0.5:
+        # Dominant-axis mode: pick one of axes 0..5, set to ±[0.5, 1.0], rest small
+        a = rng.normal(0.0, 0.2, size=7).clip(-1.0, 1.0)
+        dom_axis = int(rng.integers(0, 6))
+        a[dom_axis] = float(rng.uniform(0.5, 1.0)) * (1 if rng.random() < 0.5 else -1)
+    elif r < 0.8:
+        # Uniform in [-1, 1] (high-magnitude tends to dominate)
         a = rng.uniform(-1.0, 1.0, size=7)
     else:
+        # Gaussian near zero (rare, for low-action regime coverage)
         a = rng.normal(0.0, 0.5, size=7).clip(-1.0, 1.0)
-    # Last element is gripper command; restrict to {-1, +1} half the time
     if rng.random() < 0.5:
         a[6] = -1.0 if rng.random() < 0.5 else 1.0
     return a.astype(np.float32)
