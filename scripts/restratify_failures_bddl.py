@@ -21,12 +21,16 @@ Per-trace output:
   label:                         # categorical label from atomic_results pattern
 
 Labels for tasks of form `(And (In obj region) (Close region))`:
-  IN_TRUE_CLOSE_TRUE             # both atomics True → trace shouldn't be a failure (replay bug)
+  IN_TRUE_CLOSE_TRUE             # both atomics True → if trace was PHYS_FAIL, on-line check disagrees
   IN_TRUE_CLOSE_FALSE            # legitimate "drawer-close subpredicate failed"
   IN_FALSE_CLOSE_TRUE            # bowl misplaced but drawer closed
   IN_FALSE_CLOSE_FALSE           # combination failure (likely the dominant mode)
   WRONG_DRAWER                   # bowl in top or middle region (not the goal region)
-  REPLAY_DIVERGED                # restoring + replaying didn't reproduce failure
+  RESTORE_FAILED                 # set_state_from_flattened threw
+
+NOTE: v2 uses direct state-jump to recorded qpos[-1]/qvel[-1] — no action
+replay. Eliminates the drift confound discovered in
+project_replay_drift_severe_2026_05_18.md.
 
 Usage:
   PYTHONPATH=src:third_party/libero MUJOCO_GL=egl uv run python3 -u \\
@@ -61,16 +65,25 @@ LIBERO_DUMMY = [0.0] * 6 + [-1.0]
 
 
 def restore_to_end(env, trace_npz) -> bool:
-    """Replay full action sequence from init_sim_state. Returns True on success."""
+    """Jump directly to the recorded final sim state — NO action replay.
+
+    Replay drifts up to 40cm on contact-rich trajectories (see
+    project_replay_drift_severe_2026_05_18.md). The recorded qpos and qvel
+    arrays are the on-the-fly trajectory; reconstructing the sim state from
+    qpos[-1]/qvel[-1] and skipping action replay eliminates drift accumulation.
+    """
     try:
         env.reset()
-        env.env.sim.set_state_from_flattened(trace_npz["init_sim_state"])
+        # Sim state layout is [time, qpos..., qvel...]. Use recorded final qpos/qvel.
+        qpos = np.asarray(trace_npz["qpos"][-1], dtype=np.float64).ravel()
+        qvel = np.asarray(trace_npz["qvel"][-1], dtype=np.float64).ravel()
+        time = float(trace_npz["t"][-1]) if "t" in trace_npz.files else 0.0
+        flat = np.concatenate([[time], qpos, qvel])
+        env.env.sim.set_state_from_flattened(flat)
         env.env.sim.forward()
-        for _ in range(10): env.step(LIBERO_DUMMY)
-        for a in trace_npz["action"]:
-            env.step(a.tolist())
         return True
-    except Exception:
+    except Exception as e:
+        print(f"  restore_failed: {type(e).__name__}: {e}", flush=True)
         return False
 
 
