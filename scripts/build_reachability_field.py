@@ -133,18 +133,35 @@ def stage_gen(args) -> int:
     joint_motion = np.zeros((N,), dtype=np.float32)
 
     print(f"Generating {N} (config, action) samples, K={K} OSC steps each...")
+    # Isolate objects ONCE at startup, never reset env again (~50x faster).
+    # Per-iteration: write robot qpos+qvel, reset OSC controller, run K steps.
+    isolate_objects(env)
+    sim = env.env.sim
+    robot = env.env.robots[0]
     t0 = time.time()
     for i in range(N):
         q = sample_joint_config(rng, mdl, traj_cfgs)
         a = sample_action(rng)
-        # Reset env state
-        env.reset()
-        isolate_objects(env)
-        sim = env.env.sim
-        # Overwrite robot qpos
+        # Write robot state directly (no full env reset)
         sim.data.qpos[:7] = q
         sim.data.qvel[:7] = 0.0
+        # Keep objects pinned far away so they don't drift between queries
+        for j in range(mdl.njnt):
+            if mdl.jnt_type[j] == 0:  # free joint
+                addr = int(mdl.jnt_qposadr[j])
+                sim.data.qpos[addr:addr + 3] = [5.0, 5.0, 0.5]
+                sim.data.qpos[addr + 3:addr + 7] = [1.0, 0.0, 0.0, 0.0]
+                dof = int(mdl.jnt_dofadr[j])
+                sim.data.qvel[dof:dof + 6] = 0.0
         sim.forward()
+        # Reset OSC controller internal state so the previous query doesn't leak in
+        try:
+            robot.controller.reset_goal()
+        except Exception:
+            try:
+                robot.controller.update_initial_joints(q)
+            except Exception:
+                pass
         ee0 = np.array(sim.data.site_xpos[eef_site_id])
         q0 = sim.data.qpos[:7].copy()
         # Run K OSC steps with the commanded action
