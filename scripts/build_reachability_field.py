@@ -145,13 +145,20 @@ def stage_gen(args) -> int:
     joint_motion = np.zeros((N,), dtype=np.float32)
 
     print(f"Generating {N} (config, action) samples, K={K} OSC steps each...")
-    # Isolate objects ONCE at startup, never reset env again (~50x faster).
     # Per-iteration: write robot qpos+qvel, reset OSC controller, run K steps.
+    # Periodic env.reset() to recover from sim NaN-state corruption that
+    # silently breaks all subsequent samples (transition observed at ~i=50).
+    env.reset()
     isolate_objects(env)
     sim = env.env.sim
     robot = env.env.robots[0]
+    reset_every = 50
     t0 = time.time()
     for i in range(N):
+        if i > 0 and i % reset_every == 0:
+            env.reset()
+            isolate_objects(env)
+            sim = env.env.sim  # reset may rebind
         q = sample_joint_config(rng, mdl, traj_cfgs)
         a = sample_action(rng)
         # Write robot state directly (no full env reset)
@@ -184,6 +191,14 @@ def stage_gen(args) -> int:
             pass
         ee1 = np.array(sim.data.site_xpos[eef_site_id])
         q1 = sim.data.qpos[:7].copy()
+        # If qpos/qvel went non-finite, sim is corrupted — reset before continuing.
+        if not (np.all(np.isfinite(sim.data.qpos)) and np.all(np.isfinite(sim.data.qvel))):
+            env.reset()
+            isolate_objects(env)
+            sim = env.env.sim
+            # Mark this sample's outputs as zero (couldn't measure cleanly)
+            ee1 = ee0.copy()
+            q1 = q.copy()
         configs[i] = q.astype(np.float32)
         actions[i] = a
         realized_xyz[i] = (ee1 - ee0).astype(np.float32)
