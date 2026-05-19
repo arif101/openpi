@@ -168,21 +168,21 @@ def restratify_one(env, d, tidx: int) -> dict:
 
 def label_for(tidx: int, atomic_results: dict, extra: dict) -> str:
     # Task 3 pattern: (And (Close ...region) (In ...region))
+    # BDDL parser lowercases predicate names — match on lower.
     if tidx == 3:
-        close_v = None
-        in_v = None
-        for k, v in atomic_results.items():
-            if k.startswith("Close("): close_v = v
-            elif k.startswith("In("): in_v = v
-        if in_v is True and close_v is True: return "IN_TRUE_CLOSE_TRUE"
-        if in_v is True and close_v is False: return "IN_TRUE_CLOSE_FALSE"
-        if in_v is False and close_v is True: return "IN_FALSE_CLOSE_TRUE"
-        if in_v is False and close_v is False:
-            # Probe wrong-drawer
-            for r in ("white_cabinet_1_top_region", "white_cabinet_1_middle_region"):
-                if extra.get(f"In(bowl, {r})") is True:
-                    return "WRONG_DRAWER"
-            return "IN_FALSE_CLOSE_FALSE"
+        ar = {k.lower(): v for k, v in atomic_results.items()}
+        close_v = next((v for k, v in ar.items() if k.startswith("close(")), None)
+        in_v = next((v for k, v in ar.items() if k.startswith("in(")), None)
+        if not (isinstance(in_v, bool) and isinstance(close_v, bool)):
+            return "PARSE_ERR"
+        wrong = any(
+            extra.get(f"In(bowl, white_cabinet_1_{r}_region)") is True
+            for r in ("top", "middle")
+        )
+        if in_v and close_v: return "IN_TRUE_CLOSE_TRUE"  # replay-diverged from corpus PHYS_FAIL label
+        if in_v and not close_v: return "IN_TRUE_CLOSE_FALSE"  # legitimate drawer-close subpred fail
+        if not in_v and close_v: return "WRONG_DRAWER" if wrong else "IN_FALSE_CLOSE_TRUE"
+        if not in_v and not close_v: return "WRONG_DRAWER" if wrong else "IN_FALSE_CLOSE_FALSE"
     return "OTHER"
 
 
