@@ -33,13 +33,34 @@ This is a structurally different failure mode than the IN_TRUE_CLOSE_FALSE patte
 | IN_FALSE / NO_APPROACH | Approach-not-initiated (EE never near bowl, no grasp attempt) | EE-to-bowl distance progress reward |
 | IN_FALSE / PLACEMENT_MISS | Bowl reached drawer area, missed AABB | Goal-region shaping reward |
 
-## Sub-pattern within NO_APPROACH
+## Sub-pattern within NO_APPROACH (resolved, 2026-05-23)
 
-The 10 NO_APPROACH traces split:
-- 5 with `ee_to_bowl_min` in 8–12cm range (close, but never closed gripper — possible perception near-miss)
-- 5 with `ee_to_bowl_min > 14cm` (way off — Pi0.5 doesn't even target the bowl)
+Further analysis on the 10 NO_APPROACH traces revealed two structurally different sub-modes:
 
-Worth a deeper look if we pursue NO_APPROACH-targeted intervention. Different sub-sub-modes may need different signals.
+**GRASP_TOO_HIGH (7 traces, 70% of NO_APPROACH):**
+- Mean relative position EE−bowl at closest-approach moment: **(−2.3, −1.3, +8.8) cm** — well-aligned in xy, **8.8 cm above bowl in z**.
+- Gripper commanded closed at +1.00 in 6/7 traces at the closest-approach moment.
+- Mean cosine(EE velocity, toward-bowl) = −0.70 — EE is heading AWAY from bowl right when gripper closes.
+- Action at closest approach has dominant +z component (+0.3 to +0.7).
+
+**Interpretation: Pi0.5 attempts a grasp 8–10 cm above the bowl, then lifts.** The gripper closes; the EE moves up; the bowl is never touched. This is a **perception/proprioception depth error**, not "Pi0.5 doesn't try." The previous "`grip_close_near_bowl_steps = 0`" finding was an artifact of an 8cm threshold — the gripper IS closing near the bowl, just 1–4 cm outside the threshold.
+
+**APPROACH_WILDLY_OFF (3 traces, 30% of NO_APPROACH):**
+- Mean relative position: (−7.4, +6.0, +14.8) cm — off in all three axes.
+- One trace at 26.9 cm closest-approach. Mixed gripper signal.
+- **Pi0.5 genuinely lost** — never locates the bowl. Likely perception/policy failure at init pose.
+
+## Updated failure-mode taxonomy with reward-component attribution
+
+| Sub-mode | Count | % of all task-3 failures | Plausible reward component |
+|---|---|---|---|
+| IN_TRUE_CLOSE_FALSE | 14 | 54% | Tracking-error penalty |
+| IN_FALSE / GRASP_TOO_HIGH | 7 | 27% | Grasp-in-contact reward (penalize gripper-closed-without-contact) |
+| IN_FALSE / APPROACH_WILDLY_OFF | 3 | 12% | EE-to-bowl approach progress |
+| IN_FALSE / PLACEMENT_MISS | 1 | 4% | Goal-region shaping |
+| IN_FALSE / OTHER | 1 | 4% | — |
+
+These 4 reward components together address 96% of failures, with per-component-attributable per-stratum lift. That's the basis of the GRPO ablation experiment.
 
 ## What this changes
 

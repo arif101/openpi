@@ -82,21 +82,34 @@ Mean EE position at the moment of drawer closing in 53 PHYS_OK traces: (+0.031, 
 
 This is task-3-specific but informative: the right action sequence isn't obvious from the task description.
 
-### The IN_FALSE stratum decomposes into NO_APPROACH (dominant) + small tail
+### The IN_FALSE stratum decomposes into GRASP_TOO_HIGH + APPROACH_WILDLY_OFF (+ tail)
 
-Applied the cmd-vs-realized methodology — mirrored from EE trajectory analysis to bowl trajectory analysis — across the 12 IN_FALSE task-3 traces. Sub-mode distribution:
+Applied the cmd-vs-realized methodology — mirrored from EE trajectory analysis to bowl trajectory analysis — across the 12 IN_FALSE task-3 traces, then split the initially-coarse NO_APPROACH bucket by `ee_to_bowl_min`.
 
-| Sub-mode | Count | % | Signature |
+| Sub-mode | Count | % of all failures | Signature |
 |---|---|---|---|
-| NO_APPROACH | 10 | 83% | `ee_to_bowl_min` 8–27 cm; `grip_close_near_bowl_steps = 0` for all 10 |
-| OTHER | 1 | 8% | Got close, partial grasp, bowl drifted back |
-| PLACEMENT_MISS | 1 | 8% | Bowl reached drawer area, missed AABB |
+| GRASP_TOO_HIGH | 7 | 27% | EE 8.8 cm ABOVE bowl in z (xy-aligned), gripper closes, EE then lifts |
+| APPROACH_WILDLY_OFF | 3 | 12% | EE never gets close in xy or z; mixed gripper signal |
+| PLACEMENT_MISS | 1 | 4% | Bowl reached drawer area, missed AABB |
+| OTHER | 1 | 4% | Mixed |
 
-Pi0.5 never even attempts a grasp in 83% of IN_FALSE traces. Gripper command stays at −1 (open) throughout the approach phase. Bowl stays near its initial position.
+**GRASP_TOO_HIGH (27%) is the second-largest failure mode overall** (after IN_TRUE_CLOSE_FALSE at 54%). Pi0.5 attempts a grasp 8–10 cm above the bowl, closes the gripper, then lifts. Bowl never touched. This is a **perception/proprioception depth error**, not "Pi0.5 doesn't try."
 
-**This is a structurally different failure mode than IN_TRUE.** IN_TRUE = Pi0.5 *tries* and embodiment *can't*. IN_FALSE / NO_APPROACH = Pi0.5 *doesn't try*. No single reward term targets both. Memory file: `project_in_false_diagnostic_2026_05_23.md`.
+**APPROACH_WILDLY_OFF (12%)** is Pi0.5 genuinely lost — never locates the bowl. Likely perception/policy failure at init pose under 5cm perturbation.
 
-Sub-pattern worth flagging: within NO_APPROACH, 5/10 traces have `ee_to_bowl_min` 8–12cm (close, but no grasp attempt — possible perception near-miss) and 5/10 have `ee_to_bowl_min > 14cm` (way off). Two different sub-sub-modes may be hiding here.
+The earlier "Pi0.5 doesn't try" framing was wrong — it was an artifact of an 8cm grip-close-near-bowl threshold that missed grasp attempts at 8–12cm. Reframing: Pi0.5 *does* try in 7/10 of these traces, but its grasp attempts are 1–4 cm outside the threshold and 9 cm too high. Memory file: `project_in_false_diagnostic_2026_05_23.md`.
+
+### Full task-3 failure taxonomy with reward-component attribution
+
+| Sub-mode | Count | % | Failure character | Plausible reward component |
+|---|---|---|---|---|
+| IN_TRUE_CLOSE_FALSE | 14 | 54% | Execution-stuck (cmd correct, EE doesn't move) | Tracking-error penalty |
+| IN_FALSE / GRASP_TOO_HIGH | 7 | 27% | Grasp attempted 9cm above bowl; depth-perception error | Grasp-in-contact reward |
+| IN_FALSE / APPROACH_WILDLY_OFF | 3 | 12% | EE never near bowl; perception/policy lost | EE-to-bowl approach progress |
+| IN_FALSE / PLACEMENT_MISS | 1 | 4% | Bowl reached drawer area, missed AABB | Goal-region shaping |
+| IN_FALSE / OTHER | 1 | 4% | Mixed | — |
+
+4 reward components address 96% of failures, each attributable to a specific stratum. This is the basis of the GRPO ablation experiment.
 
 ### Joint-teleport + push closes the drawer in 2/14 traces
 
@@ -172,25 +185,27 @@ The artifact is: (a) the diagnostic methodology (BDDL state-jump stratification 
 
 ### The next experiment, designed for the per-stratum story
 
-Three-arm ablation, each arm attributable to per-stratum lift:
+Four-arm ablation, each arm attributable to per-stratum lift:
 
 1. Use Cosmos-RL (or a fork) to GRPO-fine-tune Pi0.5 on libero_10 with `train_expert_only=true`.
-2. Three reward variants:
+2. Four reward variants:
    - **A (baseline)**: sparse task success only.
-   - **B**: sparse + λ₁ · Σ_t max(0, ||a_cmd_t|| − ||realized_ee_t||) — *targets IN_TRUE_CLOSE_FALSE (execution-stuck)*.
-   - **C**: sparse + λ₁ · tracking_error + λ₂ · approach_progress, where approach_progress = (initial_ee_to_bowl − ee_to_bowl_t) — *targets IN_TRUE AND IN_FALSE / NO_APPROACH*.
-3. Evaluate per BDDL stratum using the state-jump re-stratifier.
-4. **Headline result**: an A→B→C ablation table showing per-stratum failure-rate reduction attributable to each added reward component. Each row is a stratum; each column is a reward variant; the cells decompose where the lift comes from.
+   - **B**: A + λ₁ · Σ_t max(0, ||a_cmd_t|| − ||realized_ee_t||) — *targets IN_TRUE_CLOSE_FALSE (54%)*.
+   - **C**: B + λ₂ · grasp_in_contact_reward = penalty when gripper closes without EE-object contact — *targets +GRASP_TOO_HIGH (cumulative 81%)*.
+   - **D**: C + λ₃ · approach_progress reward — *targets +APPROACH_WILDLY_OFF (cumulative 93%)*.
+3. Evaluate per BDDL stratum × per sub-mode using the state-jump re-stratifier + in_false_diagnostic.
+4. **Headline result**: an A→B→C→D ablation table showing per-stratum failure-rate reduction attributable to each added reward component. Each row is a stratum; each column is a reward variant; the cells decompose where the lift comes from.
 
-Pre-requisite: extend Cosmos-RL's text-shaped reward interface to accept rollout trajectory information (observations, actions, full sim state at every step). Their code is Apache-2.0; this is a contribution-shaped change, not a fork.
+Pre-requisite: extend Cosmos-RL's text-shaped reward interface to accept rollout trajectory information (observations, actions, full sim state at every step, contact state). Their code is Apache-2.0; this is a contribution-shaped change, not a fork.
 
 This experiment serves all three audiences (YC, paper, collaborator engagement) but the *framing* of the headline differs. Decide framing before writing.
 
-### Open methodological gaps that should be closed before the next experiment
+### Open methodological gaps remaining before the next experiment
 
-- **Transfer-test target task is unidentified.** Without a second reach-limited task to test transfer on, the per-stratum result can be called "task 3 curiosity." Candidates: task 9 (microwave + close), BEHAVIOR-1K reach-limited tasks (different sim). Stratifying failures on a second task is the cheap pre-experiment (requires fresh GPU rollouts).
-- **NO_APPROACH sub-sub-modes.** 5/10 of NO_APPROACH traces are at `ee_to_bowl_min` 8–12cm (close, but no grasp attempt) and 5/10 at >14cm (way off). May be different sub-sub-modes requiring different signals. ~30 min of follow-up analysis on existing local data.
-- **The 1 OTHER + 1 PLACEMENT_MISS** in the IN_FALSE diagnostic deserve a closer look before treating them as noise — small N but the PLACEMENT_MISS one specifically tells us whether the AABB metric and the policy's place-target are mis-aligned.
+- **Transfer-test target task is unidentified.** Without a second task with comparable failure-mode structure, the per-stratum result can be called "task 3 curiosity." Candidates: task 9 (microwave + close), BEHAVIOR-1K reach-limited tasks (different sim). Stratifying failures on a second task is the cheap pre-experiment but requires fresh GPU rollouts.
+- **The 1 OTHER + 1 PLACEMENT_MISS** in the IN_FALSE diagnostic deserve a closer look before treating them as noise — small N but the PLACEMENT_MISS specifically tells us whether the AABB metric and the policy's place-target are mis-aligned.
+
+Both are deferred-but-tracked; we now have enough specificity (4 sub-modes mapped to 4 reward components) to design the experiment.
 
 ---
 
