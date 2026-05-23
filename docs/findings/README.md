@@ -41,6 +41,7 @@ findings first; everything else is detail.
 - [BDDL `In()` predicate failure modes](project_in_predicate_failure_modes.md) — pre-experiment predictions before re-stratification
 - [BDDL re-stratification result](project_bddl_restratification_result.md) — actual distribution: 53% IN_TRUE_CLOSE_FALSE
 - [Drawer-close failure root cause](project_drawer_close_failure_root_cause_2026_05_18.md) — Pi0.5 commands drawer-close in 14/14 failing traces; EE doesn't move in 11/14; execution failure, not generation failure
+- [IN_FALSE failure diagnostic](project_in_false_diagnostic_2026_05_23.md) — 83% of IN_FALSE failures are NO_APPROACH (Pi0.5 never gets EE near bowl, never commands grasp). Structurally different from IN_TRUE; needs a different reward component
 - [Recovery primitive v1 partial result](project_recovery_primitive_v1_partial_2026_05_18.md) — joint-teleport + push closes drawer in 2/14 (mechanism validated, naive impl rejected)
 - [Reachability field v1 (training-distribution pass)](project_reachability_field_v1_2026_05_19.md) — R² = 0.51 on its own validation set
 

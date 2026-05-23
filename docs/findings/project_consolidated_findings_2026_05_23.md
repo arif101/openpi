@@ -10,15 +10,19 @@ originSessionId: 53e17618-aeb4-4007-9d29-d56bfc1900c3
 
 1. **Inference-time deliberation hits a structural ceiling.** MPPI on Pi0.5 gives 0pp average lift on the task we measured at the perturbation we care about (task 3, 5cm, N=40 per mode, paired seeds). The earlier seed-specific +20pp didn't survive controlled measurement. Q(h,a) ≈ V(h) ±1pp on LIBERO-90 confirmed the same ceiling for value-function search.
 
-2. **The dominant failure mode on our reference task is execution, not generation.** 14/14 failing traces show Pi0.5 commanding the right thing (saturated +y) for 300+ steps; 11/14 show the EE physically not moving in response. The bottleneck is OSC controller kinematic null-space drift, not Pi0.5 picking wrong actions.
+2. **Failure modes decompose into structurally different sub-strata.** On our reference task we now have two diagnosed modes:
+   - **IN_TRUE_CLOSE_FALSE (14 traces, 54%):** Pi0.5 commands the right thing (saturated +y) for 300+ steps; EE doesn't move (OSC kinematic null-space drift). *Execution failure under correct intent.*
+   - **IN_FALSE / NO_APPROACH (10 traces, 38%):** Pi0.5 never gets EE within 8cm of the bowl; gripper never commanded closed in vicinity of bowl. *Approach-not-initiated.*
 
-3. **MPPI's design envelope cannot fix this class of failure.** Candidates are Gaussian σ=0.1 noise around a correct prior; the noise can't construct multi-stage maneuvers; the cost function has no drawer-qpos term anyway. Two-out-of-three structural reasons it fails to help.
+   These need different interventions. No single reward term targets both.
+
+3. **MPPI's design envelope cannot fix the IN_TRUE class.** Candidates are Gaussian σ=0.1 noise around a correct prior; the noise can't construct multi-stage maneuvers; the cost function has no drawer-qpos term anyway. Two-out-of-three structural reasons it fails to help.
 
 4. **The cheap "embodiment-feasibility field" path is also dead.** A learned f(q,a) → realized_motion model passes R²=0.51 on its own training distribution but R²=0.10 on the deployment trace distribution. Reason: training data excluded scene objects; deployment failures depend on scene contact. The "cheap and unlimited" promise of the field was cheap precisely because it abstracted away the variable that drives the failure mode.
 
-5. **A diagnostic apparatus that gives per-failure-mode visibility is the unique artifact we built.** BDDL atomic-predicate stratification via state-jump (no action replay), with the cmd-vs-realized failure signature. NVIDIA's Cosmos-RL doesn't have this; it optimizes aggregate success. This is the defensible contribution.
+5. **A diagnostic apparatus that gives per-failure-mode visibility is the unique artifact we built.** BDDL atomic-predicate stratification via state-jump (no action replay), with the cmd-vs-realized signature. The signature generalizes: we applied it to EE trajectory for IN_TRUE, then to bowl trajectory for IN_FALSE, and both decomposed into clean sub-modes. NVIDIA's Cosmos-RL doesn't have this; it optimizes aggregate success. This is the defensible contribution.
 
-6. **The strategic position that survives:** **dense supervisory signal design for VLA training, with diagnostic precision about which signals fix which failure modes.** Not another inference-time wrapper. Not another foundation model. Reward / loss / curriculum design, validated per-stratum.
+6. **The strategic position that survives, sharpened:** **dense supervisory signal design for VLA training, with multiple per-stratum-targeted reward components, demonstrated via stratified ablation.** Not one universal feasibility signal — a *decomposed* signal with per-component contribution attributable to per-stratum lift. Reward / loss / curriculum design, validated per-stratum.
 
 ---
 
@@ -77,6 +81,22 @@ The earlier "+20pp" memory was seed-specific. Per-seed numbers: seed 42 mppi −
 Mean EE position at the moment of drawer closing in 53 PHYS_OK traces: (+0.031, +0.154, +0.939). That's **inside the open drawer cavity, behind the bowl** — not at the drawer face. Successful trajectories close the drawer by pushing the bowl, which pushes the drawer's back wall. Failing trajectories retreat to EE_y ≈ 0.04 (10cm behind the bowl), losing the contact path.
 
 This is task-3-specific but informative: the right action sequence isn't obvious from the task description.
+
+### The IN_FALSE stratum decomposes into NO_APPROACH (dominant) + small tail
+
+Applied the cmd-vs-realized methodology — mirrored from EE trajectory analysis to bowl trajectory analysis — across the 12 IN_FALSE task-3 traces. Sub-mode distribution:
+
+| Sub-mode | Count | % | Signature |
+|---|---|---|---|
+| NO_APPROACH | 10 | 83% | `ee_to_bowl_min` 8–27 cm; `grip_close_near_bowl_steps = 0` for all 10 |
+| OTHER | 1 | 8% | Got close, partial grasp, bowl drifted back |
+| PLACEMENT_MISS | 1 | 8% | Bowl reached drawer area, missed AABB |
+
+Pi0.5 never even attempts a grasp in 83% of IN_FALSE traces. Gripper command stays at −1 (open) throughout the approach phase. Bowl stays near its initial position.
+
+**This is a structurally different failure mode than IN_TRUE.** IN_TRUE = Pi0.5 *tries* and embodiment *can't*. IN_FALSE / NO_APPROACH = Pi0.5 *doesn't try*. No single reward term targets both. Memory file: `project_in_false_diagnostic_2026_05_23.md`.
+
+Sub-pattern worth flagging: within NO_APPROACH, 5/10 traces have `ee_to_bowl_min` 8–12cm (close, but no grasp attempt — possible perception near-miss) and 5/10 have `ee_to_bowl_min > 14cm` (way off). Two different sub-sub-modes may be hiding here.
 
 ### Joint-teleport + push closes the drawer in 2/14 traces
 
@@ -150,23 +170,27 @@ The artifact is: (a) the diagnostic methodology (BDDL state-jump stratification 
 - A finding that dense reward shaping doesn't improve per-stratum failure rates beyond what sparse reward does. That would force a deeper reframe.
 - A finding that our diagnostic apparatus doesn't generalize beyond task 3 — i.e., other tasks don't have crisp per-stratum failure signatures we can target. We have no evidence yet either way on this.
 
-### The next experiment, if and when
+### The next experiment, designed for the per-stratum story
 
-Single-bet experiment that distinguishes our claim from the null:
+Three-arm ablation, each arm attributable to per-stratum lift:
 
 1. Use Cosmos-RL (or a fork) to GRPO-fine-tune Pi0.5 on libero_10 with `train_expert_only=true`.
-2. Two reward variants:
-   - **Baseline**: sparse task success only.
-   - **Treatment**: sparse task success + λ · Σ_t max(0, ||a_cmd_t|| − ||realized_ee_t||).
-3. Evaluate per BDDL stratum using our state-jump re-stratifier.
-4. **Headline result**: does the treatment specifically reduce IN_TRUE_CLOSE_FALSE failures (without harming other modes), or does it just shift the failure distribution?
+2. Three reward variants:
+   - **A (baseline)**: sparse task success only.
+   - **B**: sparse + λ₁ · Σ_t max(0, ||a_cmd_t|| − ||realized_ee_t||) — *targets IN_TRUE_CLOSE_FALSE (execution-stuck)*.
+   - **C**: sparse + λ₁ · tracking_error + λ₂ · approach_progress, where approach_progress = (initial_ee_to_bowl − ee_to_bowl_t) — *targets IN_TRUE AND IN_FALSE / NO_APPROACH*.
+3. Evaluate per BDDL stratum using the state-jump re-stratifier.
+4. **Headline result**: an A→B→C ablation table showing per-stratum failure-rate reduction attributable to each added reward component. Each row is a stratum; each column is a reward variant; the cells decompose where the lift comes from.
 
-Pre-requisite: extend Cosmos-RL's text-shaped reward interface to accept rollout trajectory information. Their code is Apache-2.0; this is a contribution-shaped change, not a fork.
+Pre-requisite: extend Cosmos-RL's text-shaped reward interface to accept rollout trajectory information (observations, actions, full sim state at every step). Their code is Apache-2.0; this is a contribution-shaped change, not a fork.
+
+This experiment serves all three audiences (YC, paper, collaborator engagement) but the *framing* of the headline differs. Decide framing before writing.
 
 ### Open methodological gaps that should be closed before the next experiment
 
-- **Transfer-test target task is unidentified.** Without a second reach-limited task to test transfer on, the per-stratum result can be called "task 3 curiosity." Candidates: task 9 (microwave + close), BEHAVIOR-1K reach-limited tasks (different sim). Stratifying failures on a second task is the cheap pre-experiment.
-- **The 17 IN_FALSE failures haven't been diagnosed.** We know what's wrong with the 14 IN_TRUE_CLOSE_FALSE failures (execution). We don't yet know what's wrong with the rest. They might be perception-limited (scene-perception relevant), planning-limited (subgoal-search relevant), or grasping-limited (yet another mode). One day of focused analysis with the same cmd-vs-realized signature applied to bowl trajectories instead of EE trajectories.
+- **Transfer-test target task is unidentified.** Without a second reach-limited task to test transfer on, the per-stratum result can be called "task 3 curiosity." Candidates: task 9 (microwave + close), BEHAVIOR-1K reach-limited tasks (different sim). Stratifying failures on a second task is the cheap pre-experiment (requires fresh GPU rollouts).
+- **NO_APPROACH sub-sub-modes.** 5/10 of NO_APPROACH traces are at `ee_to_bowl_min` 8–12cm (close, but no grasp attempt) and 5/10 at >14cm (way off). May be different sub-sub-modes requiring different signals. ~30 min of follow-up analysis on existing local data.
+- **The 1 OTHER + 1 PLACEMENT_MISS** in the IN_FALSE diagnostic deserve a closer look before treating them as noise — small N but the PLACEMENT_MISS one specifically tells us whether the AABB metric and the policy's place-target are mis-aligned.
 
 ---
 
