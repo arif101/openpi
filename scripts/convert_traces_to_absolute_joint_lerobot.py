@@ -144,15 +144,18 @@ def main() -> int:
     h, w, c = sample["image"].shape[1:]
     print(f"Image shape: {h}x{w}x{c}, found {len(paths)} traces")
 
+    # Pi0.5 base expects 3 cameras with canonical openpi names.
+    # LIBERO only has 2 (front + wrist). Provide a zero-filled right_wrist for compat.
     dataset = LeRobotDataset.create(
         repo_id=repo_name,
         robot_type="panda",
         fps=10,
         features={
-            "image": {"dtype": "image", "shape": (h, w, c), "names": ["height", "width", "channel"]},
-            "wrist_image": {"dtype": "image", "shape": (h, w, c), "names": ["height", "width", "channel"]},
-            "state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
-            "actions": {"dtype": "float32", "shape": (8,), "names": ["actions"]},
+            "observation.images.base_0_rgb": {"dtype": "image", "shape": (h, w, c), "names": ["height", "width", "channel"]},
+            "observation.images.left_wrist_0_rgb": {"dtype": "image", "shape": (h, w, c), "names": ["height", "width", "channel"]},
+            "observation.images.right_wrist_0_rgb": {"dtype": "image", "shape": (h, w, c), "names": ["height", "width", "channel"]},
+            "observation.state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
+            "action": {"dtype": "float32", "shape": (8,), "names": ["action"]},
         },
         image_writer_threads=10,
         image_writer_processes=5,
@@ -168,12 +171,14 @@ def main() -> int:
             print(f"  SKIP {p.name}: {type(e).__name__}: {e}")
             continue
         T = ep["state"].shape[0]
+        zero_img = np.zeros_like(ep["image"][0])
         for t in range(T):
             dataset.add_frame({
-                "image": ep["image"][t],
-                "wrist_image": ep["wrist_image"][t],
-                "state": ep["state"][t],
-                "actions": ep["action"][t],
+                "observation.images.base_0_rgb": ep["image"][t],
+                "observation.images.left_wrist_0_rgb": ep["wrist_image"][t],
+                "observation.images.right_wrist_0_rgb": zero_img,
+                "observation.state": ep["state"][t],
+                "action": ep["action"][t],
                 "task": ep["task"],
             })
         dataset.save_episode()
