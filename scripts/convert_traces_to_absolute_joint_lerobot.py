@@ -112,12 +112,15 @@ def parse_args():
 def main() -> int:
     args = parse_args()
 
-    # Lazy import — only available in LeRobot envs
+    # Lazy import — try modern path first, then old
     try:
-        from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+        from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
     except ImportError:
-        print("ERROR: lerobot not installed. uv pip install lerobot")
-        return 1
+        try:
+            from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+        except ImportError:
+            print("ERROR: lerobot not installed. uv pip install lerobot")
+            return 1
     import shutil
 
     repo_name = args.repo_name
