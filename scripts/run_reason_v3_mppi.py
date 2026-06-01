@@ -144,6 +144,10 @@ def parse_args():
     p.add_argument("--task-suite", default="libero_10")
     p.add_argument("--task-idx", type=int, default=0, help="Single task to evaluate")
     p.add_argument("--num-trials", type=int, default=10)
+    p.add_argument("--modes", nargs="+", default=["baseline", "mppi"],
+                   choices=["baseline", "mppi"],
+                   help="Which eval modes to run. Use --modes baseline to collect "
+                        "pure Pi0.5 rollouts without the (slow) MPPI pass.")
     p.add_argument("--num-steps-wait", type=int, default=10)
     p.add_argument("--replan-steps", type=int, default=5)
     p.add_argument("--perturbation-cm", type=float, default=5.0)
@@ -1279,7 +1283,7 @@ def main():
     print(f"{'='*70}", flush=True)
 
     results = {}
-    for eval_mode in ("baseline", "mppi"):
+    for eval_mode in args.modes:
         perturb_rng = np.random.default_rng(args.seed + 1000)
         successes = 0
         per_trial = []
