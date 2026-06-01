@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 export PATH=$HOME/.local/bin:$PATH
 export __EGL_VENDOR_LIBRARY_FILENAMES=${__EGL_VENDOR_LIBRARY_FILENAMES:-/root/egl_nvidia.json}
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
-export PYTHONPATH=$PWD/motor_distill:$PWD/third_party/libero:$PYTHONPATH
+export PYTHONPATH=$PWD/motor_distill:$PWD/third_party/libero:${PYTHONPATH:-}
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYOPENGL_PLATFORM=egl
 N=${1:-30}
 mkdir -p logs/a0
