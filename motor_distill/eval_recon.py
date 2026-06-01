@@ -54,9 +54,10 @@ def main():
     cos_all, mse_all, grip_all = [], [], []
     for f in files:
         o = rekey.build_pairs(f, rekey.RekeyConfig(horizon=args.horizon))
-        gp, gq = torch.tensor(o["g_pos"]), torch.tensor(o["g_quat"])
-        pr, ch = torch.tensor(o["proprio"]), torch.tensor(o["chunk"])
-        op, oq = torch.tensor(o["obj_pos"]), torch.tensor(o["obj_quat"])
+        ft = lambda a: torch.tensor(np.asarray(a, dtype=np.float32))
+        gp, gq = ft(o["g_pos"]), ft(o["g_quat"])
+        pr, ch = ft(o["proprio"]), ft(o["chunk"])
+        op, oq = ft(o["obj_pos"]), ft(o["obj_quat"])
         with torch.no_grad():
             preds = torch.stack([net.sample(gp, gq, pr, op, oq, steps=10)
                                  for _ in range(args.samples)]).mean(0)   # [N,H,7] mean
