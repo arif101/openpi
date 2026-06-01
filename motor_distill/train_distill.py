@@ -14,10 +14,16 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import pathlib
 
 import numpy as np
 import torch
+
+# Cap CPU threads: on many-core boxes torch oversubscribes (128 threads for a
+# tiny MLP's matmuls) and thrashes on thread-sync, running ~10x slower. 8 is
+# plenty for a 0.5M-param head.
+torch.set_num_threads(min(8, os.cpu_count() or 8))
 
 import head as H
 import rekey
