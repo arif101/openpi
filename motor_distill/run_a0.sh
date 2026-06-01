@@ -10,13 +10,15 @@ export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 PYTHONUNBUFFERED=1
 export PYTHONPATH=$PWD/motor_distill:$PWD/third_party/libero:${PYTHONPATH:-}
 export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=0 PYOPENGL_PLATFORM=egl
 N=${1:-30}
+GMODE=${GMODE:-step}
+TASKS=${TASKS:-0 3 6 9}
 mkdir -p logs/a0
 for V in plain equiv; do
-  for T in 0 3 6 9; do
+  for T in $TASKS; do
     ( echo N | uv run --no-sync python motor_distill/eval_a0.py \
         --ckpt data/keystone/ckpt/head_${V}.pt --task-idx "$T" \
-        --trace-dir data/keystone/pert0 --n "$N" --replan 8 \
-        > "logs/a0/a0_${V}_t${T}.log" 2>&1 ) &
+        --trace-dir data/keystone/pert0 --n "$N" --replan 8 --g-mode "$GMODE" \
+        > "logs/a0/a0_${GMODE}_${V}_t${T}.log" 2>&1 ) &
   done
 done
 wait

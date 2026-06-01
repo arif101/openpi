@@ -54,8 +54,11 @@ def _t(x):
     return torch.tensor(np.asarray(x, dtype=np.float32)[None])      # [1, d]
 
 
-def rollout(net, env, ref, target_name, replan, max_steps, sample_steps=10):
-    """One head-driven rollout with g replayed from the reference trace.
+def rollout(net, env, ref, target_name, replan, max_steps, sample_steps=10, g_mode="step"):
+    """One head-driven rollout. g_mode:
+      'step'    : replay g indexed by timestep (open-loop, covariate-shift prone).
+      'nearest' : index g by the reference state nearest the head's CURRENT proprio
+                  (re-aligns the plan to where the head actually is -> closed-loop).
     Returns True iff BDDL success (env done)."""
     env.reset()
     obs = env.set_init_state(ref["init_state_libero"])
@@ -63,6 +66,8 @@ def rollout(net, env, ref, target_name, replan, max_steps, sample_steps=10):
     sim = env.env.sim
     target_bid = int(sim.model.body_name2id(target_name))
     g_pos, g_quat = ref["g_pos"], ref["g_quat"]
+    ref_pos = ref["proprio"][:, :3]                 # reference EE pos per step
+    ref_grip = ref["proprio"][:, 7:9]               # reference gripper per step
     ng = len(g_pos)
     done = False
     t = 0
@@ -73,11 +78,15 @@ def rollout(net, env, ref, target_name, replan, max_steps, sample_steps=10):
             return True
     step = 0
     while step < max_steps:
-        gi = min(step, ng - 1)                                       # replay g, clamp at end
         ee_pos = np.asarray(obs["robot0_eef_pos"], np.float32)
         eq = np.asarray(obs["robot0_eef_quat"], np.float32)          # xyzw
         ee_quat_wxyz = np.array([eq[3], eq[0], eq[1], eq[2]], np.float32)
         grip = np.asarray(obs["robot0_gripper_qpos"], np.float32)
+        if g_mode == "nearest":                                     # re-align plan to current state
+            d = np.sum((ref_pos - ee_pos) ** 2, 1) + 5.0 * np.sum((ref_grip - grip) ** 2, 1)
+            gi = int(np.argmin(d))
+        else:
+            gi = min(step, ng - 1)
         proprio = np.concatenate([ee_pos, ee_quat_wxyz, grip])
         obj_pos = sim.data.body_xpos[target_bid].astype(np.float32).copy()
         obj_quat = sim.data.body_xquat[target_bid].astype(np.float32).copy()  # wxyz
@@ -104,6 +113,7 @@ def main():
     p.add_argument("--replan", type=int, default=8)
     p.add_argument("--horizon", type=int, default=16)
     p.add_argument("--sample-steps", type=int, default=10)
+    p.add_argument("--g-mode", choices=["step", "nearest"], default="step")
     p.add_argument("--seed", type=int, default=7)
     args = p.parse_args()
 
@@ -134,8 +144,9 @@ def main():
         d = np.load(f, allow_pickle=True)
         target_name = out["target_name"]
         ref = {"init_state_libero": d["init_state_libero"],
-               "g_pos": out["g_pos"], "g_quat": out["g_quat"]}
-        ok = rollout(net, env, ref, target_name, args.replan, max_steps, args.sample_steps)
+               "g_pos": out["g_pos"], "g_quat": out["g_quat"], "proprio": out["proprio"]}
+        ok = rollout(net, env, ref, target_name, args.replan, max_steps,
+                     args.sample_steps, g_mode=args.g_mode)
         succ += ok
         print(f"  [{i+1}/{len(files)}] target={target_name:28s} -> {'OK' if ok else 'FAIL'} "
               f"(running {succ}/{i+1})", flush=True)
