@@ -116,6 +116,12 @@ class MotorHead(nn.Module):
         super().__init__()
         self.H, self.A, self.equivariant = horizon, action_dim, True
         self.chunk_dim = horizon * action_dim
+        # normalizer (identity by default; train_distill fits it from data and
+        # stores it in the checkpoint). Flow trains in normalized space.
+        self.register_buffer("cond_mean", torch.zeros(cond_dim))
+        self.register_buffer("cond_std", torch.ones(cond_dim))
+        self.register_buffer("chunk_mean", torch.zeros(self.chunk_dim))
+        self.register_buffer("chunk_std", torch.ones(self.chunk_dim))
         self.cond_enc = nn.Sequential(nn.Linear(cond_dim, hidden), nn.SiLU(),
                                       nn.Linear(hidden, hidden))
         self.net = nn.Sequential(
@@ -132,7 +138,9 @@ class MotorHead(nn.Module):
     def loss(self, g_pos, g_quat, proprio, chunk, obj_pos, obj_quat):
         """Rectified-flow loss in canonical space."""
         cond, psi = cond_vector(g_pos, g_quat, proprio, obj_pos, obj_quat, self.equivariant)
+        cond = (cond - self.cond_mean) / self.cond_std
         x1 = chunk_to_canonical(chunk, psi).reshape(chunk.shape[0], -1)
+        x1 = (x1 - self.chunk_mean) / self.chunk_std
         x0 = torch.randn_like(x1)
         t = torch.rand(x1.shape[0], device=x1.device)
         x_t = (1 - t)[:, None] * x0 + t[:, None] * x1
@@ -144,6 +152,7 @@ class MotorHead(nn.Module):
     def sample(self, g_pos, g_quat, proprio, obj_pos, obj_quat, steps=10):
         """Integrate the flow; return a WORLD-frame action chunk [B,H,7]."""
         cond, psi = cond_vector(g_pos, g_quat, proprio, obj_pos, obj_quat, self.equivariant)
+        cond = (cond - self.cond_mean) / self.cond_std
         cond_emb = self.cond_enc(cond)
         B = g_pos.shape[0]
         x = torch.randn(B, self.chunk_dim, device=g_pos.device)
@@ -151,5 +160,6 @@ class MotorHead(nn.Module):
         for i in range(steps):
             t = torch.full((B,), i * dt, device=g_pos.device)
             x = x + dt * self.velocity(x, t, cond_emb)
+        x = x * self.chunk_std + self.chunk_mean              # denormalize
         chunk_c = x.reshape(B, self.H, self.A)
         return chunk_from_canonical(chunk_c, psi)
