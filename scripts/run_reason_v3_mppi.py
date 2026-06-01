@@ -1317,20 +1317,24 @@ def main():
 
     env.close()
 
-    base = results["baseline"]["success_rate"]
-    mp = results["mppi"]["success_rate"]
-    delta_pp = (mp - base) * 100
+    base = results.get("baseline", {}).get("success_rate")
+    mp = results.get("mppi", {}).get("success_rate")
+    delta_pp = (mp - base) * 100 if (base is not None and mp is not None) else None
     print(f"\n{'='*70}", flush=True)
-    print(f"baseline:   {base*100:5.1f}% ({results['baseline']['successes']}/{trials})", flush=True)
-    print(f"mppi:       {mp*100:5.1f}% ({results['mppi']['successes']}/{trials})", flush=True)
-    print(f"delta:      {delta_pp:+.1f} pp", flush=True)
-    print(f"{'='*70}", flush=True)
-    if delta_pp >= 3:
-        print("✓ PASS: MPPI mechanism validates (≥+3pp).", flush=True)
-    elif delta_pp >= -2:
-        print("≈ FLAT: tune K / σ / λ / weights, OR target may be wrong.", flush=True)
+    for m in args.modes:
+        rr = results[m]
+        print(f"{m:10s}: {rr['success_rate']*100:5.1f}% ({rr['successes']}/{trials})", flush=True)
+    if delta_pp is not None:
+        print(f"delta:      {delta_pp:+.1f} pp", flush=True)
+        print(f"{'='*70}", flush=True)
+        if delta_pp >= 3:
+            print("✓ PASS: MPPI mechanism validates (≥+3pp).", flush=True)
+        elif delta_pp >= -2:
+            print("≈ FLAT: tune K / σ / λ / weights, OR target may be wrong.", flush=True)
+        else:
+            print("✗ FAIL: MPPI actively hurting — diagnose cost function.", flush=True)
     else:
-        print("✗ FAIL: MPPI actively hurting — diagnose cost function.", flush=True)
+        print(f"{'='*70}", flush=True)
 
     payload = {
         "args": vars(args),
