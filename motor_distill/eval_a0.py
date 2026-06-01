@@ -54,11 +54,14 @@ def _t(x):
     return torch.tensor(np.asarray(x, dtype=np.float32)[None])      # [1, d]
 
 
-def rollout(net, env, sim, ref, target_bid, replan, max_steps, sample_steps=10):
+def rollout(net, env, ref, target_name, replan, max_steps, sample_steps=10):
     """One head-driven rollout with g replayed from the reference trace.
     Returns True iff BDDL success (env done)."""
     env.reset()
     obs = env.set_init_state(ref["init_state_libero"])
+    # env.env.sim is REBUILT on reset() — grab it fresh here, not before.
+    sim = env.env.sim
+    target_bid = int(sim.model.body_name2id(target_name))
     g_pos, g_quat = ref["g_pos"], ref["g_quat"]
     ng = len(g_pos)
     done = False
@@ -117,7 +120,6 @@ def main():
                              camera_heights=LIBERO_ENV_RESOLUTION,
                              camera_widths=LIBERO_ENV_RESOLUTION)
     env.seed(args.seed)
-    sim = env.env.sim
     max_steps = MAX_STEPS[args.task_suite]
     print(f"task {args.task_idx}: {task.language}", flush=True)
 
@@ -131,10 +133,9 @@ def main():
         out = rekey.build_pairs(f, rekey.RekeyConfig(horizon=args.horizon))
         d = np.load(f, allow_pickle=True)
         target_name = out["target_name"]
-        target_bid = int(sim.model.body_name2id(target_name))
         ref = {"init_state_libero": d["init_state_libero"],
                "g_pos": out["g_pos"], "g_quat": out["g_quat"]}
-        ok = rollout(net, env, sim, ref, target_bid, args.replan, max_steps, args.sample_steps)
+        ok = rollout(net, env, ref, target_name, args.replan, max_steps, args.sample_steps)
         succ += ok
         print(f"  [{i+1}/{len(files)}] target={target_name:28s} -> {'OK' if ok else 'FAIL'} "
               f"(running {succ}/{i+1})", flush=True)
