@@ -111,6 +111,8 @@ def test_build_pairs_end_to_end():
         assert out["g_quat"].shape == (N, 4)
         assert out["proprio"].shape == (N, 9)
         assert out["chunk"].shape == (N, 16, 7)
+        assert out["obj_pos"].shape == (N, 3)
+        assert out["obj_quat"].shape == (N, 4)
         # most-displaced object is index 1 (the 0.3m-moving one)
         assert out["target_index"] == 1
         # explicit name selection works

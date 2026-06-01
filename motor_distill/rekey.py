@@ -153,7 +153,7 @@ def build_pairs(npz_path: str | pathlib.Path, cfg: RekeyConfig = RekeyConfig()):
     ti = select_target_object(obj_pos, names, cfg.target_name)
     ee_quat_wxyz = np.stack([quat_xyzw_to_wxyz(q) for q in ee_quat_xyzw])  # [T, 4]
 
-    g_pos, g_quat, proprio, chunk = [], [], [], []
+    g_pos, g_quat, proprio, chunk, otpos, otquat = [], [], [], [], [], []
     for t in range(T - H):
         rp, rq = ee_in_object_frame(
             ee_pos[t + H], ee_quat_wxyz[t + H], obj_pos[t, ti], obj_quat[t, ti])
@@ -161,12 +161,16 @@ def build_pairs(npz_path: str | pathlib.Path, cfg: RekeyConfig = RekeyConfig()):
         g_quat.append(rq)
         proprio.append(np.concatenate([ee_pos[t], ee_quat_wxyz[t], grip[t]]))
         chunk.append(actions[t:t + H])
+        otpos.append(obj_pos[t, ti])          # target object world pose at t —
+        otquat.append(obj_quat[t, ti])         # needed for yaw-canonicalization + closed-loop
 
     return {
         "g_pos": np.stack(g_pos),
         "g_quat": np.stack(g_quat),
         "proprio": np.stack(proprio),
         "chunk": np.stack(chunk),
+        "obj_pos": np.stack(otpos),            # [N, 3]
+        "obj_quat": np.stack(otquat),          # [N, 4] scalar-first
         "target_index": ti,
         "target_name": str(names[ti]),
         "success": bool(d["success"]),
