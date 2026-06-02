@@ -54,6 +54,7 @@ def extract_for_dir(model, files, bs=8):
         if imgs.shape[0] == 0:
             continue
         base = resize224(imgs); wr = resize224(wrist)
+        it = np.clip(it, 0, d["object_pos"].shape[0] - 1)     # image_t can exceed logged steps by a few
         labels = d["object_pos"][it, ti]                      # object position at each image's timestep
         for b in range(0, base.shape[0], bs):
             data = {
