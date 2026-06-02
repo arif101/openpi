@@ -47,11 +47,16 @@ def derive_grasp(files, horizon):
         tg = int(clos[0])
         rp, rq = ee_in_object_frame(ee_p[tg], quat_xyzw_to_wxyz(ee_q[tg]), op[tg, ti], oq[tg, ti])
         pos.append(rp); quat.append(rq)
+        # max_disp = per-step LOOKAHEAD magnitude ||g - current_EE_in_obj||, NOT ||g||
+        # (||g|| is EE-to-object distance; the head's g is a short H-step motion).
         o = rekey.build_pairs(f, rekey.RekeyConfig(horizon=horizon))
-        gmags.append(np.linalg.norm(o["g_pos"], axis=1))
+        g, pr2, op2, oq2 = o["g_pos"], o["proprio"], o["obj_pos"], o["obj_quat"]
+        for t in range(len(g)):
+            er, _ = ee_in_object_frame(pr2[t, :3], pr2[t, 3:7], op2[t], oq2[t])
+            gmags.append(np.linalg.norm(g[t] - er))
     grasp_pos = np.mean(pos, 0).astype(np.float32)
     grasp_quat = quat_normalize(np.mean(quat, 0)).astype(np.float32)
-    max_disp = float(np.percentile(np.concatenate(gmags), 95))
+    max_disp = float(np.percentile(np.asarray(gmags), 95))
     return grasp_pos, grasp_quat, max_disp, tname
 
 
