@@ -73,32 +73,43 @@ def derive(files, horizon):
     return grasp_pos, grasp_quat, tname, dmp, act_per_unit
 
 
-def grasp_rollout(env, init_state, tname, grasp_pos, grasp_quat, dmp, apu, kp_rot=3.0):
+def grasp_rollout(env, init_state, tname, grasp_pos, grasp_quat, dmp, apu, kp_rot=3.0, debug=False):
     env.reset(); obs = env.set_init_state(init_state)
     sim = env.env.sim; bid = int(sim.model.body_name2id(tname))
     z0 = float(sim.data.body_xpos[bid][2])
-    st = dmp.reset(); dphase = 1.0 / PHASE_STEPS
+    # initialize the DMP at the ROBOT's actual start (object frame), not the demo's
+    E0 = np.asarray(obs["robot0_eef_pos"], np.float32)
+    eq0 = np.asarray(obs["robot0_eef_quat"], np.float32)
+    Eq0 = np.array([eq0[3], eq0[0], eq0[1], eq0[2]], np.float32)
+    O0p = sim.data.body_xpos[bid].astype(np.float32).copy()
+    O0q = sim.data.body_xquat[bid].astype(np.float32).copy()
+    e_rel0, _ = ee_in_object_frame(E0, Eq0, O0p, O0q)
+    st = {"x": e_rel0.copy().astype(np.float64), "v": np.zeros(3), "s": 1.0}
+    x0_run = e_rel0.astype(np.float64)
+    dphase = 1.0 / PHASE_STEPS
+    min_d, closed = 9.9, False
     for step in range(GRASP_MAX_STEPS):
         E_pos = np.asarray(obs["robot0_eef_pos"], np.float32)
         eq = np.asarray(obs["robot0_eef_quat"], np.float32)
         E_q = np.array([eq[3], eq[0], eq[1], eq[2]], np.float32)
         O_pos = sim.data.body_xpos[bid].astype(np.float32).copy()
         O_quat = sim.data.body_xquat[bid].astype(np.float32).copy()
-        # advance DMP toward grasp_pos (object frame); desired pos -> world
-        dmp.step(st, grasp_pos, dt=dphase, x0=dmp.x0)
+        dmp.step(st, grasp_pos.astype(np.float64), dt=dphase, x0=x0_run)
         desired_world = O_pos + quat_rotate(O_quat, st["x"].astype(np.float32))
         a_pos = np.clip((desired_world - E_pos) / apu, -1, 1)
-        # orientation: proportional toward grasp orientation (object->world)
         tgt_q = quat_mul(O_quat, grasp_quat)
         err = quat_mul(tgt_q, quat_conj(quat_normalize(E_q)))
         a_rot = np.clip(kp_rot * axisangle_from_quat(err), -1, 1)
-        # gripper: close when EE near grasp pose (object frame)
         e_rel, _ = ee_in_object_frame(E_pos, E_q, O_pos, O_quat)
-        grip = 1.0 if np.linalg.norm(e_rel - grasp_pos) < GRIP_EPS else -1.0
+        dist = float(np.linalg.norm(e_rel - grasp_pos))
+        min_d = min(min_d, dist)
+        grip = 1.0 if dist < GRIP_EPS else -1.0
+        if grip > 0:
+            closed = True
         obs, _, done, _ = env.step([*a_pos, *a_rot, grip])
         if float(sim.data.body_xpos[bid][2]) - z0 > LIFT_M:
-            return True
-    return False
+            return (True, min_d, closed) if debug else True
+    return (False, min_d, closed) if debug else False
 
 
 def main():
@@ -110,6 +121,7 @@ def main():
     p.add_argument("--n", type=int, default=40)
     p.add_argument("--horizon", type=int, default=16)
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -134,9 +146,15 @@ def main():
     head = 0
     for i, f in enumerate(test_files):
         init = np.load(f, allow_pickle=True)["init_state_libero"]
-        ok = grasp_rollout(env, init, tname, grasp_pos, grasp_quat, dmp, apu)
+        r = grasp_rollout(env, init, tname, grasp_pos, grasp_quat, dmp, apu, debug=args.debug)
+        if args.debug:
+            ok, min_d, closed = r
+            print(f"  [{i+1}/{len(test_files)}] {'LIFT' if ok else '----'} "
+                  f"min_approach={min_d:.3f}m gripper_closed={closed} (dmp {head+ok}/{i+1})", flush=True)
+        else:
+            ok = r
+            print(f"  [{i+1}/{len(test_files)}] {'LIFT' if ok else '----'} (dmp {head+ok}/{i+1})", flush=True)
         head += ok
-        print(f"  [{i+1}/{len(test_files)}] {'LIFT' if ok else '----'} (dmp {head}/{i+1})", flush=True)
     n = len(test_files)
     pert = args.pert_dir.split("pert")[-1]
     print(f"\nDMP-GRASP task {args.task_idx} pert={pert}: DMP-lift {head}/{n}={head/n*100:.1f}%  "
