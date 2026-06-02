@@ -44,8 +44,8 @@ def fit_eval(Xtr, Ytr, Xte, Yte, epochs=1500):
         loss.backward(); opt.step()
     with torch.no_grad():
         pred = head(Xte_t).cpu().numpy(); ptr = head(Xtr_t).cpu().numpy()
-    return (np.linalg.norm(pred - Yte, -1).mean(), np.median(np.linalg.norm(pred - Yte, -1)),
-            np.linalg.norm(ptr - Ytr, -1).mean())
+    return (np.linalg.norm(pred - Yte, axis=-1).mean(), np.median(np.linalg.norm(pred - Yte, axis=-1)),
+            np.linalg.norm(ptr - Ytr, axis=-1).mean())
 
 
 def main():
@@ -61,7 +61,7 @@ def main():
     te_ids = set(utid[:n_te].tolist()); train_ids = utid[n_te:]
     te = np.array([t in te_ids for t in tid])
     Xte, Yte = X[te], Y[te]
-    base = np.linalg.norm(Yte - Y[~te].mean(0), -1)
+    base = np.linalg.norm(Yte - Y[~te].mean(0), axis=-1)
     print(f"{len(utid)} traces, held-out {n_te} ({te.sum()} frames). "
           f"predict-mean test {base.mean()*100:.1f}cm / med {np.median(base)*100:.1f}cm\n", flush=True)
     print(f"{'n_train_traces':>14s}  {'TRAIN':>6s}  {'test-mean':>9s}  {'test-med':>8s}", flush=True)
