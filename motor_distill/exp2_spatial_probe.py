@@ -116,54 +116,71 @@ def get_features(args):
     return X, Y, tid
 
 
-class KeypointHead:
+import torch
+torch.set_num_threads(8)
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class KeypointHead(torch.nn.Module):
     """Spatial soft-argmax: grid -> K heatmaps -> K (u,v) -> MLP -> xyz."""
     def __init__(self, D, K=16):
-        import torch
-        self.torch = torch
+        super().__init__()
         self.detect = torch.nn.Linear(D, K)
         self.mlp = torch.nn.Sequential(torch.nn.Linear(2 * K, 128), torch.nn.SiLU(),
                                        torch.nn.Linear(128, 64), torch.nn.SiLU(),
                                        torch.nn.Linear(64, 3))
         ys, xs = torch.meshgrid(torch.linspace(0, 1, GRID), torch.linspace(0, 1, GRID), indexing="ij")
-        self.xs = xs.reshape(-1); self.ys = ys.reshape(-1)
-        self.params = list(self.detect.parameters()) + list(self.mlp.parameters())
+        self.register_buffer("xs", xs.reshape(-1)); self.register_buffer("ys", ys.reshape(-1))
 
     def forward(self, X):                                  # X [B,196,D]
-        torch = self.torch
         attn = torch.softmax(self.detect(X), dim=1)        # [B,196,K]
         u = (attn * self.xs[None, :, None]).sum(1)
         v = (attn * self.ys[None, :, None]).sum(1)
         return self.mlp(torch.cat([u, v], dim=1))
 
 
-class PooledHead:
-    """Mean-pool the grid -> MLP -> xyz (the old representation, same protocol)."""
-    def __init__(self, D):
-        import torch
-        self.torch = torch
-        self.norm = None
+class PooledHead(torch.nn.Module):
+    """Mean-pool the grid -> MLP -> xyz (the old representation, fair head)."""
+    def __init__(self, D, **kw):
+        super().__init__()
         self.mlp = torch.nn.Sequential(torch.nn.Linear(D, 256), torch.nn.SiLU(),
                                        torch.nn.Linear(256, 64), torch.nn.SiLU(),
                                        torch.nn.Linear(64, 3))
-        self.params = list(self.mlp.parameters())
 
     def forward(self, X):
         return self.mlp(X.mean(1))
 
 
+class AttnPoolHead(torch.nn.Module):
+    """Learned-query cross-attention pool (no peak assumption) -> MLP -> xyz."""
+    def __init__(self, D, n_query=8, dim=256):
+        super().__init__()
+        self.proj = torch.nn.Linear(D, dim)
+        self.q = torch.nn.Parameter(torch.randn(n_query, dim) * 0.02)
+        self.attn = torch.nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(n_query * dim, 256), torch.nn.SiLU(),
+                                       torch.nn.Linear(256, 64), torch.nn.SiLU(),
+                                       torch.nn.Linear(64, 3))
+
+    def forward(self, X):                                  # X [B,196,D]
+        kv = self.proj(X)
+        q = self.q[None].expand(X.shape[0], -1, -1)
+        out, _ = self.attn(q, kv, kv)                      # [B,n_query,dim]
+        return self.mlp(out.reshape(out.shape[0], -1))
+
+
 def train_eval(HeadCls, name, Xtr, Ytr, Xte, Yte, epochs=1500, **kw):
-    import torch
-    head = HeadCls(Xtr.shape[-1], **kw)
-    Xtr_t = torch.tensor(Xtr); Yt = torch.tensor(Ytr)
+    head = HeadCls(Xtr.shape[-1], **kw).to(DEV)
+    Xtr_t = torch.tensor(Xtr, device=DEV); Xte_t = torch.tensor(Xte, device=DEV)
+    Yt = torch.tensor(Ytr, device=DEV)
     mu, sd = Yt.mean(0), Yt.std(0) + 1e-6
-    opt = torch.optim.Adam(head.params, 1e-3)
+    opt = torch.optim.Adam(head.parameters(), 1e-3)
     for ep in range(epochs):
         opt.zero_grad()
-        loss = (((head.forward(Xtr_t) - mu) / sd - (Yt - mu) / sd) ** 2).mean()
+        loss = (((head(Xtr_t) - mu) / sd - (Yt - mu) / sd) ** 2).mean()
         loss.backward(); opt.step()
     with torch.no_grad():
-        pred = head.forward(torch.tensor(Xte)).numpy()
+        pred = head(Xte_t).cpu().numpy()
     err = np.linalg.norm(pred - Yte, axis=-1)
     ax = np.abs(pred - Yte).mean(0)
     return err.mean(), np.median(err), ax
@@ -195,19 +212,28 @@ def main():
     print(f"predict-mean (held-out): mean {spread.mean()*100:.1f}cm  median {np.median(spread)*100:.1f}cm  "
           f"per-axis {np.abs(Yte-Ytr.mean(0)).mean(0).round(3)}\n", flush=True)
 
-    print("training SPATIAL keypoint head ...", flush=True)
-    sm, smd, sax = train_eval(KeypointHead, "spatial", X[tr], Ytr, X[te], Yte, K=16)
-    print("training POOLED mlp head ...", flush=True)
-    pm, pmd, pax = train_eval(PooledHead, "pooled", X[tr], Ytr, X[te], Yte)
+    print(f"device={DEV}\n", flush=True)
+    runs = [
+        ("keypoint K=16", KeypointHead, {"K": 16}),
+        ("keypoint K=32", KeypointHead, {"K": 32}),
+        ("attn-pool q=8", AttnPoolHead, {}),
+        ("pooled MLP", PooledHead, {}),
+    ]
+    results = []
+    for name, cls, kw in runs:
+        print(f"training {name} ...", flush=True)
+        m, md, ax = train_eval(cls, name, X[tr], Ytr, X[te], Yte, **kw)
+        results.append((name, m, md, ax))
 
     print("\n=== EXP 2 CORRECTED (pooled data, trace-split): object-position error (cm) ===", flush=True)
-    print(f"  predict-mean baseline : mean {spread.mean()*100:5.1f}  median {np.median(spread)*100:5.1f}", flush=True)
-    print(f"  SPATIAL keypoint head : mean {sm*100:5.1f}  median {smd*100:5.1f}  per-axis(cm) {(sax*100).round(1)}", flush=True)
-    print(f"  POOLED mlp head       : mean {pm*100:5.1f}  median {pmd*100:5.1f}  per-axis(cm) {(pax*100).round(1)}", flush=True)
-    best = min(sm, pm)
+    print(f"  {'predict-mean baseline':22s}: mean {spread.mean()*100:5.1f}  median {np.median(spread)*100:5.1f}", flush=True)
+    for name, m, md, ax in results:
+        print(f"  {name:22s}: mean {m*100:5.1f}  median {md*100:5.1f}  per-axis(cm) {(ax*100).round(1)}", flush=True)
+    best = min(m for _, m, _, _ in results)
+    bestname = min(results, key=lambda r: r[1])[0]
     verdict = ("LOCALIZES (beats predict-mean) -> world encoder viable" if best < 0.6 * spread.mean()
                else "TIES predict-mean -> features do NOT localize -> perception wall")
-    print(f"\nVERDICT: best head {best*100:.1f}cm vs predict-mean {spread.mean()*100:.1f}cm -> {verdict}", flush=True)
+    print(f"\nVERDICT: best={bestname} {best*100:.1f}cm vs predict-mean {spread.mean()*100:.1f}cm -> {verdict}", flush=True)
     print("SPATIAL_PROBE_EXIT=0", flush=True)
 
 
