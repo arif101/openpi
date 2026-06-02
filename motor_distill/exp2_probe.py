@@ -45,29 +45,41 @@ def resize224(imgs):
     return np.asarray(jnp.clip(out, 0, 255).astype(jnp.uint8))
 
 
-def extract_for_dir(model, files, bs=8):
-    feats, pos = [], []
+N_FRAMES = 6                                                  # first few frames/trace (object static)
+BS = 8
+
+
+def extract_for_dir(model, files):
+    # gather all frames first, then process in FIXED-size batches (one JIT compile)
+    bases, wrists, labels = [], [], []
     for f in files:
         d = np.load(f, allow_pickle=True)
         imgs, wrist, it = d["image"], d["wrist_image"], d["image_t"]
-        names = list(d["object_names"]); ti = rekey.select_target_object(d["object_pos"], names)
         if imgs.shape[0] == 0:
             continue
-        base = resize224(imgs); wr = resize224(wrist)
-        it = np.clip(it, 0, d["object_pos"].shape[0] - 1)     # image_t can exceed logged steps by a few
-        labels = d["object_pos"][it, ti]                      # object position at each image's timestep
-        for b in range(0, base.shape[0], bs):
-            data = {
-                "image": {"base_0_rgb": base[b:b+bs],
-                          "left_wrist_0_rgb": wr[b:b+bs],
-                          "right_wrist_0_rgb": np.zeros_like(base[b:b+bs])},
-                "image_mask": {k: np.ones(base[b:b+bs].shape[0], bool)
-                               for k in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")},
-                "state": np.zeros((base[b:b+bs].shape[0], 32), np.float32),  # prefix features ignore state
-            }
-            feats.append(extract_features_from_dict(model, data))
-            pos.append(labels[b:b+bs])
-    return np.concatenate(feats), np.concatenate(pos)
+        k = min(N_FRAMES, imgs.shape[0])
+        names = list(d["object_names"]); ti = rekey.select_target_object(d["object_pos"], names)
+        it = np.clip(it[:k], 0, d["object_pos"].shape[0] - 1)
+        bases.append(resize224(imgs[:k])); wrists.append(resize224(wrist[:k]))
+        labels.append(d["object_pos"][it, ti])
+    base = np.concatenate(bases); wr = np.concatenate(wrists); lab = np.concatenate(labels)
+    feats = []
+    for b in range(0, base.shape[0], BS):
+        bb, ww = base[b:b+BS], wr[b:b+BS]
+        pad = BS - bb.shape[0]                                 # pad last batch to fixed BS -> no recompile
+        if pad:
+            bb = np.concatenate([bb, np.repeat(bb[-1:], pad, 0)])
+            ww = np.concatenate([ww, np.repeat(ww[-1:], pad, 0)])
+        data = {
+            "image": {"base_0_rgb": bb, "left_wrist_0_rgb": ww, "right_wrist_0_rgb": np.zeros_like(bb)},
+            "image_mask": {k_: np.ones(BS, bool) for k_ in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")},
+            "state": np.zeros((BS, 32), np.float32),
+        }
+        h = extract_features_from_dict(model, data)
+        feats.append(h[: bb.shape[0] - pad] if pad else h)
+        if (b // BS) % 10 == 0:
+            print(f"    batch {b//BS}/{(base.shape[0]+BS-1)//BS}", flush=True)
+    return np.concatenate(feats), lab
 
 
 def mlp_probe(Xtr, Ytr, Xte_dict, epochs=300):
