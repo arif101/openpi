@@ -1,18 +1,27 @@
-"""Exp 2 (SPATIAL re-test): do Pi0.5's frozen VLM features encode object POSITION
-when read SPATIALLY (per-token grid) instead of mean-pooled?
+"""Exp 2 (SPATIAL re-test, CORRECTED protocol): do Pi0.5's frozen VLM features
+encode object POSITION?
 
-The pooled probe (exp2_probe.py) failed: 12.8cm in-dist, 24-31cm OOD. Diagnosis:
-mean-pooling averages over all tokens -> destroys WHERE the object is. Pi0.5 itself
-localizes via the per-token spatial grid (attention), not a pooled vector. This
-re-test uses the un-pooled base-camera 14x14 patch grid with a spatial soft-argmax
-keypoint head (the standard way to extract position from a feature map) -> object xyz.
+History:
+  v0 (pooled, train pert0 / eval OOD): 12.8cm in-dist, 24-31cm OOD.
+  v1 (spatial keypoint, train pert0 / eval OOD): 2/5.5/8.6cm — BUT tied the
+     predict-mean baseline on every split. label-spread in pert0 is only 1.8cm:
+     the training data has ~no object-position variation, so the probe just
+     learns the mean. The test was DEGENERATE (can't fit a regressor when the
+     target is ~constant in training).
 
-Gate (unchanged): if pert5/pert10 error ~<=3cm -> spatial features localize OOD ->
-world encoder viable. If still large -> perception is the genuine wall (the VLM, not
-our handling). We also print a PREDICT-MEAN baseline + label spread per split so we
-can tell "probe learned nothing (=mean)" apart from "probe localizes."
+CORRECTED protocol (this file): POOL pert0+5+10 (together ~6-8cm of real position
+variation), split by TRACE (held-out positions unseen), standardize targets, and
+compare two read-outs of the SAME frozen VLM features against predict-mean:
+  - SPATIAL : base-camera 14x14 patch grid -> soft-argmax keypoint head -> xyz.
+  - POOLED  : mean-pooled grid -> MLP -> xyz  (the old representation, fair head).
+predict-mean (always output train-mean position) is the bar both must beat.
 
-Train on pert0, eval on pert0-val + pert5 + pert10. Position error in cm.
+Read: head-error << predict-mean => VLM features carry grasp-precise position ->
+world encoder viable. head-error ~= predict-mean => features don't localize ->
+the genuine perception wall (the VLM, not our handling).
+
+Features are cached to <data>/exp2_spatial_cache.npz so head/split iterations
+don't re-run the VLM.
 """
 from __future__ import annotations
 
@@ -31,8 +40,8 @@ from openpi.shared import download
 import rekey
 
 
-GRID = 14                 # 224/16 patches per side
-N_BASE = GRID * GRID       # 196 base-camera patch tokens (base camera = first image in prefix)
+GRID = 14
+N_BASE = GRID * GRID       # 196 base-camera patch tokens
 N_FRAMES = 6
 BS = 8
 
@@ -51,9 +60,9 @@ def resize224(imgs):
     return np.asarray(jnp.clip(out, 0, 255).astype(jnp.uint8))
 
 
-def extract_for_dir(model, files):
-    bases, wrists, labels = [], [], []
-    for f in files:
+def extract_for_dir(model, files, tid_start):
+    bases, wrists, labels, tids = [], [], [], []
+    for ti_, f in enumerate(files):
         d = np.load(f, allow_pickle=True)
         imgs, wrist, it = d["image"], d["wrist_image"], d["image_t"]
         if imgs.shape[0] == 0:
@@ -63,7 +72,9 @@ def extract_for_dir(model, files):
         it = np.clip(it[:k], 0, d["object_pos"].shape[0] - 1)
         bases.append(resize224(imgs[:k])); wrists.append(resize224(wrist[:k]))
         labels.append(d["object_pos"][it, ti])
-    base = np.concatenate(bases); wr = np.concatenate(wrists); lab = np.concatenate(labels)
+        tids.append(np.full(k, tid_start + ti_, np.int32))
+    base = np.concatenate(bases); wr = np.concatenate(wrists)
+    lab = np.concatenate(labels); tid = np.concatenate(tids)
     grids = []
     for b in range(0, base.shape[0], BS):
         bb, ww = base[b:b+BS], wr[b:b+BS]
@@ -76,60 +87,86 @@ def extract_for_dir(model, files):
             "image_mask": {k_: np.ones(BS, bool) for k_ in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")},
             "state": np.zeros((BS, 32), np.float32),
         }
-        prefix_out, _ = extract_spatial_features_from_dict(model, data)   # [BS, seq, D]
-        g = prefix_out[:, :N_BASE]                                        # base-camera 14x14 grid
+        prefix_out, _ = extract_spatial_features_from_dict(model, data)
+        g = prefix_out[:, :N_BASE]
         grids.append(g[: bb.shape[0] - pad] if pad else g)
         if (b // BS) % 10 == 0:
             print(f"    batch {b//BS}/{(base.shape[0]+BS-1)//BS}", flush=True)
-    return np.concatenate(grids), lab                                    # [N,196,D], [N,3]
+    return np.concatenate(grids), lab, tid
+
+
+def get_features(args):
+    cache = pathlib.Path(args.data) / "exp2_spatial_cache.npz"
+    if cache.exists() and not args.refresh:
+        print(f"loading cached features {cache}", flush=True)
+        z = np.load(cache)
+        return z["X"], z["Y"], z["tid"]
+    model = load_model(args.ckpt)
+    pat = lambda pert: sorted(glob.glob(str(pathlib.Path(args.data) / f"pert{pert}" /
+                              f"PHYS_OK_{args.task_suite}_task{args.task_idx}_*baseline*.npz")))
+    Xs, Ys, Ts = [], [], []
+    base = 0
+    for pert in (0, 5, 10):
+        print(f"extracting pert{pert} ...", flush=True)
+        X, Y, T = extract_for_dir(model, pat(pert), base)
+        Xs.append(X); Ys.append(Y); Ts.append(T); base = int(T.max()) + 1
+    X = np.concatenate(Xs); Y = np.concatenate(Ys).astype(np.float32); tid = np.concatenate(Ts)
+    np.savez(cache, X=X, Y=Y, tid=tid)
+    print(f"cached {X.shape} -> {cache}", flush=True)
+    return X, Y, tid
 
 
 class KeypointHead:
-    """Spatial soft-argmax keypoint readout: D-dim grid -> K heatmaps -> K (u,v) -> MLP -> xyz."""
+    """Spatial soft-argmax: grid -> K heatmaps -> K (u,v) -> MLP -> xyz."""
     def __init__(self, D, K=16):
         import torch
         self.torch = torch
-        self.detect = torch.nn.Linear(D, K)                              # 1x1 conv over grid
+        self.detect = torch.nn.Linear(D, K)
         self.mlp = torch.nn.Sequential(torch.nn.Linear(2 * K, 128), torch.nn.SiLU(),
                                        torch.nn.Linear(128, 64), torch.nn.SiLU(),
                                        torch.nn.Linear(64, 3))
         ys, xs = torch.meshgrid(torch.linspace(0, 1, GRID), torch.linspace(0, 1, GRID), indexing="ij")
-        self.xs = xs.reshape(-1); self.ys = ys.reshape(-1)               # [196]
+        self.xs = xs.reshape(-1); self.ys = ys.reshape(-1)
         self.params = list(self.detect.parameters()) + list(self.mlp.parameters())
 
-    def forward(self, X):                                                # X [B,196,D]
+    def forward(self, X):                                  # X [B,196,D]
         torch = self.torch
-        heat = self.detect(X)                                            # [B,196,K]
-        attn = torch.softmax(heat, dim=1)                                # spatial softmax per channel
-        u = (attn * self.xs[None, :, None]).sum(1)                       # [B,K]
-        v = (attn * self.ys[None, :, None]).sum(1)                       # [B,K]
-        kp = torch.cat([u, v], dim=1)                                    # [B,2K]
-        return self.mlp(kp)
+        attn = torch.softmax(self.detect(X), dim=1)        # [B,196,K]
+        u = (attn * self.xs[None, :, None]).sum(1)
+        v = (attn * self.ys[None, :, None]).sum(1)
+        return self.mlp(torch.cat([u, v], dim=1))
 
 
-def run_probe(Xtr, Ytr, Xte_dict, epochs=600, K=16):
+class PooledHead:
+    """Mean-pool the grid -> MLP -> xyz (the old representation, same protocol)."""
+    def __init__(self, D):
+        import torch
+        self.torch = torch
+        self.norm = None
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(D, 256), torch.nn.SiLU(),
+                                       torch.nn.Linear(256, 64), torch.nn.SiLU(),
+                                       torch.nn.Linear(64, 3))
+        self.params = list(self.mlp.parameters())
+
+    def forward(self, X):
+        return self.mlp(X.mean(1))
+
+
+def train_eval(HeadCls, name, Xtr, Ytr, Xte, Yte, epochs=1500, **kw):
     import torch
-    head = KeypointHead(Xtr.shape[-1], K=K)
-    Xtr = torch.tensor(Xtr); Ytr = torch.tensor(Ytr)
-    mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6                              # normalize targets
-    opt = torch.optim.Adam(head.params, 2e-3)
+    head = HeadCls(Xtr.shape[-1], **kw)
+    Xtr_t = torch.tensor(Xtr); Yt = torch.tensor(Ytr)
+    mu, sd = Yt.mean(0), Yt.std(0) + 1e-6
+    opt = torch.optim.Adam(head.params, 1e-3)
     for ep in range(epochs):
         opt.zero_grad()
-        pred = head.forward(Xtr)
-        loss = (((pred - Ytr) / sd) ** 2).mean()
+        loss = (((head.forward(Xtr_t) - mu) / sd - (Yt - mu) / sd) ** 2).mean()
         loss.backward(); opt.step()
-        if ep % (epochs // 6) == 0 or ep == epochs - 1:
-            print(f"    [head] ep {ep} loss {loss.item():.4f}", flush=True)
-    out = {}
-    ymean = Ytr.mean(0)                                                  # predict-mean baseline (from train)
-    for name, (Xte, Yte) in Xte_dict.items():
-        with torch.no_grad():
-            pred = head.forward(torch.tensor(Xte)).numpy()
-        err = np.linalg.norm(pred - Yte, axis=-1)
-        base_err = np.linalg.norm(ymean.numpy() - Yte, axis=-1)         # error of always predicting train mean
-        spread = np.linalg.norm(Yte - Yte.mean(0), axis=-1).mean()      # label spread within this split
-        out[name] = (err.mean(), np.median(err), base_err.mean(), spread)
-    return out
+    with torch.no_grad():
+        pred = head.forward(torch.tensor(Xte)).numpy()
+    err = np.linalg.norm(pred - Yte, axis=-1)
+    ax = np.abs(pred - Yte).mean(0)
+    return err.mean(), np.median(err), ax
 
 
 def main():
@@ -138,25 +175,39 @@ def main():
     p.add_argument("--task-suite", default="libero_10")
     p.add_argument("--ckpt", default="gs://openpi-assets/checkpoints/pi05_libero/params")
     p.add_argument("--data", default="data/keystone")
-    p.add_argument("--K", type=int, default=16)
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
-    model = load_model(args.ckpt)
-    pat = lambda pert: sorted(glob.glob(str(pathlib.Path(args.data) / f"pert{pert}" /
-                              f"PHYS_OK_{args.task_suite}_task{args.task_idx}_*baseline*.npz")))
-    print("extracting SPATIAL features ...", flush=True)
-    X0, Y0 = extract_for_dir(model, pat(0))
-    X5, Y5 = extract_for_dir(model, pat(5))
-    X10, Y10 = extract_for_dir(model, pat(10))
-    n = X0.shape[0]; ntr = int(n * 0.8)
-    print(f"pert0 {n} grids {X0.shape}, pert5 {X5.shape[0]}, pert10 {X10.shape[0]}", flush=True)
-    res = run_probe(X0[:ntr], Y0[:ntr],
-                    {"pert0-val": (X0[ntr:], Y0[ntr:]), "pert5": (X5, Y5), "pert10": (X10, Y10)}, K=args.K)
-    print("\n=== EXP 2 SPATIAL PROBE: keypoint readout -> object position (cm) ===", flush=True)
-    print(f"{'split':10s}  {'probe-mean':>10s}  {'probe-med':>9s}  {'predict-mean':>12s}  {'label-spread':>12s}", flush=True)
-    for k, (m, md, bm, sp) in res.items():
-        print(f"{k:10s}  {m*100:9.1f}c  {md*100:8.1f}c  {bm*100:11.1f}c  {sp*100:11.1f}c", flush=True)
-    print("\nRead: probe << predict-mean => features carry position. probe ~= predict-mean => learned nothing.", flush=True)
-    print("Gate: pert5/pert10 probe-error ~<=3cm => spatial world encoder viable.", flush=True)
+
+    X, Y, tid = get_features(args)
+    rng = np.random.default_rng(args.seed)
+    utid = np.unique(tid); rng.shuffle(utid)
+    n_te = max(1, int(len(utid) * 0.2))
+    te_ids = set(utid[:n_te].tolist())
+    te = np.array([t in te_ids for t in tid]); tr = ~te
+    print(f"\npooled {X.shape}, {len(utid)} traces -> train {tr.sum()} / test {te.sum()} "
+          f"({len(utid)-n_te}/{n_te} traces)", flush=True)
+
+    Ytr, Yte = Y[tr], Y[te]
+    spread = np.linalg.norm(Yte - Ytr.mean(0), axis=-1)            # predict-mean error on held-out
+    print(f"label-spread (train): {np.linalg.norm(Ytr - Ytr.mean(0), axis=-1).mean()*100:.1f}cm  "
+          f"per-axis std {Ytr.std(0).round(3)}", flush=True)
+    print(f"predict-mean (held-out): mean {spread.mean()*100:.1f}cm  median {np.median(spread)*100:.1f}cm  "
+          f"per-axis {np.abs(Yte-Ytr.mean(0)).mean(0).round(3)}\n", flush=True)
+
+    print("training SPATIAL keypoint head ...", flush=True)
+    sm, smd, sax = train_eval(KeypointHead, "spatial", X[tr], Ytr, X[te], Yte, K=16)
+    print("training POOLED mlp head ...", flush=True)
+    pm, pmd, pax = train_eval(PooledHead, "pooled", X[tr], Ytr, X[te], Yte)
+
+    print("\n=== EXP 2 CORRECTED (pooled data, trace-split): object-position error (cm) ===", flush=True)
+    print(f"  predict-mean baseline : mean {spread.mean()*100:5.1f}  median {np.median(spread)*100:5.1f}", flush=True)
+    print(f"  SPATIAL keypoint head : mean {sm*100:5.1f}  median {smd*100:5.1f}  per-axis(cm) {(sax*100).round(1)}", flush=True)
+    print(f"  POOLED mlp head       : mean {pm*100:5.1f}  median {pmd*100:5.1f}  per-axis(cm) {(pax*100).round(1)}", flush=True)
+    best = min(sm, pm)
+    verdict = ("LOCALIZES (beats predict-mean) -> world encoder viable" if best < 0.6 * spread.mean()
+               else "TIES predict-mean -> features do NOT localize -> perception wall")
+    print(f"\nVERDICT: best head {best*100:.1f}cm vs predict-mean {spread.mean()*100:.1f}cm -> {verdict}", flush=True)
     print("SPATIAL_PROBE_EXIT=0", flush=True)
 
 
