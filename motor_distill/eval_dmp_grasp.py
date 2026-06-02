@@ -97,12 +97,12 @@ def grasp_rollout(env, init_state, tname, grasp_pos, grasp_quat, dmp, apu, kp_ro
         e_rel, _ = ee_in_object_frame(E_pos, E_q, O_pos, O_quat)
         dist = float(np.linalg.norm(e_rel - grasp_pos))
         min_d = min(min_d, dist)
-        if secured < 8:                                   # PHASE 1: approach grasp pose (DMP servo)
+        if secured < 18:                                  # PHASE 1: approach + settle + close fingers
             dmp.step(st, grasp_pos.astype(np.float64), dt=dphase, x0=x0_run)
             desired_world = O_pos + quat_rotate(O_quat, st["x"].astype(np.float32))
             a_pos = np.clip((desired_world - E_pos) / apu, -1, 1)
-            grip = 1.0 if dist < GRIP_EPS else -1.0
-            if grip > 0:
+            grip = 1.0 if dist < GRIP_EPS else -1.0       # close fingers once near
+            if dist < 0.012:                              # only count tight, settled contact
                 closed = True; secured += 1
             else:
                 secured = 0
