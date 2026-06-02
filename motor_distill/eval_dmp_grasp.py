@@ -87,25 +87,31 @@ def grasp_rollout(env, init_state, tname, grasp_pos, grasp_quat, dmp, apu, kp_ro
     st = {"x": e_rel0.copy().astype(np.float64), "v": np.zeros(3), "s": 1.0}
     x0_run = e_rel0.astype(np.float64)
     dphase = 1.0 / PHASE_STEPS
-    min_d, closed = 9.9, False
+    min_d, closed, secured = 9.9, False, 0
     for step in range(GRASP_MAX_STEPS):
         E_pos = np.asarray(obs["robot0_eef_pos"], np.float32)
         eq = np.asarray(obs["robot0_eef_quat"], np.float32)
         E_q = np.array([eq[3], eq[0], eq[1], eq[2]], np.float32)
         O_pos = sim.data.body_xpos[bid].astype(np.float32).copy()
         O_quat = sim.data.body_xquat[bid].astype(np.float32).copy()
-        dmp.step(st, grasp_pos.astype(np.float64), dt=dphase, x0=x0_run)
-        desired_world = O_pos + quat_rotate(O_quat, st["x"].astype(np.float32))
-        a_pos = np.clip((desired_world - E_pos) / apu, -1, 1)
-        tgt_q = quat_mul(O_quat, grasp_quat)
-        err = quat_mul(tgt_q, quat_conj(quat_normalize(E_q)))
-        a_rot = np.clip(kp_rot * axisangle_from_quat(err), -1, 1)
         e_rel, _ = ee_in_object_frame(E_pos, E_q, O_pos, O_quat)
         dist = float(np.linalg.norm(e_rel - grasp_pos))
         min_d = min(min_d, dist)
-        grip = 1.0 if dist < GRIP_EPS else -1.0
-        if grip > 0:
-            closed = True
+        if secured < 8:                                   # PHASE 1: approach grasp pose (DMP servo)
+            dmp.step(st, grasp_pos.astype(np.float64), dt=dphase, x0=x0_run)
+            desired_world = O_pos + quat_rotate(O_quat, st["x"].astype(np.float32))
+            a_pos = np.clip((desired_world - E_pos) / apu, -1, 1)
+            grip = 1.0 if dist < GRIP_EPS else -1.0
+            if grip > 0:
+                closed = True; secured += 1
+            else:
+                secured = 0
+        else:                                             # PHASE 2: lift straight up, gripper closed
+            a_pos = np.array([0.0, 0.0, 1.0])
+            grip = 1.0
+        tgt_q = quat_mul(O_quat, grasp_quat)
+        err = quat_mul(tgt_q, quat_conj(quat_normalize(E_q)))
+        a_rot = np.clip(kp_rot * axisangle_from_quat(err), -1, 1)
         obs, _, done, _ = env.step([*a_pos, *a_rot, grip])
         if float(sim.data.body_xpos[bid][2]) - z0 > LIFT_M:
             return (True, min_d, closed) if debug else True
