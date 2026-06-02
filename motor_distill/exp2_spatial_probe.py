@@ -181,9 +181,11 @@ def train_eval(HeadCls, name, Xtr, Ytr, Xte, Yte, epochs=1500, **kw):
         loss.backward(); opt.step()
     with torch.no_grad():
         pred = head(Xte_t).cpu().numpy()
+        predtr = head(Xtr_t).cpu().numpy()
     err = np.linalg.norm(pred - Yte, axis=-1)
+    trerr = np.linalg.norm(predtr - Ytr, axis=-1)
     ax = np.abs(pred - Yte).mean(0)
-    return err.mean(), np.median(err), ax
+    return err.mean(), np.median(err), ax, trerr.mean()
 
 
 def main():
@@ -222,14 +224,15 @@ def main():
     results = []
     for name, cls, kw in runs:
         print(f"training {name} ...", flush=True)
-        m, md, ax = train_eval(cls, name, X[tr], Ytr, X[te], Yte, **kw)
-        results.append((name, m, md, ax))
+        m, md, ax, tr_err = train_eval(cls, name, X[tr], Ytr, X[te], Yte, **kw)
+        results.append((name, m, md, ax, tr_err))
 
     print("\n=== EXP 2 CORRECTED (pooled data, trace-split): object-position error (cm) ===", flush=True)
-    print(f"  {'predict-mean baseline':22s}: mean {spread.mean()*100:5.1f}  median {np.median(spread)*100:5.1f}", flush=True)
-    for name, m, md, ax in results:
-        print(f"  {name:22s}: mean {m*100:5.1f}  median {md*100:5.1f}  per-axis(cm) {(ax*100).round(1)}", flush=True)
-    best = min(m for _, m, _, _ in results)
+    print(f"  {'predict-mean baseline':22s}:  test-mean {spread.mean()*100:5.1f}  test-med {np.median(spread)*100:5.1f}", flush=True)
+    for name, m, md, ax, tr_err in results:
+        print(f"  {name:22s}:  TRAIN {tr_err*100:5.1f}  test-mean {m*100:5.1f}  test-med {md*100:5.1f}  per-axis {(ax*100).round(1)}", flush=True)
+    m = min(r[1] for r in results)
+    best = min(r[1] for r in results)
     bestname = min(results, key=lambda r: r[1])[0]
     verdict = ("LOCALIZES (beats predict-mean) -> world encoder viable" if best < 0.6 * spread.mean()
                else "TIES predict-mean -> features do NOT localize -> perception wall")
