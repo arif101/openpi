@@ -55,6 +55,23 @@ def extract_features_from_dict(
     return extract_features_from_observation(model, observation)
 
 
+def extract_spatial_features_from_dict(
+    model: "Pi0",
+    data: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract UN-POOLED per-token VLM hidden states from a raw data dict.
+
+    Returns the full prefix sequence (image patch tokens + language tokens)
+    without pooling, so downstream heads can localize objects spatially.
+
+    Returns:
+        (prefix_out [batch, seq_len, hidden_dim], prefix_mask [batch, seq_len]).
+    """
+    observation = _model.Observation.from_dict(data)
+    prefix_out, prefix_mask = model.extract_vlm_spatial_features(observation)
+    return np.asarray(prefix_out, dtype=np.float32), np.asarray(prefix_mask)
+
+
 def get_hidden_dim(model: "Pi0") -> int:
     """Return the VLM hidden state dimension for a given model.
 

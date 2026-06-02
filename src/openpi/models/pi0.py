@@ -261,6 +261,35 @@ class Pi0(_model.BaseModel):
 
         return pooled
 
+    def extract_vlm_spatial_features(
+        self,
+        observation: _model.Observation,
+    ) -> tuple[at.Float[at.Array, "b s d"], at.Bool[at.Array, "b s"]]:
+        """Extract UN-POOLED per-token VLM hidden states from the prefix.
+
+        Same forward pass as extract_vlm_features, but returns the full
+        [batch, seq_len, hidden_dim] prefix sequence (image patch tokens +
+        language tokens) WITHOUT mean-pooling, plus the validity mask. The
+        image patch tokens retain spatial structure (per-camera 14x14 grid for
+        224px input, patch 16) — needed to localize objects, which mean-pooling
+        destroys.
+
+        Token layout follows embed_prefix: [cam0 patches | cam1 patches | ... |
+        language tokens]. With pool_type="none" each camera contributes
+        (H/16)*(W/16) tokens and no CLS token.
+
+        Returns:
+            (prefix_out [b, s, d], prefix_mask [b, s]).
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return prefix_out, prefix_mask
+
     @override
     def sample_actions(
         self,
