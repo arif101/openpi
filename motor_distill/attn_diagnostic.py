@@ -82,7 +82,7 @@ def detect_boxes(img, queries, device):
     return out_boxes
 
 
-def heatmap(policy, base_img, frame, prompt, a0, stride=32, patch=48):
+def heatmap(policy, base_img, frame, prompt, a0, stride=20, patch=40):
     H, W = base_img.shape[:2]
     sal = np.zeros((H, W), np.float32)
     for y in range(0, H, stride):
@@ -94,12 +94,26 @@ def heatmap(policy, base_img, frame, prompt, a0, stride=32, patch=48):
     return sal
 
 
+def jet(s):
+    """s in [0,1] -> jet RGB 0..255 (blue=low, green=mid, red=high)."""
+    r = np.clip(1.5 - np.abs(4 * s - 3), 0, 1)
+    g = np.clip(1.5 - np.abs(4 * s - 2), 0, 1)
+    b = np.clip(1.5 - np.abs(4 * s - 1), 0, 1)
+    return np.stack([r, g, b], -1) * 255.0
+
+
 def save_overlay(base_img, sal, path):
+    """Grad-CAM style: grayscale base (image stays legible) + jet heatmap, alpha by
+    saliency so cold regions show the clear image and hot regions pop in color."""
     import imageio
-    s = sal / (sal.max() + 1e-6)
-    ov = base_img.astype(np.float32).copy()
-    ov[..., 0] = np.clip(ov[..., 0] + 160 * s, 0, 255)        # red = high saliency
-    imageio.imwrite(path, ov.astype(np.uint8))
+    thr = np.percentile(sal, 95) + 1e-6                        # robust norm (ignore outliers)
+    s = np.clip(sal / thr, 0, 1) ** 0.7                        # gamma -> mid-range contrast
+    lum = base_img.astype(np.float32) @ np.array([0.299, 0.587, 0.114])
+    gray = np.repeat(lum[..., None], 3, -1)
+    heat = jet(s)
+    a = np.clip(s, 0, 0.85)[..., None]                         # hot=color, cold=grayscale image
+    out = (1 - a) * gray + a * heat
+    imageio.imwrite(path, np.clip(out, 0, 255).astype(np.uint8))
 
 
 def main():
@@ -110,6 +124,7 @@ def main():
     p.add_argument("--task-idx", type=int, default=3)
     p.add_argument("--n", type=int, default=5)
     p.add_argument("--full-heatmap", action="store_true")
+    p.add_argument("--heat-frames", type=int, default=3)
     args = p.parse_args()
     import torch
     from openpi.training import config as _config
@@ -149,7 +164,7 @@ def main():
             gscore = deltas[tgt] / (deltas["bowl"] + deltas["bottle"] + 1e-6)
             agg[key].append(gscore)
             print(f"{fi:6d} {key:12s} {deltas['bowl']:7.3f} {deltas['bottle']:8.3f} {gscore:9.2f}", flush=True)
-            if args.full_heatmap and fi == 0:
+            if args.full_heatmap and fi < args.heat_frames:
                 sal = heatmap(policy, img, frame, prompt, a0)
                 save_overlay(img, sal, out / f"heat_f{fi}_{key}.png")
     print("\n=== GROUNDING SCORE (delta on named object / total), mean over frames ===", flush=True)
