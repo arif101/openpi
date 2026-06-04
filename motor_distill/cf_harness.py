@@ -96,18 +96,26 @@ def mask_except(img, box, pad=12, val=128):
 
 
 # ----------------------------- episode -----------------------------
-def body_z(sim, name):
-    try:
-        return float(sim.data.body_xpos[int(sim.model.body_name2id(name))][2])
-    except Exception:
-        return np.nan
+def resolve_bodies(sim, names):
+    """Map bddl object names (e.g. 'moka_pot_1') -> actual mujoco body names
+    (e.g. 'moka_pot_1_main') by exact/suffix/substring match."""
+    allb = [sim.model.body_id2name(i) for i in range(sim.model.nbody)]
+    out = {}
+    for n in names:
+        if n in allb:
+            out[n] = n
+        elif n + "_main" in allb:
+            out[n] = n + "_main"
+        else:
+            cand = [b for b in allb if b and n in b]
+            out[n] = cand[0] if cand else None
+    return out
 
 
-def body_pos(sim, name):
-    try:
-        return sim.data.body_xpos[int(sim.model.body_name2id(name))].astype(np.float64).copy()
-    except Exception:
+def body_pos(sim, bname):
+    if bname is None:
         return np.full(3, np.nan)
+    return sim.data.body_xpos[int(sim.model.body_name2id(bname))].astype(np.float64).copy()
 
 
 def run_episode(policy, env, instruction, targets, distractors, init=None,
@@ -116,7 +124,8 @@ def run_episode(policy, env, instruction, targets, distractors, init=None,
     obs = env.set_init_state(init) if init is not None else env.reset()
     sim = env.env.sim
     bodies = targets + distractors
-    z0 = {b: body_z(sim, b) for b in bodies}
+    rb = resolve_bodies(sim, bodies)                                   # bddl name -> mujoco body name
+    z0 = {b: body_pos(sim, rb[b])[2] for b in bodies}
     chunk = None; ci = 0; success = False
     lifted = {b: 0.0 for b in bodies}
     reach = {b: 1e9 for b in bodies}                                  # min EE->object dist (grounding)
@@ -132,8 +141,9 @@ def run_episode(policy, env, instruction, targets, distractors, init=None,
         obs, _, done, info = env.step(chunk[ci].tolist()); ci += 1
         E = np.asarray(obs["robot0_eef_pos"], np.float64)
         for b in bodies:
-            lifted[b] = max(lifted[b], body_z(sim, b) - z0[b])
-            reach[b] = min(reach[b], float(np.linalg.norm(E - body_pos(sim, b))))
+            pos = body_pos(sim, rb[b])
+            lifted[b] = max(lifted[b], pos[2] - z0[b])
+            reach[b] = min(reach[b], float(np.linalg.norm(E - pos)))
         if done or (isinstance(info, dict) and info.get("success")):
             success = True; break
     reach_tgt = min(reach[t] for t in targets)
