@@ -101,6 +101,61 @@ def clean_query(body):
     return "a " + re.sub(r"_\d+$", "", body).replace("_", " ")
 
 
+# ----------------------------- heat map (where pi0.5 looks) -----------------------------
+def jet(s):
+    r = np.clip(1.5 - np.abs(4 * s - 3), 0, 1); g = np.clip(1.5 - np.abs(4 * s - 2), 0, 1)
+    b = np.clip(1.5 - np.abs(4 * s - 1), 0, 1)
+    return np.stack([r, g, b], -1) * 255.0
+
+
+def save_overlay(base_img, sal, path, boxes=None):
+    import imageio
+    thr = np.percentile(sal, 95) + 1e-6
+    s = np.clip(sal / thr, 0, 1) ** 0.7
+    lum = base_img.astype(np.float32) @ np.array([0.299, 0.587, 0.114])
+    gray = np.repeat(lum[..., None], 3, -1)
+    a = np.clip(s, 0, 0.85)[..., None]
+    out = (1 - a) * gray + a * jet(s)
+    for col, box in (boxes or []):                                    # draw object boxes (target/distractor)
+        if box is not None:
+            x0, y0, x1, y1 = box
+            out[y0:y1, x0:x0 + 2] = col; out[y0:y1, x1 - 2:x1] = col
+            out[y0:y0 + 2, x0:x1] = col; out[y1 - 2:y1, x0:x1] = col
+    imageio.imwrite(path, np.clip(out, 0, 255).astype(np.uint8))
+
+
+def occ_heatmap(policy, base, obs_frame, instruction, stride=24, patch=40):
+    wr = np.asarray(obs_frame["robot0_eye_in_hand_image"])
+    ee, eq, gq = obs_frame["robot0_eef_pos"], obs_frame["robot0_eef_quat"], obs_frame["robot0_gripper_qpos"]
+    act = lambda im: np.asarray(policy.infer(build_obs(im, wr, ee, eq, gq, instruction))["actions"], np.float32)[:, :3]
+    a0 = act(base); H, W = base.shape[:2]; sal = np.zeros((H, W), np.float32)
+    for y in range(0, H, stride):
+        for x in range(0, W, stride):
+            occ = base.copy(); occ[y:y + patch, x:x + patch] = 128
+            d = float(np.linalg.norm(act(occ) - a0))
+            sal[y:y + patch, x:x + patch] = np.maximum(sal[y:y + patch, x:x + patch], d)
+    return sal
+
+
+def diag_scene(policy, env, instruction, targets, distractors, scene, outdir, device):
+    import imageio
+    env.reset(); obs = env.reset()
+    base = np.asarray(obs["agentview_image"])
+    sim = env.env.sim; rb = resolve_bodies(sim, targets + distractors)
+    tbox = detect_box(base, clean_query(targets[0]), device)
+    dbox = detect_box(base, clean_query(distractors[0]), device) if distractors else None
+    imageio.imwrite(outdir / f"{scene}_raw.png", base)
+    masked = base.copy()
+    for d in distractors:
+        masked = mask_box(masked, detect_box(masked, clean_query(d), device))
+    imageio.imwrite(outdir / f"{scene}_masked.png", masked)         # verify GDINO grayed the memorized obj
+    sal = occ_heatmap(policy, base, obs, instruction)
+    # green box = named target, red box = memorized distractor
+    save_overlay(base, sal, outdir / f"{scene}_heat.png",
+                 boxes=[([0, 255, 0], tbox), ([255, 0, 0], dbox)])
+    return {"target_box": tbox is not None, "distractor_box": dbox is not None}
+
+
 # ----------------------------- episode -----------------------------
 def resolve_bodies(sim, names):
     """Map bddl object names (e.g. 'moka_pot_1') -> actual mujoco body names
@@ -171,7 +226,8 @@ def main():
     p.add_argument("--bddl-dir", default="data/libero_pro/bddl_files/libero_10_task")
     p.add_argument("--n", type=int, default=6)
     p.add_argument("--horizon", type=int, default=300)
-    p.add_argument("--oracle", action="store_true", help="also run box-oracle (mask all-but-target)")
+    p.add_argument("--oracle", action="store_true", help="also run de-attractor oracle")
+    p.add_argument("--diag", action="store_true", help="save raw/masked/heatmap PNGs per scene (no rollout)")
     args = p.parse_args()
     import torch
     from openpi.training import config as _config
@@ -191,6 +247,13 @@ def main():
             print(f"  skip (no graspable target): {pathlib.Path(bf).name}", flush=True); continue
         env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256)
         env.seed(7)
+        if args.diag:
+            outdir = pathlib.Path("data/cf_diag"); outdir.mkdir(parents=True, exist_ok=True)
+            d = diag_scene(policy, env, instruction, targets, distractors, pathlib.Path(bf).stem[:30], outdir, dev)
+            env.close()
+            print(f"  {pathlib.Path(bf).stem[:38]:40s} tgt={targets[0]:20s} instr='{instruction[:40]}' "
+                  f"| target_box={d['target_box']} distractor_box={d['distractor_box']} -> saved raw/masked/heat", flush=True)
+            continue
         base = run_episode(policy, env, instruction, targets, distractors, horizon=args.horizon, device=dev)
         rec = {"scene": pathlib.Path(bf).stem[:38], "instr": instruction[:42], "target": targets[0],
                "b_succ": base["success"], "b_reach": base["reached_target"], "b_lift": base["lifted_target"],
