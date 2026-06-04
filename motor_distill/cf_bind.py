@@ -53,8 +53,8 @@ def init_adapter(key, dg, dh=512):
     return init_mlp(key, D_VLM, dh, dg)
 
 
-def adapter_apply(p, prefix_out):
-    lang = prefix_out[:, N_IMG:].mean(1)                            # pool language tokens
+def adapter_apply(p, prefix_out, n_img=N_IMG):
+    lang = prefix_out[:, n_img:].mean(1)                            # pool language tokens
     return mlp(p, lang)
 
 
@@ -62,8 +62,8 @@ def init_disc(key, dg, dh=512):
     return init_mlp(key, D_VLM, dh, dg)
 
 
-def disc_apply(p, prefix_out):
-    vis = prefix_out[:, :N_IMG].mean(1)                            # pool vision tokens
+def disc_apply(p, prefix_out, n_img=N_IMG):
+    vis = prefix_out[:, :n_img].mean(1)                            # pool vision tokens
     return mlp(p, vis)
 
 

@@ -414,3 +414,50 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_bound_train(
+        self,
+        observation: _model.Observation,
+        g: at.Float[at.Array, "b dg"],
+        binder_apply,
+        binder_params,
+        noise: at.Float[at.Array, "b ah ad"],
+        *,
+        num_steps: int = 10,
+        target_state=None,
+    ) -> _model.Actions:
+        """Differentiable (UNROLLED) twin of sample_actions_bound for TRAINING the binder.
+        Identical math, but the fixed `num_steps` denoising loop is a Python unroll instead of
+        jax.lax.while_loop (which has no reverse-mode rule). Gradients flow to binder_params (and,
+        via g, to the adapter); pi0.5 params stay frozen (not in the differentiated pytree).
+        Assumes observation already preprocessed by the caller is NOT required — we preprocess here."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        if target_state is None:
+            target_state = observation.target_state
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        x_t = noise
+        time = 1.0
+        for _ in range(num_steps):
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size), target_state=target_state,
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_s = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_s, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens], mask=full_attn_mask, positions=positions,
+                kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+            )
+            suffix_out = binder_apply(binder_params, suffix_out, g)
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            x_t = x_t + dt * v_t
+            time = time + dt
+        return x_t
