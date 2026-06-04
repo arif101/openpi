@@ -128,8 +128,7 @@ def main():
         u_t = nrm(tp_b - ee_b); u_d = nrm(dp_b - ee_b)
         cos_t = jnp.sum(d_u * u_t, -1); cos_d = jnp.sum(d_u * u_d, -1)
         L_task = (-cos_t + args.alpha * jax.nn.relu(cos_d)).mean()
-        vis = pf[:, :B.N_IMG].mean(1)
-        disc_out = B.disc_apply(params["disc"], vis)
+        disc_out = B.disc_apply(params["disc"], pf, n_img)          # disc pools vision internally
         L_disc = jnp.mean((disc_out - jax.lax.stop_gradient(g)) ** 2)        # train disc (witness)
         L_indep = jnp.mean((jax.lax.stop_gradient(disc_out) - g) ** 2)       # adapter strips vision info
         L = L_task + args.w_disc * L_disc - w_indep * L_indep
