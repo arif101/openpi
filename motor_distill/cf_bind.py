@@ -45,7 +45,8 @@ def binder_apply(p, suffix_out, g):
     gate = jnp.tanh(p["gate"])
     h = jax.nn.silu(mlp(p["hid"], g))                               # [B, dh]
     scale = h @ p["scale"]; shift = h @ p["shift"]                  # [B, D_ACT]
-    return suffix_out * (1.0 + gate * scale[:, None, :]) + gate * shift[:, None, :]
+    out = suffix_out * (1.0 + gate * scale[:, None, :]) + gate * shift[:, None, :]
+    return out.astype(suffix_out.dtype)                             # gate=0 -> exact identity (no bf16 upcast drift)
 
 
 def init_adapter(key, dg, dh=512):
@@ -77,7 +78,7 @@ def _dummy_obs(model):
             "state": np.zeros((1, 32), np.float32),
             "tokenized_prompt": rng.integers(0, 1000, (1, 48), np.int32),
             "tokenized_prompt_mask": np.ones((1, 48), bool)}
-    return _model.Observation.from_dict(data)
+    return jax.tree.map(jnp.asarray, _model.Observation.from_dict(data))
 
 
 def main():
@@ -93,7 +94,7 @@ def main():
     binder_p = init_binder(jax.random.key(0), dg)
     g = jax.random.normal(jax.random.key(1), (1, dg))
     noise = jax.random.normal(jax.random.key(2), (1, 10, 32))
-    a_stock = np.asarray(model.sample_actions(jax.random.key(3), obs, num_steps=10, noise=noise))
+    a_stock = np.asarray(model.sample_actions(jax.random.key(3), obs, num_steps=10, noise=noise)[0])
     a_bound = np.asarray(model.sample_actions_bound(jax.random.key(3), obs, g, binder_apply, binder_p,
                                                     num_steps=10, noise=noise))
     diff = float(np.abs(a_stock - a_bound).max())
