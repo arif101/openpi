@@ -103,6 +103,13 @@ def body_z(sim, name):
         return np.nan
 
 
+def body_pos(sim, name):
+    try:
+        return sim.data.body_xpos[int(sim.model.body_name2id(name))].astype(np.float64).copy()
+    except Exception:
+        return np.full(3, np.nan)
+
+
 def run_episode(policy, env, instruction, targets, distractors, init=None,
                 horizon=300, replan=5, oracle_query=None, device="cuda"):
     env.reset()
@@ -112,6 +119,7 @@ def run_episode(policy, env, instruction, targets, distractors, init=None,
     z0 = {b: body_z(sim, b) for b in bodies}
     chunk = None; ci = 0; success = False
     lifted = {b: 0.0 for b in bodies}
+    reach = {b: 1e9 for b in bodies}                                  # min EE->object dist (grounding)
     for step in range(horizon):
         if chunk is None or ci >= replan:
             base = np.asarray(obs["agentview_image"])
@@ -122,15 +130,21 @@ def run_episode(policy, env, instruction, targets, distractors, init=None,
                           obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"], instruction)
             chunk = np.asarray(policy.infer(o)["actions"], np.float32); ci = 0
         obs, _, done, info = env.step(chunk[ci].tolist()); ci += 1
+        E = np.asarray(obs["robot0_eef_pos"], np.float64)
         for b in bodies:
             lifted[b] = max(lifted[b], body_z(sim, b) - z0[b])
+            reach[b] = min(reach[b], float(np.linalg.norm(E - body_pos(sim, b))))
         if done or (isinstance(info, dict) and info.get("success")):
             success = True; break
-    # which object did it engage most (largest lift)?
-    grasped = max(bodies, key=lambda b: lifted[b]) if bodies else None
-    grasped_is_target = grasped in targets
-    return {"success": success, "grasped": grasped, "grasped_is_target": grasped_is_target,
-            "lift": {b: round(lifted[b], 3) for b in bodies}}
+    reach_tgt = min(reach[t] for t in targets)
+    reach_dist = min([reach[d] for d in distractors], default=1e9)    # nearest distractor (incl memorized obj)
+    lift_tgt = max(lifted[t] for t in targets)
+    lift_dist = max([lifted[d] for d in distractors], default=0.0)
+    return {"success": success,
+            "reached_target": reach_tgt < reach_dist,                  # gripper went to named obj, not distractor
+            "reach_tgt_cm": round(reach_tgt * 100, 1), "reach_dist_cm": round(reach_dist * 100, 1),
+            "lifted_target": lift_tgt > 0.03 and lift_tgt > lift_dist,  # actually picked the named obj up
+            "lift_tgt_cm": round(lift_tgt * 100, 1), "lift_dist_cm": round(lift_dist * 100, 1)}
 
 
 # ----------------------------- main / aggregate -----------------------------
@@ -163,28 +177,31 @@ def main():
         env.seed(7)
         tgt_q = "a " + targets[0].rsplit("_", 1)[0].replace("_", " ")     # query for GDINO from body name
         base = run_episode(policy, env, instruction, targets, distractors, horizon=args.horizon, device=dev)
-        rec = {"scene": pathlib.Path(bf).stem[:40], "instr": instruction[:45],
-               "target": targets[0], "base_succ": base["success"], "base_grasp_tgt": base["grasped_is_target"]}
+        rec = {"scene": pathlib.Path(bf).stem[:38], "instr": instruction[:42], "target": targets[0],
+               "b_succ": base["success"], "b_reach": base["reached_target"], "b_lift": base["lifted_target"],
+               "b_rt": base["reach_tgt_cm"], "b_rd": base["reach_dist_cm"]}
         if args.oracle:
             orc = run_episode(policy, env, instruction, targets, distractors, horizon=args.horizon,
                               oracle_query=tgt_q, device=dev)
-            rec["oracle_succ"] = orc["success"]; rec["oracle_grasp_tgt"] = orc["grasped_is_target"]
+            rec["o_reach"] = orc["reached_target"]; rec["o_lift"] = orc["lifted_target"]; rec["o_succ"] = orc["success"]
         env.close()
         rows.append(rec)
-        print(f"  {rec['scene']:42s} instr='{rec['instr']}' tgt={rec['target']:22s} "
-              f"base_succ={rec['base_succ']} grasp_tgt={rec['base_grasp_tgt']}"
-              + (f" | oracle_succ={rec.get('oracle_succ')} grasp_tgt={rec.get('oracle_grasp_tgt')}" if args.oracle else ""),
+        print(f"  {rec['scene']:40s} tgt={rec['target']:20s} | reach_tgt={rec['b_rt']}cm reach_distr={rec['b_rd']}cm "
+              f"reached_tgt={rec['b_reach']} lifted_tgt={rec['b_lift']} succ={rec['b_succ']}"
+              + (f" || ORACLE reached={rec.get('o_reach')} lifted={rec.get('o_lift')} succ={rec.get('o_succ')}" if args.oracle else ""),
               flush=True)
     n = len(rows)
     if n:
-        bs = sum(r["base_succ"] for r in rows); bg = sum(r["base_grasp_tgt"] for r in rows)
-        print(f"\n=== LIBERO-PRO TASK counterfactual (N={n}) ===", flush=True)
-        print(f"  baseline: success {bs}/{n}={bs/n*100:.0f}%  grasped-named-target {bg}/{n}={bg/n*100:.0f}%", flush=True)
+        f = lambda k: sum(bool(r.get(k)) for r in rows)
+        print(f"\n=== LIBERO-PRO TASK counterfactual (N={n}) — grounding metrics ===", flush=True)
+        print(f"  BASELINE: reached-named-target {f('b_reach')}/{n}={f('b_reach')/n*100:.0f}%  "
+              f"lifted-named-target {f('b_lift')}/{n}={f('b_lift')/n*100:.0f}%  success {f('b_succ')}/{n}={f('b_succ')/n*100:.0f}%", flush=True)
         if args.oracle:
-            os_ = sum(r.get("oracle_succ", False) for r in rows); og = sum(r.get("oracle_grasp_tgt", False) for r in rows)
-            print(f"  BOX-ORACLE: success {os_}/{n}={os_/n*100:.0f}%  grasped-named-target {og}/{n}={og/n*100:.0f}%", flush=True)
-            print(f"  -> oracle gap (does a perfect cue re-target the frozen motor?): "
-                  f"grasp-target {bg/n*100:.0f}% -> {og/n*100:.0f}%", flush=True)
+            print(f"  BOX-ORACLE: reached {f('o_reach')}/{n}={f('o_reach')/n*100:.0f}%  "
+                  f"lifted {f('o_lift')}/{n}={f('o_lift')/n*100:.0f}%  success {f('o_succ')}/{n}={f('o_succ')/n*100:.0f}%", flush=True)
+            print(f"  -> KEYSTONE: does a perfect cue re-target the frozen motor? "
+                  f"reached-target {f('b_reach')/n*100:.0f}% -> {f('o_reach')/n*100:.0f}%, "
+                  f"lifted {f('b_lift')/n*100:.0f}% -> {f('o_lift')/n*100:.0f}%", flush=True)
     print("CF_HARNESS_EXIT=0", flush=True)
 
 
