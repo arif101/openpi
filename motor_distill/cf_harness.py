@@ -84,15 +84,21 @@ def detect_box(img, query, device):
     return res["boxes"][int(res["scores"].argmax())].cpu().numpy().astype(int)
 
 
-def mask_except(img, box, pad=12, val=128):
+def mask_box(img, box, pad=6, val=128):
+    """Gray out ONLY the box region (de-attractor: remove the memorized object,
+    keep the rest of the scene). LIBERO-CF Table-II shows this raises CF success."""
     if box is None:
         return img
     H, W = img.shape[:2]
-    out = np.full_like(img, val)
+    out = img.copy()
     x0, y0, x1, y1 = box
     x0, y0 = max(0, x0 - pad), max(0, y0 - pad); x1, y1 = min(W, x1 + pad), min(H, y1 + pad)
-    out[y0:y1, x0:x1] = img[y0:y1, x0:x1]
+    out[y0:y1, x0:x1] = val
     return out
+
+
+def clean_query(body):
+    return "a " + re.sub(r"_\d+$", "", body).replace("_", " ")
 
 
 # ----------------------------- episode -----------------------------
@@ -119,7 +125,7 @@ def body_pos(sim, bname):
 
 
 def run_episode(policy, env, instruction, targets, distractors, init=None,
-                horizon=300, replan=5, oracle_query=None, device="cuda"):
+                horizon=300, replan=5, suppress_queries=None, device="cuda"):
     env.reset()
     obs = env.set_init_state(init) if init is not None else env.reset()
     sim = env.env.sim
@@ -132,9 +138,9 @@ def run_episode(policy, env, instruction, targets, distractors, init=None,
     for step in range(horizon):
         if chunk is None or ci >= replan:
             base = np.asarray(obs["agentview_image"])
-            if oracle_query is not None:
-                box = detect_box(base, oracle_query, device)
-                base = mask_except(base, box)
+            if suppress_queries:                                       # de-attractor: gray ONLY memorized objects
+                for q in suppress_queries:
+                    base = mask_box(base, detect_box(base, q, device))
             o = build_obs(base, np.asarray(obs["robot0_eye_in_hand_image"]),
                           obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"], instruction)
             chunk = np.asarray(policy.infer(o)["actions"], np.float32); ci = 0
@@ -185,14 +191,13 @@ def main():
             print(f"  skip (no graspable target): {pathlib.Path(bf).name}", flush=True); continue
         env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256)
         env.seed(7)
-        tgt_q = "a " + targets[0].rsplit("_", 1)[0].replace("_", " ")     # query for GDINO from body name
         base = run_episode(policy, env, instruction, targets, distractors, horizon=args.horizon, device=dev)
         rec = {"scene": pathlib.Path(bf).stem[:38], "instr": instruction[:42], "target": targets[0],
                "b_succ": base["success"], "b_reach": base["reached_target"], "b_lift": base["lifted_target"],
                "b_rt": base["reach_tgt_cm"], "b_rd": base["reach_dist_cm"]}
         if args.oracle:
             orc = run_episode(policy, env, instruction, targets, distractors, horizon=args.horizon,
-                              oracle_query=tgt_q, device=dev)
+                              suppress_queries=[clean_query(d) for d in distractors], device=dev)
             rec["o_reach"] = orc["reached_target"]; rec["o_lift"] = orc["lifted_target"]; rec["o_succ"] = orc["success"]
         env.close()
         rows.append(rec)
