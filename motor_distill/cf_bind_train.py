@@ -112,7 +112,16 @@ def main():
     k1, k2, k3, key = jax.random.split(key, 4)
     params = {"binder": B.init_binder(k1, args.dg), "adapter": B.init_adapter(k2, args.dg),
               "disc": B.init_disc(k3, args.dg)}
-    opt = optax.adam(args.lr); opt_state = opt.init(params)
+    # gate gets a dedicated higher LR (single scalar must climb to real authority; otherwise the
+    # binder stays near-identity and can't override the memorized target). disc gets weight decay
+    # to slow memorization of g from vision on only ~140 points (keeps the witness honest).
+    labels = jax.tree.map(lambda _: "base", params)
+    labels["binder"]["gate"] = "gate"
+    labels["disc"] = jax.tree.map(lambda _: "disc", params["disc"])
+    opt = optax.multi_transform(
+        {"base": optax.adam(args.lr), "gate": optax.adam(args.lr * 20.0),
+         "disc": optax.adamw(args.lr, weight_decay=1e-2)}, labels)
+    opt_state = opt.init(params)
     ee = jnp.asarray(sup["ee"]); tpos = jnp.asarray(sup["tpos"]); dpos = jnp.asarray(sup["dpos"])
     nrm = lambda v: v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + 1e-8)
     w_indep = args.w_indep if args.penalty == "on" else 0.0

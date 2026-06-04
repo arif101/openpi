@@ -34,10 +34,14 @@ def mlp(p, x):
     return jax.nn.silu(x @ p["w1"] + p["b1"]) @ p["w2"] + p["b2"]
 
 
-def init_binder(key, dg, dh=256):
-    ka, kb = jax.random.split(key)
+def init_binder(key, dg, dh=256, sc=0.02):
+    ka, ks, kb = jax.random.split(key, 3)
+    # ONLY the gate is zero-init -> gate=0 gives bit-identical output (identity at init), BUT
+    # d(out)/d(gate) = scale*suffix + shift must be NON-zero so the gate can escape the saddle.
+    # (zero-init'ing scale/shift too -> all binder grads zero -> binder never learns; ControlNet zeros only the final gate.)
     return {"hid": init_mlp(ka, dg, dh, dh),
-            "scale": jnp.zeros((dh, D_ACT)), "shift": jnp.zeros((dh, D_ACT)),
+            "scale": jax.random.normal(ks, (dh, D_ACT)) * sc,
+            "shift": jax.random.normal(kb, (dh, D_ACT)) * sc,
             "gate": jnp.zeros(())}                                   # tanh(0)=0 -> identity at init
 
 
