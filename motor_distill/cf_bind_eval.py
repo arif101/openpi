@@ -27,23 +27,28 @@ class BoundPolicy:
 
     def __init__(self, policy, params):
         from openpi.models import model as _model
+        from openpi.shared import nnx_utils
         self._model_mod = _model
         self.p = policy
         self.model = policy._model
         self.binder = jax.tree.map(jnp.asarray, params["binder"])
         self.adapter = jax.tree.map(jnp.asarray, params["adapter"])
         self._rng = jax.random.key(0)
+        # jit the two heavy nnx forward passes (else eager execution makes each replan ~17s).
+        # binder_apply is a static function arg -> fun-arg position 4 (after state,rng,observation,g).
+        self._extract = nnx_utils.module_jit(self.model.extract_vlm_spatial_features)
+        self._sample_bound = nnx_utils.module_jit(self.model.sample_actions_bound, static_argnums=(4,))
 
     def infer(self, obs: dict) -> dict:
         inputs = self.p._input_transform(jax.tree.map(lambda x: x, obs))
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[None], inputs)
         observation = self._model_mod.Observation.from_dict(inputs)
-        pf, _ = self.model.extract_vlm_spatial_features(observation)
+        pf, _ = self._extract(observation)
         n_img = int(pf.shape[1] - observation.tokenized_prompt.shape[1])  # image tokens precede language
         g = B.adapter_apply(self.adapter, pf, n_img)
         g = g / (jnp.linalg.norm(g, axis=-1, keepdims=True) + 1e-8)
         self._rng, k = jax.random.split(self._rng)
-        actions = self.model.sample_actions_bound(k, observation, g, B.binder_apply, self.binder)
+        actions = self._sample_bound(k, observation, g, B.binder_apply, self.binder)
         outputs = {"state": inputs["state"], "actions": actions}
         outputs = jax.tree.map(lambda x: np.asarray(x[0]), outputs)
         return self.p._output_transform(outputs)
