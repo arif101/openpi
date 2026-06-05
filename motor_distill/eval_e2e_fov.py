@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--maxC", type=int, default=60); ap.add_argument("--thr", type=float, default=0.0)
     ap.add_argument("--align-cm", type=float, default=10.0); ap.add_argument("--descend", type=float, default=0.10)
     ap.add_argument("--place-cm", type=float, default=12.0)
+    ap.add_argument("--conv-grasp", action="store_true")   # close gripper on CONVERGENCE at object, not reach-head timing
     args = ap.parse_args()
     import torch
     from transformers import (CLIPModel, CLIPProcessor, Owlv2Processor, Owlv2ForObjectDetection)
@@ -63,25 +64,38 @@ def main():
 
     @torch.no_grad()
     def clip_pick(img, boxes, phrase):
-        """Crop each candidate at hi-res, CLIP-sim to the named phrase, return best box center pixel."""
-        crops, ctrs = [], []
+        """Crop each candidate to ITS OWN box extent (adaptive: small->tight zoom, large->full extent),
+        CLIP-sim to the named phrase, return (center_pixel, box) of best. General for any object size."""
+        crops, cand = [], []
         for b in boxes:
-            cy, cx = int((b[1]+b[3])/2), int((b[0]+b[2])/2)
-            r0, c0 = max(0, cy-win), max(0, cx-win); r1, c1 = min(H, cy+win), min(H, cx+win)
-            crops.append(Image.fromarray(img[r0:r1, c0:c1]).resize((224, 224))); ctrs.append((cy, cx))
+            x0, y0, x1, y1 = b; m = 0.15 * max(x1-x0, y1-y0) + 8
+            r0, c0 = max(0, int(y0-m)), max(0, int(x0-m)); r1, c1 = min(H, int(y1+m)), min(H, int(x1+m))
+            if r1-r0 < 24 or c1-c0 < 24: continue
+            crops.append(Image.fromarray(img[r0:r1, c0:c1]).resize((224, 224)))
+            cand.append((int((y0+y1)/2), int((x0+x1)/2), b))
         if not crops: return None
         ti = clipp(text=[f"a photo of {phrase}"], images=crops, return_tensors="pt", padding=True).to(dev)
         s = clip(**ti).logits_per_image.softmax(0)[:, 0].cpu().numpy()
-        return ctrs[int(s.argmax())]
+        return cand[int(s.argmax())]
 
-    def locate(img, rd, c2w, phrase, queries):
-        boxes = propose(img, queries)
-        rc = clip_pick(img, boxes, phrase)
-        if rc is None: return None
-        cy, cx = rc; w = max(4, H // 64)
-        d = float(np.median(rd[max(0,cy-w):cy+w, max(0,cx-w):cx+w, 0]))
+    def unproj_px(pick, rd, c2w):
+        """Robust near-surface depth: low percentile of depths over the WHOLE chosen box (nearest solid
+        surface — grocery front face OR container near-rim) — general, robust to hollow/edge geometry."""
+        if pick is None: return None
+        cy, cx, b = pick
+        r0, c0, r1, c1 = max(0, int(b[1])), max(0, int(b[0])), min(H, int(b[3])), min(H, int(b[2]))
+        reg = rd[r0:r1, c0:c1, 0]
+        d = float(np.percentile(reg[reg > 0], 15)) if (reg > 0).any() else float(rd[cy, cx, 0])
         return np.asarray(CU.transform_from_pixels_to_world(np.array([cy, cx], float),
                                                             np.full((H, H, 1), d), c2w)[:3], np.float32)
+
+    def bind_all(img, rd, c2w, target_phrase, container_phrase, queries):
+        """ONE general binder: propose over all instruction nouns (object + container), adaptive-crop each,
+        CLIP-disambiguate the target AND the container from the SAME box set. Container is just another noun."""
+        boxes = propose(img, queries)
+        gT = unproj_px(clip_pick(img, boxes, target_phrase), rd, c2w)
+        gC = unproj_px(clip_pick(img, boxes, container_phrase), rd, c2w)
+        return gT, gC
 
     def act(params, goal, obs, grip=None):
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
@@ -92,7 +106,7 @@ def main():
         return a
 
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
-    bind_ok, grasp_ok, full_ok = [], [], []
+    bind_ok, cont_ok, grasp_ok, full_ok = [], [], [], []
     for bf in bddls:
         instr, objs, targets, distractors = parse_bddl(bf)
         if not targets: continue
@@ -111,29 +125,48 @@ def main():
             return img, rd
 
         img, rd = frame()
-        qset = [nm(x) for x in names]                          # high-recall proposals over scene object names
-        goalT = locate(img, rd, c2w, nm(T), qset)
-        goalC = locate(img, rd, c2w, args.container, qset + [args.container, "basket", "container"])
-        # binding accuracy: goalT near the true named object?
+        # proposals over all instruction nouns (grocery candidates + the container noun) — open-vocab, general
+        qset = [nm(x) for x in names] + [args.container, "basket", "container", "bin"]
+        goalT, goalC = bind_all(img, rd, c2w, nm(T), args.container, qset)
+        # binding accuracy: goalT near true object, goalC near true basket?
         objxyz = body_pos(sim, rb[T]).astype(np.float32)
         bok = goalT is not None and float(np.linalg.norm(goalT[:2] - objxyz[:2])) < 0.05
         bind_ok.append(int(bok))
+        ck = (cbody is not None and goalC is not None and
+              float(np.linalg.norm(goalC[:2] - body_pos(sim, cbody)[:2])) < 0.08)
+        cont_ok.append(int(ck))
         if goalC is not None: goalC = goalC + np.array([0, 0, 0.05], np.float32)
 
         z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; phase = "A"
-        if goalT is not None:
+        if goalT is not None and not args.conv_grasp:
             for step in range(args.maxA):
                 obs, _, done, _ = env.step(act(rp, goalT, obs).tolist())
                 lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
                 if lifted > 0.04: phase = "B"; break
+        elif goalT is not None:
+            # convergence-gated grasp: approach with gripper OPEN until EE settles AT the object, then close + lift
+            hist = []; closed = False; cstep = 0
+            for step in range(args.maxA):
+                ee = np.asarray(obs["robot0_eef_pos"], np.float32); hist.append(ee.copy())
+                d_xy = float(np.linalg.norm(ee[:2] - goalT[:2]))
+                settled = len(hist) >= 6 and float(np.max(np.ptp(np.stack(hist[-6:]), axis=0))) < 0.015
+                if (not closed) and d_xy < 0.05 and settled:
+                    closed = True; cstep = step
+                g = goalT if not closed else goalT + np.array([0, 0, 0.20], np.float32)   # lift after grasping
+                obs, _, done, _ = env.step(act(rp, g, obs, grip=(1.0 if closed else -1.0)).tolist())
+                lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
+                if closed and step > cstep + 30: phase = "B"; break
         grasp_ok.append(int(lifted > 0.04))
 
-        opened = False
+        opened = False; obj_min_h = 9.9; ee2b_min = 9.9; reached = False
+        btrue = body_pos(sim, cbody).astype(np.float32) if cbody is not None else None
         if phase == "B" and goalC is not None:
             for step in range(args.maxB):
                 ee = np.asarray(obs["robot0_eef_pos"], np.float32)
                 obs, _, done, _ = env.step(act(tp, goalC, obs, grip=1.0).tolist())
-                if float(np.linalg.norm(ee[:2] - goalC[:2])) < ALIGN: phase = "C"; break
+                obj_min_h = min(obj_min_h, float(body_pos(sim, rb[T])[2] - z0))
+                if btrue is not None: ee2b_min = min(ee2b_min, float(np.linalg.norm(ee[:2]-btrue[:2])))
+                if float(np.linalg.norm(ee[:2] - goalC[:2])) < ALIGN: phase = "C"; reached = True; break
             if phase == "C":
                 goalP = goalC - np.array([0, 0, args.descend], np.float32)
                 start_z = float(np.asarray(obs["robot0_eef_pos"], np.float32)[2]); z_min = np.inf; desc = False
@@ -143,20 +176,26 @@ def main():
                     nadir = desc and z > z_min + 0.015
                     g_use = (goalC + np.array([0,0,0.12], np.float32)) if opened else goalP
                     obs, _, done, _ = env.step(act(tp, g_use, obs, grip=-1.0 if (nadir or opened) else 1.0).tolist())
+                    obj_min_h = min(obj_min_h, float(body_pos(sim, rb[T])[2] - z0))
                     if nadir or opened: opened = True
                 for _ in range(20):
                     obs, _, done, _ = env.step(act(tp, goalC + np.array([0,0,0.15],np.float32), obs, grip=-1.0).tolist())
-        placed = False
+        placed = False; objdist = -1.0; objz = -1.0
         if cbody is not None:
             cT = body_pos(sim, rb[T]); cC = body_pos(sim, cbody)
-            placed = bool(lifted > 0.04 and np.linalg.norm(cT[:2] - cC[:2]) < PLACE)
+            objdist = float(np.linalg.norm(cT[:2] - cC[:2])); objz = float(cT[2])
+            placed = bool(lifted > 0.04 and objdist < PLACE)
         full_ok.append(int(placed)); env.close()
-        print(f"  {nm(T):14s} bind={'Y' if bok else '.'} grasp={'Y' if lifted>0.04 else '.'} "
-              f"({lifted*100:3.0f}cm) placed={'Y' if placed else '.'}", flush=True)
+        # slip = object dropped (<2cm) during transport while gripper held closed
+        slip = (phase in ("B","C")) and obj_min_h < 0.02
+        print(f"  {nm(T):14s} bind={'Y' if bok else '.'} grasp={'Y' if lifted>0.04 else '.'}({lifted*100:3.0f}cm) "
+              f"reachBasket={'Y' if reached else '.'} slipTransit={'Y' if slip else '.'} "
+              f"obj2basket={objdist*100:4.0f}cm placed={'Y' if placed else '.'}", flush=True)
     n = len(bind_ok)
     print(f"\n=== FOVEATED BINDER + full pick-place (N={n}, seed={args.seed}) ===", flush=True)
-    print(f"  binding <5cm : {np.mean(bind_ok):.2f}   (OWLv2@256 was ~0.40)", flush=True)
-    print(f"  grasp        : {np.mean(grasp_ok):.2f}", flush=True)
+    print(f"  obj binding <5cm    : {np.mean(bind_ok):.2f}   (OWLv2@256 was ~0.40)", flush=True)
+    print(f"  basket binding <8cm : {np.mean(cont_ok):.2f}", flush=True)
+    print(f"  grasp               : {np.mean(grasp_ok):.2f}", flush=True)
     print(f"  FULL success : {np.mean(full_ok):.2f}   (CAG bar 21.7%, prior 0%)", flush=True)
     print("EVAL_E2E_FOV_EXIT=0", flush=True)
 
