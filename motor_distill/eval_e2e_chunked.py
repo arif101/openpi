@@ -19,6 +19,7 @@ def main():
     ap.add_argument("--hi", type=int, default=1024); ap.add_argument("--horizon", type=int, default=300)
     ap.add_argument("--replan", type=int, default=5); ap.add_argument("--thr", type=float, default=0.0)
     ap.add_argument("--place-cm", type=float, default=12.0)
+    ap.add_argument("--carry-attract", type=float, default=0.0)   # strong drive-to-goalC during carry (fix undershoot)
     args = ap.parse_args()
     import torch
     from transformers import CLIPModel, CLIPProcessor, Owlv2Processor, Owlv2ForObjectDetection
@@ -102,10 +103,21 @@ def main():
         if goalT is None or goalC is None:
             grasp_ok.append(0); full_ok.append(0); env.close(); print(f"  {nm(T):14s} NO BIND", flush=True); continue
         z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; chunk = None; ci = 0
+        btrue = body_pos(sim, cbody).astype(np.float32) if cbody is not None else None
+        ee2b_min = 9.9; obj2ee_open = -1.0; open_ee2b = -1.0; opened = False; obj_h_open = -1.0
         for step in range(args.horizon):                      # CHUNKED: predict K, execute replan, re-plan
             if chunk is None or ci >= args.replan:
                 chunk = predict_chunk(goalT, goalC, obs); ci = 0
-            obs, _, done, _ = env.step(chunk[ci].tolist()); ci += 1
+            a = chunk[ci].copy()
+            ee = np.asarray(obs["robot0_eef_pos"], np.float32); op = body_pos(sim, rb[T]).astype(np.float32)
+            if args.carry_attract > 0 and a[6] > 0 and lifted > 0.04:   # carrying -> drive to goalC (cures undershoot)
+                a[:3] = np.clip(a[:3] + args.carry_attract * (goalC - ee), -1.0, 1.0)
+            if btrue is not None: ee2b_min = min(ee2b_min, float(np.linalg.norm(ee[:2]-btrue[:2])))
+            if (not opened) and a[6] < 0 and lifted > 0.04:    # first release after grasp
+                opened = True; obj2ee_open = float(np.linalg.norm(op[:2]-ee[:2]))
+                open_ee2b = float(np.linalg.norm(ee[:2]-btrue[:2])) if btrue is not None else -1
+                obj_h_open = float(op[2]-z0)
+            obs, _, done, _ = env.step(a.tolist()); ci += 1
             lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
             if done: break
         placed = False; objdist = -1.0
@@ -113,8 +125,9 @@ def main():
             cT = body_pos(sim, rb[T]); cC = body_pos(sim, cbody)
             objdist = float(np.linalg.norm(cT[:2]-cC[:2])); placed = bool(lifted > 0.04 and objdist < PLACE)
         grasp_ok.append(int(lifted > 0.04)); full_ok.append(int(placed)); env.close()
-        print(f"  {nm(T):14s} bind={'Y' if bind_ok[-1] else '.'} cont={'Y' if cont_ok[-1] else '.'} "
-              f"grasp={'Y' if lifted>0.04 else '.'}({lifted*100:3.0f}cm) obj2basket={objdist*100:4.0f}cm "
+        print(f"  {nm(T):14s} grasp={'Y' if lifted>0.04 else '.'}({lifted*100:3.0f}cm) "
+              f"minEE2basket={ee2b_min*100:4.0f}cm | @open: ee2basket={open_ee2b*100:4.0f}cm "
+              f"obj2ee={obj2ee_open*100:4.0f}cm objH={obj_h_open*100:4.0f}cm | obj2basket_end={objdist*100:4.0f}cm "
               f"placed={'Y' if placed else '.'}", flush=True)
     n = len(bind_ok)
     print(f"\n=== CHUNKED motor + foveation binder (N={n}, seed={args.seed}, replan={args.replan}) ===", flush=True)
