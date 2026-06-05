@@ -20,6 +20,8 @@ def main():
     ap.add_argument("--bddl-dir", default="data/libero_pro/bddl_files/libero_object_task")
     ap.add_argument("--reach-head", default="runs/reach_head.pkl")
     ap.add_argument("--transport-head", default="runs/transport_head.pkl")
+    ap.add_argument("--place-head", default="runs/place_full_head.pkl")
+    ap.add_argument("--place-full", action="store_true")   # use unified post-grasp place head (vs scaffold)
     ap.add_argument("--container", default="basket")
     ap.add_argument("--n", type=int, default=12); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--hi", type=int, default=1024); ap.add_argument("--win", type=float, default=0.13)
@@ -41,6 +43,7 @@ def main():
     owlm = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble").to(dev).eval()
     L = lambda f: jax.tree.map(jnp.asarray, pickle.load(open(f, "rb")))
     rp, tp = L(args.reach_head), L(args.transport_head)
+    pf = L(args.place_head) if args.place_full else None
     H = args.hi; win = int(args.win * H); PLACE = args.place_cm / 100; ALIGN = args.align_cm / 100
     nm = lambda o: re.sub(r"_\d+$", "", o).replace("_", " ")
 
@@ -135,6 +138,7 @@ def main():
         ck = (cbody is not None and goalC is not None and
               float(np.linalg.norm(goalC[:2] - body_pos(sim, cbody)[:2])) < 0.08)
         cont_ok.append(int(ck))
+        goalC_raw = goalC.copy() if goalC is not None else None      # basket pos (place head is goal-relative to it)
         if goalC is not None: goalC = goalC + np.array([0, 0, 0.05], np.float32)
 
         z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; phase = "A"
@@ -160,7 +164,21 @@ def main():
 
         opened = False; obj_min_h = 9.9; ee2b_min = 9.9; reached = False
         btrue = body_pos(sim, cbody).astype(np.float32) if cbody is not None else None
-        if phase == "B" and goalC is not None:
+        if args.place_full and phase == "B" and goalC_raw is not None:
+            # ONE unified post-grasp head: carry -> descend -> release (gripper is the head's own output)
+            opened_steps = 0
+            for step in range(args.maxB + args.maxC):
+                ee = np.asarray(obs["robot0_eef_pos"], np.float32)
+                a = act(pf, goalC_raw, obs)                          # full action incl LEARNED gripper
+                obs, _, done, _ = env.step(a.tolist())
+                obj_min_h = min(obj_min_h, float(body_pos(sim, rb[T])[2] - z0))
+                if btrue is not None: ee2b_min = min(ee2b_min, float(np.linalg.norm(ee[:2]-btrue[:2])))
+                if ee2b_min < ALIGN: reached = True
+                if a[6] < 0: opened = True; opened_steps += 1
+                if opened and opened_steps > 25: break
+            for _ in range(15):                                      # settle
+                obs, _, done, _ = env.step(act(tp, goalC + np.array([0,0,0.18],np.float32), obs, grip=-1.0).tolist())
+        elif phase == "B" and goalC is not None:
             for step in range(args.maxB):
                 ee = np.asarray(obs["robot0_eef_pos"], np.float32)
                 obs, _, done, _ = env.step(act(tp, goalC, obs, grip=1.0).tolist())
