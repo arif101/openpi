@@ -48,7 +48,7 @@ def main():
         return None if best is None else (best[1], best[2])
 
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
-    rows, berrs = [], []
+    rows, berrs, lifts = [], [], []
     for bf in bddls:
         instr, objs, targets, distractors = parse_bddl(bf)
         if not targets or not distractors:
@@ -60,6 +60,7 @@ def main():
         env.seed(args.seed); env.reset(); obs = env.reset()
         sim = env.env.sim; rb = resolve_bodies(sim, [T, M])
         w2c = CU.get_camera_transform_matrix(sim, args.cam, H, W); c2w = np.linalg.inv(w2c)
+        z0T, z0M = body_pos(sim, rb[T])[2], body_pos(sim, rb[M])[2]; liftT, liftM = 0.0, 0.0
         goal = None; rT, rM = 1e9, 1e9; gerr = None
         for step in range(args.horizon):
             if goal is None or step % args.rebind == 0:
@@ -83,20 +84,24 @@ def main():
                                       jnp.asarray(np.asarray(obs["robot0_gripper_qpos"], np.float32))))
             obs, _, done, info = env.step(a.tolist())
             E = np.asarray(obs["robot0_eef_pos"], np.float32)
-            rT = min(rT, float(np.linalg.norm(E - body_pos(sim, rb[T]))))
-            rM = min(rM, float(np.linalg.norm(E - body_pos(sim, rb[M]))))
+            pT = body_pos(sim, rb[T]); pM = body_pos(sim, rb[M])
+            rT = min(rT, float(np.linalg.norm(E - pT))); rM = min(rM, float(np.linalg.norm(E - pM)))
+            liftT = max(liftT, pT[2] - z0T); liftM = max(liftM, pM[2] - z0M)
             if done:
                 break
         env.close()
-        rows.append(rT < rM if goal is not None else False)
+        reached = rT < rM if goal is not None else False
+        lifted = liftT > 0.03 and liftT > liftM                      # picked up the NAMED object
+        rows.append(reached); lifts.append(lifted)
         if gerr is not None:
             berrs.append(gerr)
         ge = f"{gerr*100:.1f}cm" if gerr is not None else "NOLOC"
         print(f"  {pathlib.Path(bf).stem[:22]:24s} T={nm(T):13s} | bind={ge} "
-              f"reach_T={rT*100:.0f} reach_M={rM*100:.0f} reached={rows[-1]}", flush=True)
+              f"reach_T={rT*100:.0f} reach_M={rM*100:.0f} reached={reached} liftT={liftT*100:.0f}cm lifted={lifted}", flush=True)
     n = len(rows)
-    print(f"\n=== END-TO-END OWLv2 (no oracle, N={n}) ===", flush=True)
-    print(f"  reaches named target: {sum(rows)}/{n} = {sum(rows)/n*100:.0f}%   (baseline 20%, pi0.5-feat 50%, oracle 90%)", flush=True)
+    print(f"\n=== END-TO-END OWLv2 (no oracle, N={n}, seed={args.seed}) ===", flush=True)
+    print(f"  reaches named target: {sum(rows)}/{n} = {sum(rows)/n*100:.0f}%   (baseline 20%, pi0.5-feat 50%, CAG 30%, oracle 90%)", flush=True)
+    print(f"  LIFTS named target:   {sum(lifts)}/{n} = {sum(lifts)/n*100:.0f}%   (task-relevant grasp success)", flush=True)
     print(f"  bind_err mean {np.mean(berrs)*100:.1f}cm over {len(berrs)} localized", flush=True)
     print("EVAL_E2E_OWL_EXIT=0", flush=True)
 
