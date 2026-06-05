@@ -8,10 +8,10 @@ import argparse, glob, pathlib, pickle
 import jax, jax.numpy as jnp, numpy as np, optax
 
 
-def init(key, dh=128):
+def init(key, din=4, dh=128):
     k = jax.random.split(key, 3)
     s = lambda kk, a, b: jax.random.normal(kk, (a, b)) * (1.0 / np.sqrt(a))
-    return {"w1": s(k[0], 4, dh), "b1": jnp.zeros(dh), "w2": s(k[1], dh, dh), "b2": jnp.zeros(dh),
+    return {"w1": s(k[0], din, dh), "b1": jnp.zeros(dh), "w2": s(k[1], dh, dh), "b2": jnp.zeros(dh),
             "w3": s(k[2], dh, 3) * 0.1, "b3": jnp.zeros(3)}
 
 
@@ -33,8 +33,9 @@ def main():
         d = np.load(f, allow_pickle=True); B.append(d["box"]); Y.append(d["pos"])
         (te if str(d["obj"]) in holdout else tr).append(i)
     B = jnp.asarray(np.stack(B)); Y = jnp.asarray(np.stack(Y)); tr = np.array(tr)
-    print(f"{len(files)} pairs, train={len(tr)} holdout={len(te)}", flush=True)
-    params = init(jax.random.key(0)); opt = optax.adam(args.lr); st = opt.init(params)
+    din = int(B.shape[1])
+    print(f"{len(files)} pairs, din={din}, train={len(tr)} holdout={len(te)}", flush=True)
+    params = init(jax.random.key(0), din); opt = optax.adam(args.lr); st = opt.init(params)
     lf = lambda p, b, y: jnp.mean(jnp.sum((apply(p, b) - y) ** 2, -1))
     gf = jax.jit(jax.value_and_grad(lf)); rng = np.random.default_rng(0)
     for step in range(args.steps):
