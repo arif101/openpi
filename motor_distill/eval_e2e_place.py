@@ -60,9 +60,9 @@ def main():
 
     def act(goal, obs, grip=None):
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
-        a = np.asarray(head_apply(rp, jnp.asarray(ee - goal),
-                                  jnp.asarray(np.asarray(obs["robot0_eef_quat"], np.float32)),
-                                  jnp.asarray(np.asarray(obs["robot0_gripper_qpos"], np.float32))))
+        a = np.array(head_apply(rp, jnp.asarray(ee - goal),
+                                jnp.asarray(np.asarray(obs["robot0_eef_quat"], np.float32)),
+                                jnp.asarray(np.asarray(obs["robot0_gripper_qpos"], np.float32))))
         if grip is not None:
             a[6] = grip
         return a
