@@ -17,7 +17,7 @@ def main():
     ap.add_argument("--n", type=int, default=10); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--maxA", type=int, default=110); ap.add_argument("--maxB", type=int, default=110)
     ap.add_argument("--thr", type=float, default=0.01); ap.add_argument("--cam", default="agentview")
-    ap.add_argument("--place-cm", type=float, default=12.0)
+    ap.add_argument("--place-cm", type=float, default=12.0); ap.add_argument("--grasp-dz", type=float, default=-0.03)
     args = ap.parse_args()
     import torch
     from transformers import Owlv2Processor, Owlv2ForObjectDetection
@@ -85,7 +85,7 @@ def main():
             if M: rM = min(rM, float(np.linalg.norm(E - body_pos(sim, rb[M]))))
         for step in range(args.maxA):                                   # phase 0: grasp
             if gA is None or step % 20 == 0:
-                g = to_goal(obs, sim, c2w, nm(T))
+                g = to_goal(obs, sim, c2w, nm(T), dz=args.grasp_dz)      # aim into object body, not top surface
                 if g is not None: gA = g
             if gA is None: break
             obs, _, done, _ = env.step(act(gA, obs, 0).tolist()); upd_reach()
