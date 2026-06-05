@@ -12,8 +12,11 @@ from cf_harness import parse_bddl, run_episode, build_obs
 class CAGPolicy:
     def __init__(self, policy, w):
         from openpi.models import model as _model
+        from openpi.shared import nnx_utils
         self._m = _model; self.p = policy; self.model = policy._model; self.w = w
         self._rng = jax.random.key(0)
+        # jit the CFG sampler (else eager double-forward-pass per step is ~10-50x slower)
+        self._cfg = nnx_utils.module_jit(self.model.sample_actions_cfg, static_argnames=("w", "num_steps"))
 
     def _obs(self, obs_dict):
         inp = self.p._input_transform(jax.tree.map(lambda x: x, obs_dict))
@@ -24,7 +27,7 @@ class CAGPolicy:
         oc = self._obs(obs)
         ou = self._obs({**obs, "prompt": ""})            # unconditional = empty prompt
         self._rng, k = jax.random.split(self._rng)
-        a = np.asarray(self.model.sample_actions_cfg(k, oc, ou, w=self.w)[0])
+        a = np.asarray(self._cfg(k, oc, ou, w=self.w)[0])
         return self.p._output_transform({"state": np.zeros(8, np.float32), "actions": a})
 
 
