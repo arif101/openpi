@@ -26,9 +26,12 @@ def main():
     ap.add_argument("--container", default="basket")
     ap.add_argument("--n", type=int, default=12); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--maxA", type=int, default=90); ap.add_argument("--maxB", type=int, default=90)
+    ap.add_argument("--grasp-lift", type=float, default=0.04)   # sustained lift required before transporting (firm-hold proxy)
     ap.add_argument("--maxC", type=int, default=60); ap.add_argument("--thr", type=float, default=0.01)
     ap.add_argument("--cam", default="agentview"); ap.add_argument("--align-cm", type=float, default=6.0)
     ap.add_argument("--place-cm", type=float, default=12.0); ap.add_argument("--descend", type=float, default=0.06)
+    ap.add_argument("--conv-cm", type=float, default=1.5)   # release when EE settles (attractor convergence)
+    ap.add_argument("--debug-c", action="store_true")       # dump phase-C trajectory of first episode
     args = ap.parse_args()
     import torch
     from transformers import Owlv2Processor, Owlv2ForObjectDetection
@@ -105,8 +108,9 @@ def main():
                 if g is not None: goalT = g
             if goalT is None: break
             obs, _, done, _ = env.step(act(rp, goalT, obs).tolist())
-            lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
-            if lifted > 0.04: phase = "B"; break
+            cur_lift = body_pos(sim, rb[T])[2] - z0
+            lifted = max(lifted, cur_lift)
+            if cur_lift > args.grasp_lift: phase = "B"; break   # require CURRENT (sustained) lift, not peak
 
         opened = False
         if phase == "B":
@@ -120,20 +124,41 @@ def main():
                 if float(np.linalg.norm(ee[:2] - goalC[:2])) < ALIGN:
                     phase = "C"; break
         if phase == "C":
-            goalP = goalC - np.array([0, 0, args.descend], np.float32)   # descend target
-            for step in range(args.maxC):                    # C: transport drives position, place-servo the gripper
-                gcmd = grip_of(pp, goalC, obs)               # learned WHEN-to-open
-                obs, _, done, _ = env.step(act(tp, goalP, obs, grip=gcmd).tolist())
+            goalP = goalC - np.array([0, 0, args.descend], np.float32)   # descend target (lower z)
+            btrue = body_pos(sim, cbody).astype(np.float32) if cbody is not None else goalC
+            trace = []                                        # release at DESCENT NADIR over the basket (gate preview)
+            start_z = float(np.asarray(obs["robot0_eef_pos"], np.float32)[2])
+            z_min = np.inf; descended = False
+            for step in range(args.maxC):                    # C: transport descends; release at lowest point
+                ee = np.asarray(obs["robot0_eef_pos"], np.float32)
+                z = float(ee[2]); z_min = min(z_min, z)
+                descended = descended or (start_z - z_min > args.descend - 0.02)
+                nadir = descended and z > z_min + 0.015        # started rising after descending = lowest point
+                trace.append((step, ee.copy(), z, float(np.linalg.norm(ee[:2] - btrue[:2]))))
+                if opened:
+                    goal_use = goalC + np.array([0, 0, 0.12], np.float32)   # retract empty gripper up & away
+                    gcmd = -1.0
+                else:
+                    goal_use = goalP; gcmd = -1.0 if nadir else 1.0
+                obs, _, done, _ = env.step(act(tp, goal_use, obs, grip=gcmd).tolist())
                 if gcmd < 0: opened = True
-                if opened and step > 5: break
+            for _ in range(20):                                # let the object settle before scoring
+                obs, _, done, _ = env.step(act(tp, goalC + np.array([0, 0, 0.15], np.float32), obs, grip=-1.0).tolist())
+            if args.debug_c and not getattr(main, "_dumped", False):
+                main._dumped = True
+                print(f"      [phaseC trace] btrue_xy={np.round(btrue[:2],2)} goalP={np.round(goalP,2)}", flush=True)
+                for (s, e, zz, dt) in trace[::4]:
+                    print(f"        step{s:2d} ee={np.round(e,2)} z={zz*100:4.0f}cm dxy2true={dt*100:4.0f}cm", flush=True)
+                print(f"        min z={min(t[2] for t in trace)*100:.0f}cm  min dxy2true={min(t[3] for t in trace)*100:.0f}cm", flush=True)
 
-        placed = False
+        placed = False; objdist = -1.0; objz = -1.0
         if cbody is not None:
             cT = body_pos(sim, rb[T]); cC = body_pos(sim, cbody)
-            placed = bool(lifted > 0.04 and np.linalg.norm(cT[:2] - cC[:2]) < PLACE)
+            objdist = float(np.linalg.norm(cT[:2] - cC[:2])); objz = float(cT[2])
+            placed = bool(lifted > 0.04 and objdist < PLACE)
         env.close(); succ.append(placed)
         print(f"  {pathlib.Path(bf).stem[:24]:26s} T={nm(T):13s} | lift={lifted*100:3.0f}cm phase={phase} "
-              f"opened={int(opened)} placed={placed}", flush=True)
+              f"opened={int(opened)} obj2basket={objdist*100:4.0f}cm objz={objz*100:3.0f}cm placed={placed}", flush=True)
     n = len(succ)
     print(f"\n=== FULL pick+place SUCCESS (factored MoE primitives, N={n}, seed={args.seed}) ===", flush=True)
     print(f"  success: {sum(succ)}/{n} = {sum(succ)/n*100:.0f}%   (CAG bar = 21.7%, prior hardcoded = 0%)", flush=True)
