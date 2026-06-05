@@ -64,11 +64,22 @@ language-named object on objects/scenes it was never trained on. This is the str
 ## Limitations / next
 - 3 wrong-object failures are inherent OWLv2 confusions on ambiguous grocery items (cream cheese / ketchup /
   chocolate pudding); a stronger detector or wrist-cam refinement could help.
-- **Full pick+place tested: 0/10 success, but PICK works** — 5/10 grasp+lift and enter the transport phase;
-  transport-and-release fails because the reach head was distilled ONLY on reaching (never on navigating while
-  holding an object or releasing at a 2nd goal). **The place phase needs a dedicated head/controller** (distill
-  π0.5's place actions, or a transport-while-holding policy) — the clear next build. Grounding+grasp (the hard
-  binding problem) is solved; place is mechanical follow-on.
+## Unified motor + no-regression (single conditioned head, not per-action heads)
+Distilled ONE phase-conditioned attractor motor from reach + π0.5's full pick+place demos (40/40 π0.5 success);
+the task is a *plan* over (goal, phase), not a head per verb.
+- **No-regression gate PASSED**: unified motor reach **80%** (was 67%), grasp **50%** (was 47%) — adding place
+  training did NOT forget reach/grasp. The single conditioned head absorbs capability cleanly (no head-zoo
+  needed; primitive/MoE design deferred until a capability actually regresses).
+- **Full pick+place = 0/10**, and the cause is NOT interference — it's **grasp firmness**: deployment grasps
+  lift only 4–6cm (π0.5 demos lift 19–26cm) because the OWLv2 goal is ~5cm off → the gripper closes off-axis →
+  marginal grasp → object drops in transport. Vertical goal-offset had zero effect → the error is **horizontal**.
+- **Fix = closed-loop wrist-camera grasp**: at grasp range the object fills the wrist view → precise horizontal
+  localization → firm close. The third-person OWLv2 (~5cm) is the binding floor; reaching tolerates it, grasping
+  for transport does not. This is the well-scoped next build (and the natural seed of the metacognitive re-grasp loop).
+
+## Limitations / next (continued)
+- 3 wrong-object failures are inherent OWLv2 confusions on ambiguous grocery items (cream cheese / ketchup /
+  chocolate pudding); a stronger detector or the same wrist-cam refinement could help.
 - Sim depth is exact; real-world transfer = swap in MOMA-calibrated monocular depth (1–3mm) — a calibrated
   peripheral, not a research problem.
 
