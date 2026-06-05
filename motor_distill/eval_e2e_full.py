@@ -62,27 +62,33 @@ def main():
                                    jnp.asarray([float(phase)])))
 
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
-    succ, lifts = [], []
+    succ, lifts, reaches = [], [], []
     for bf in bddls:
         instr, objs, targets, distractors = parse_bddl(bf)
         if not targets:
             continue
-        T = targets[0]
+        T = targets[0]; M = distractors[0] if distractors else None
         env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=H, camera_widths=W, camera_depths=True)
         env.seed(args.seed); env.reset(); obs = env.reset()
         sim = env.env.sim
         try:
-            rb = resolve_bodies(sim, [T, args.container + "_1"]); cb = rb[args.container + "_1"]
+            bl = [T, args.container + "_1"] + ([M] if M else [])
+            rb = resolve_bodies(sim, bl); cb = rb[args.container + "_1"]
         except Exception:
             env.close(); continue
         w2c = CU.get_camera_transform_matrix(sim, args.cam, H, W); c2w = np.linalg.inv(w2c)
-        z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; gA = None; gB = None
+        z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; gA = None; gB = None; rT, rM = 1e9, 1e9
+        def upd_reach():
+            nonlocal rT, rM
+            E = np.asarray(obs["robot0_eef_pos"], np.float32)
+            rT = min(rT, float(np.linalg.norm(E - body_pos(sim, rb[T]))))
+            if M: rM = min(rM, float(np.linalg.norm(E - body_pos(sim, rb[M]))))
         for step in range(args.maxA):                                   # phase 0: grasp
             if gA is None or step % 20 == 0:
                 g = to_goal(obs, sim, c2w, nm(T))
                 if g is not None: gA = g
             if gA is None: break
-            obs, _, done, _ = env.step(act(gA, obs, 0).tolist())
+            obs, _, done, _ = env.step(act(gA, obs, 0).tolist()); upd_reach()
             lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
             if lifted > 0.04: break
         if lifted > 0.04:
@@ -94,11 +100,13 @@ def main():
                 obs, _, done, _ = env.step(act(gB, obs, 1).tolist())
         mpz = body_pos(sim, rb[T]); cpz = body_pos(sim, cb)
         placed = bool(lifted > 0.04 and np.linalg.norm(mpz[:2] - cpz[:2]) < args.place_cm / 100)
-        env.close(); succ.append(placed); lifts.append(lifted > 0.04)
-        print(f"  {pathlib.Path(bf).stem[:24]:26s} T={nm(T):13s} | lifted={lifted*100:.0f}cm placed={placed}", flush=True)
+        reached = (rT < rM) if M else (rT < 0.08)
+        env.close(); succ.append(placed); lifts.append(lifted > 0.04); reaches.append(reached)
+        print(f"  {pathlib.Path(bf).stem[:24]:26s} T={nm(T):13s} | reached={reached} lifted={lifted*100:.0f}cm placed={placed}", flush=True)
     n = len(succ)
     print(f"\n=== FULL pick+place, UNIFIED motor (N={n}, seed={args.seed}) ===", flush=True)
-    print(f"  lift: {sum(lifts)}/{n} = {sum(lifts)/n*100:.0f}%   success(place): {sum(succ)}/{n} = {sum(succ)/n*100:.0f}%", flush=True)
+    print(f"  NO-REGRESSION  reach: {sum(reaches)}/{n}={sum(reaches)/n*100:.0f}% (old 67%)  grasp/lift: {sum(lifts)}/{n}={sum(lifts)/n*100:.0f}% (old 47%)", flush=True)
+    print(f"  NEW CAPABILITY success(place): {sum(succ)}/{n} = {sum(succ)/n*100:.0f}%", flush=True)
     print("EVAL_E2E_FULL_EXIT=0", flush=True)
 
 
