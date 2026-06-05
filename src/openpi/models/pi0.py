@@ -415,6 +415,55 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
 
+    def sample_actions_cfg(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        observation_uncond: _model.Observation,
+        *,
+        w: float = 1.0,
+        num_steps: int = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        """Classifier-free guidance over the LANGUAGE condition (= the CAG baseline / amplification probe).
+        Per flow step: v = v_uncond + w*(v_cond - v_uncond). w=1 is the stock conditional policy; w>1
+        AMPLIFIES the instruction's effect (the language->target circuit). observation/_uncond share pixels
+        and proprio; _uncond carries an empty prompt. Sizes whether the existing weak circuit is salvageable
+        by gain alone, and is the published inference-time grounding baseline (CAG)."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        observation_uncond = _model.preprocess_observation(None, observation_uncond, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        def build_prefix(obs):
+            pt, pm, par = self.embed_prefix(obs)
+            _, kv = self.PaliGemma.llm([pt, None], mask=make_attn_mask(pm, par),
+                                       positions=jnp.cumsum(pm, axis=1) - 1)
+            return pm, kv
+
+        pm_c, kv_c = build_prefix(observation)
+        pm_u, kv_u = build_prefix(observation_uncond)
+
+        def velocity(pm, kv, x_t, time):
+            st, sm, sar, ad = self.embed_suffix(observation, x_t, jnp.broadcast_to(time, batch_size))
+            pam = einops.repeat(pm, "b p -> b s p", s=st.shape[1])
+            full = jnp.concatenate([pam, make_attn_mask(sm, sar)], axis=-1)
+            pos = jnp.sum(pm, axis=-1)[:, None] + jnp.cumsum(sm, axis=-1) - 1
+            (_, so), _ = self.PaliGemma.llm([None, st], mask=full, positions=pos, kv_cache=kv,
+                                            adarms_cond=[None, ad])
+            return self.action_out_proj(so[:, -self.action_horizon :])
+
+        x_t, time = noise, 1.0
+        for _ in range(num_steps):
+            v_c = velocity(pm_c, kv_c, x_t, time)
+            v_u = velocity(pm_u, kv_u, x_t, time)
+            v = v_u + w * (v_c - v_u)
+            x_t = x_t + dt * v
+            time = time + dt
+        return x_t
+
     def sample_actions_bound_train(
         self,
         observation: _model.Observation,
