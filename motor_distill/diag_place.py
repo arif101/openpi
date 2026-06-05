@@ -25,6 +25,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bddl-dir", default="data/libero_pro/bddl_files/libero_object_task")
     ap.add_argument("--reach-head", default="runs/reach_head.pkl")
+    ap.add_argument("--transport-head", default="")   # if set, use a dedicated transport primitive for phase B
     ap.add_argument("--container", default="basket")
     ap.add_argument("--n", type=int, default=12); ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--maxA", type=int, default=90); ap.add_argument("--maxB", type=int, default=120)
@@ -40,6 +41,8 @@ def main():
     owlp = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
     owlm = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble").to(dev).eval()
     rp = jax.tree.map(jnp.asarray, pickle.load(open(args.reach_head, "rb")))
+    tp = jax.tree.map(jnp.asarray, pickle.load(open(args.transport_head, "rb"))) if args.transport_head else rp
+    print(f"phase-B head: {'transport_head' if args.transport_head else 'reach_head (shared)'}", flush=True)
     H = W = 256
     nm = lambda o: re.sub(r"_\d+$", "", o).replace("_", " ")
     PLACE = args.place_cm / 100
@@ -66,9 +69,9 @@ def main():
         return np.asarray(CU.transform_from_pixels_to_world(np.array([cy, cx], float),
                                                             np.full((H, W, 1), d), c2w)[:3], np.float32)
 
-    def act(goal, obs, grip=None):
+    def act(params, goal, obs, grip=None):
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
-        a = np.array(head_apply(rp, jnp.asarray(ee - goal),
+        a = np.array(head_apply(params, jnp.asarray(ee - goal),
                                 jnp.asarray(np.asarray(obs["robot0_eef_quat"], np.float32)),
                                 jnp.asarray(np.asarray(obs["robot0_gripper_qpos"], np.float32))))
         if grip is not None:
@@ -105,7 +108,7 @@ def main():
                     goalT = g
             if goalT is None:
                 break
-            obs, _, done, _ = env.step(act(goalT, obs).tolist())
+            obs, _, done, _ = env.step(act(rp, goalT, obs).tolist())
             lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
             if lifted > 0.04:
                 phase = "B"; break
@@ -131,7 +134,7 @@ def main():
                 grip = (-1.0 if near else args.grip_close)
                 if near:
                     released = True
-                obs, _, done, _ = env.step(act(goalC, obs, grip=grip).tolist())
+                obs, _, done, _ = env.step(act(tp, goalC, obs, grip=grip).tolist())
                 ee_end = np.asarray(obs["robot0_eef_pos"], np.float32)
                 obj_h = body_pos(sim, rb[T])[2] - z0
                 if (not released) and obj_h < 0.02:    # object fell while still "held"
