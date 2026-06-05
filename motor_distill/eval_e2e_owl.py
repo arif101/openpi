@@ -17,7 +17,7 @@ def main():
     ap.add_argument("--reach-head", default="runs/reach_head.pkl")
     ap.add_argument("--n", type=int, default=12); ap.add_argument("--horizon", type=int, default=140)
     ap.add_argument("--rebind", type=int, default=25); ap.add_argument("--cam", default="agentview")
-    ap.add_argument("--thr", type=float, default=0.03)
+    ap.add_argument("--thr", type=float, default=0.03); ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
     import torch
     from transformers import Owlv2Processor, Owlv2ForObjectDetection
@@ -33,16 +33,19 @@ def main():
 
     @torch.no_grad()
     def locate(img, names, ti):
-        inp = owlp(text=[names], images=Image.fromarray(img), return_tensors="pt").to(dev)
-        o = owlm(**inp)
-        r = owlp.post_process_grounded_object_detection(
-            o, threshold=args.thr, target_sizes=torch.tensor([[H, W]]).to(dev))[0]
-        labels = r["labels"].cpu().numpy(); scores = r["scores"].cpu().numpy(); boxes = r["boxes"].cpu().numpy()
-        m = labels == ti
-        if not m.any():
-            return None
-        b = boxes[m][scores[m].argmax()]
-        return int((b[1] + b[3]) / 2), int((b[0] + b[2]) / 2)        # (row=cy, col=cx)
+        tgt = names[ti]
+        # per-target query with prompt variants + low threshold to maximize recall; take best box.
+        queries = [tgt, f"a {tgt}", f"a photo of a {tgt}", f"{tgt} package", f"{tgt} bottle"]
+        best = None
+        for q in queries:
+            inp = owlp(text=[[q]], images=Image.fromarray(img), return_tensors="pt").to(dev)
+            r = owlp.post_process_grounded_object_detection(
+                owlm(**inp), threshold=args.thr, target_sizes=torch.tensor([[H, W]]).to(dev))[0]
+            sc = r["scores"].cpu().numpy()
+            if len(sc) and (best is None or sc.max() > best[0]):
+                b = r["boxes"].cpu().numpy()[sc.argmax()]
+                best = (float(sc.max()), int((b[1] + b[3]) / 2), int((b[0] + b[2]) / 2))
+        return None if best is None else (best[1], best[2])
 
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
     rows, berrs = [], []
@@ -54,7 +57,7 @@ def main():
         present = list(dict.fromkeys((targets or []) + (distractors or [])))
         names = [nm(o) for o in present]; ti = present.index(T)
         env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=H, camera_widths=W, camera_depths=True)
-        env.seed(7); env.reset(); obs = env.reset()
+        env.seed(args.seed); env.reset(); obs = env.reset()
         sim = env.env.sim; rb = resolve_bodies(sim, [T, M])
         w2c = CU.get_camera_transform_matrix(sim, args.cam, H, W); c2w = np.linalg.inv(w2c)
         goal = None; rT, rM = 1e9, 1e9; gerr = None
