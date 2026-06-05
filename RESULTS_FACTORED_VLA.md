@@ -39,6 +39,17 @@ language ─► [OWLv2 open-vocab binding] ─► 3D goal ─► [distilled goal
 - **>2× over CAG** (67% vs 30%), the inference-time baseline.
 - **Task-relevant**: actually **lifts the language-named object 47%** vs 20% baseline (2.4×).
 
+## Cross-suite generalization (frozen pipeline, NO retraining)
+Same distilled motor + OWLv2 binder, applied to suites with different objects/scenes:
+| suite | reach-named | note |
+|---|---|---|
+| libero_object (in-distribution) | 67% (±5%) | 3-seed |
+| **libero_10 (kitchen/living-room objects, never distilled)** | **78%** | objects unseen by the motor — generalizes by construction |
+| libero_goal | 100% (N=8) | grounding generalizes; lift n/a (mostly non-pick tasks) |
+
+The motor is object-agnostic and the binder is frozen open-vocab → the pipeline reaches the
+language-named object on objects/scenes it was never trained on. This is the structure-not-coverage result.
+
 ## Key ablations / negative results
 - **Learned binder fails held-out generalization** (2cm train → 20cm on unseen object names) —
   it memorizes. The **open-vocab OWLv2 binder generalizes by construction** (the structure-not-coverage win).
