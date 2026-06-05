@@ -77,6 +77,19 @@ the task is a *plan* over (goal, phase), not a head per verb.
   localization → firm close. The third-person OWLv2 (~5cm) is the binding floor; reaching tolerates it, grasping
   for transport does not. This is the well-scoped next build (and the natural seed of the metacognitive re-grasp loop).
 
+## Full pick+place investigation (4 attempts, all place=0%) — multi-factor, deferred
+- place-head (scripted), unified phase-conditioned motor, wrist-camera OWLv2 refinement, primitive-basis
+  (firmer reach-grasp + place primitive) — ALL reach place=0/10.
+- **Grasp firmness is improvable** (primitive basis lifts 8–9cm vs unified 4–6cm — un-diluting helps), but
+  **place still fails**, so the bottleneck is the PLACE PHASE itself (transport stability + basket binding +
+  release timing), not only grasp. Multi-factor; needs dedicated debugging, not one fix.
+- **Wrist-camera OWLv2 refinement is DEAD**: geometry was a convention bug (wrist=vraw, agentview=vflip; now
+  known), but OWLv2 fails to detect in the extreme close-up wrist view (1/8) — detector-scale limit. The
+  principled fix for fine grasp is a learned vision-SERVO primitive (reads wrist FEATURES, not detections) —
+  a re-collect + distill build, deferred.
+- **Verdict**: grounding + grasp (the hard binding problem) is solved and strong; full task SUCCESS (place)
+  is a separable, multi-factor follow-on, not part of the core contribution.
+
 ## Limitations / next (continued)
 - 3 wrong-object failures are inherent OWLv2 confusions on ambiguous grocery items (cream cheese / ketchup /
   chocolate pudding); a stronger detector or the same wrist-cam refinement could help.
