@@ -73,15 +73,10 @@ def main():
         d = float(np.percentile(reg[reg>0], 15)) if (reg>0).any() else float(rd[cy,cx,0])
         return np.asarray(CU.transform_from_pixels_to_world(np.array([cy,cx],float), np.full((H,H,1),d), c2w)[:3], np.float32)
 
-    pos_fn = jax.jit(head_apply_unified); gate_fn = jax.jit(gate_apply)
-    def step_action(goalT, goalC, obs):
-        ee = np.asarray(obs["robot0_eef_pos"], np.float32)
-        grip = np.asarray(obs["robot0_gripper_qpos"], np.float32)
-        q = np.asarray(obs["robot0_eef_quat"], np.float32)
-        a = np.array(pos_fn(uh, jnp.asarray(ee-goalT), jnp.asarray(ee-goalC), jnp.asarray(q), jnp.asarray(grip)))
-        f = (feats(ee, goalT, goalC, grip) - gmu) / gsd        # learned gate decides the gripper
-        a[6] = 1.0 if float(gate_fn(gp, jnp.asarray(f))) > 0 else -1.0
-        return a
+    gate_fn = jax.jit(gate_apply); KA = 5.0
+    def gate_close(ee, goalT, goalC, grip):
+        f = (feats(ee, goalT, goalC, grip) - gmu) / gsd        # learned gate: P(close) from convergence
+        return float(gate_fn(gp, jnp.asarray(f))) > 0
 
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
     bind_ok, cont_ok, grasp_ok, full_ok = [], [], [], []
@@ -107,13 +102,24 @@ def main():
         cont_ok.append(int(cbody is not None and goalC is not None and np.linalg.norm(goalC[:2]-body_pos(sim,cbody)[:2]) < 0.08))
         if goalT is None or goalC is None:
             grasp_ok.append(0); full_ok.append(0); env.close(); print(f"  {nm(T):14s} NO BIND", flush=True); continue
-        z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; ee2b_min = 9.9
+        z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; ee2b_min = 9.9; ptr = 0; released = 0
         btrue = body_pos(sim, cbody).astype(np.float32) if cbody is not None else None
+        # emitter sub-goal plan: [(object, close), (container, open)]; gate advances the pointer on convergence
         for step in range(args.horizon):
             ee = np.asarray(obs["robot0_eef_pos"], np.float32)
+            grip = np.asarray(obs["robot0_gripper_qpos"], np.float32)
             if btrue is not None: ee2b_min = min(ee2b_min, float(np.linalg.norm(ee[:2]-btrue[:2])))
-            obs, _, done, _ = env.step(step_action(goalT, goalC, obs).tolist())
+            target = goalT if ptr == 0 else goalC               # pure attractor to CURRENT sub-goal target
+            close = gate_close(ee, goalT, goalC, grip)
+            if ptr == 0 and close:                              # gate fired grasp -> advance to place sub-goal
+                ptr = 1
+            a = np.zeros(7, np.float32)
+            a[:3] = np.clip(KA * (target - ee), -1.0, 1.0)
+            a[6] = 1.0 if close else -1.0                       # gate decides gripper
+            if ptr == 1 and not close: released += 1            # gate fired release at container
+            obs, _, done, _ = env.step(a.tolist())
             lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
+            if released > 8: break                              # settled after release
             if done: break
         placed = False; objdist = -1.0
         if cbody is not None:
