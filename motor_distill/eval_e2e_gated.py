@@ -78,7 +78,7 @@ def main():
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
         grip = np.asarray(obs["robot0_gripper_qpos"], np.float32)
         q = np.asarray(obs["robot0_eef_quat"], np.float32)
-        a = np.asarray(pos_fn(uh, jnp.asarray(ee-goalT), jnp.asarray(ee-goalC), jnp.asarray(q), jnp.asarray(grip)))
+        a = np.array(pos_fn(uh, jnp.asarray(ee-goalT), jnp.asarray(ee-goalC), jnp.asarray(q), jnp.asarray(grip)))
         f = (feats(ee, goalT, goalC, grip) - gmu) / gsd        # learned gate decides the gripper
         a[6] = 1.0 if float(gate_fn(gp, jnp.asarray(f))) > 0 else -1.0
         return a
