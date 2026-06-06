@@ -21,6 +21,7 @@ def main():
     ap.add_argument("--seed", type=int, default=7); ap.add_argument("--hi", type=int, default=1024)
     ap.add_argument("--horizon", type=int, default=320); ap.add_argument("--thr", type=float, default=0.0)
     ap.add_argument("--place-cm", type=float, default=12.0)
+    ap.add_argument("--carry-height", type=float, default=0.15)   # approach basket from ABOVE (clear the rim)
     args = ap.parse_args()
     import torch
     from transformers import CLIPModel, CLIPProcessor, Owlv2Processor, Owlv2ForObjectDetection
@@ -104,12 +105,17 @@ def main():
             grasp_ok.append(0); full_ok.append(0); env.close(); print(f"  {nm(T):14s} NO BIND", flush=True); continue
         z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; ee2b_min = 9.9; ptr = 0; released = 0
         btrue = body_pos(sim, cbody).astype(np.float32) if cbody is not None else None
+        do_trace = (not any(bind_ok[:-1])) and bind_ok[-1]    # trace the FIRST bound episode
+        if do_trace:
+            print(f"   [TRACE {nm(T)}] goalT={np.round(goalT,2)} goalC={np.round(goalC,2)} btrue={np.round(btrue,2) if btrue is not None else None}", flush=True)
         # emitter sub-goal plan: [(object, close), (container, open)]; gate advances the pointer on convergence
         for step in range(args.horizon):
             ee = np.asarray(obs["robot0_eef_pos"], np.float32)
             grip = np.asarray(obs["robot0_gripper_qpos"], np.float32)
             if btrue is not None: ee2b_min = min(ee2b_min, float(np.linalg.norm(ee[:2]-btrue[:2])))
-            target = goalT if ptr == 0 else goalC               # pure attractor to CURRENT sub-goal target
+            # carry approaches basket from ABOVE (clear the rim), descends once horizontally over it
+            over = float(np.linalg.norm(ee[:2] - goalC[:2])) < 0.06
+            target = goalT if ptr == 0 else (goalC if over else goalC + np.array([0,0,args.carry_height], np.float32))
             close = gate_close(ee, goalT, goalC, grip)
             if ptr == 0 and close:                              # gate fired grasp -> advance to place sub-goal
                 ptr = 1
@@ -117,6 +123,10 @@ def main():
             a[:3] = np.clip(KA * (target - ee), -1.0, 1.0)
             a[6] = 1.0 if close else -1.0                       # gate decides gripper
             if ptr == 1 and not close: released += 1            # gate fired release at container
+            if do_trace and step % 15 == 0:
+                print(f"      s{step:3d} ptr={ptr} close={int(close)} ee={np.round(ee,2)} "
+                      f"tgt={np.round(target,2)} ee2basket={np.linalg.norm(ee[:2]-btrue[:2])*100:.0f}cm "
+                      f"ee2obj={np.linalg.norm(ee[:2]-goalT[:2])*100:.0f}cm", flush=True)
             obs, _, done, _ = env.step(a.tolist())
             lifted = max(lifted, body_pos(sim, rb[T])[2] - z0)
             if released > 8: break                              # settled after release

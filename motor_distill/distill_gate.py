@@ -15,15 +15,17 @@ import argparse, glob, pathlib, pickle
 import jax, jax.numpy as jnp, numpy as np, optax
 
 
-def feats(ee, tgt, cont, grip):
+def feats(ee, tgt, cont, grip=None):
+    # CONVERGENCE features ONLY (no grip -> gate INITIATES the gripper event instead of trailing it;
+    # the earlier grip-conditioned gate was circular: it never fired close because the gripper stayed open).
     ro = ee - tgt; rc = ee - cont
     return np.concatenate([
         np.linalg.norm(ro[..., :2], axis=-1, keepdims=True), ro[..., 2:3],
-        np.linalg.norm(rc[..., :2], axis=-1, keepdims=True), rc[..., 2:3],
-        grip], axis=-1).astype(np.float32)                   # (...,6)
+        np.linalg.norm(rc[..., :2], axis=-1, keepdims=True), rc[..., 2:3]],
+        axis=-1).astype(np.float32)                          # (...,4) convergence to both goals
 
 
-def init_gate(key, din=6, dh=64):
+def init_gate(key, din=4, dh=64):
     k = jax.random.split(key, 3)
     s = lambda kk, a, b: jax.random.normal(kk, (a, b)) * (1.0 / np.sqrt(a))
     return {"w1": s(k[0], din, dh), "b1": jnp.zeros(dh),

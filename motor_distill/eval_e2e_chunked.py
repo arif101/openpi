@@ -105,11 +105,19 @@ def main():
         z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; chunk = None; ci = 0
         btrue = body_pos(sim, cbody).astype(np.float32) if cbody is not None else None
         ee2b_min = 9.9; obj2ee_open = -1.0; open_ee2b = -1.0; opened = False; obj_h_open = -1.0
+        do_trace = (len(grasp_ok) == 1)                       # trace 2nd episode (a grasping one)
+        if do_trace:
+            print(f"   [TRACE {nm(T)}] goalT={np.round(goalT,2)} goalC={np.round(goalC,2)} "
+                  f"btrue={np.round(btrue,2) if btrue is not None else None}", flush=True)
         for step in range(args.horizon):                      # CHUNKED: predict K, execute replan, re-plan
             if chunk is None or ci >= args.replan:
                 chunk = predict_chunk(goalT, goalC, obs); ci = 0
             a = chunk[ci].copy()
             ee = np.asarray(obs["robot0_eef_pos"], np.float32); op = body_pos(sim, rb[T]).astype(np.float32)
+            if do_trace and step % 12 == 0:
+                print(f"      s{step:3d} grip={a[6]:+.1f} ee={np.round(ee,2)} obj={np.round(op,2)} "
+                      f"objH={(op[2]-z0)*100:4.0f}cm objXY2basket={np.linalg.norm(op[:2]-btrue[:2])*100:4.0f}cm "
+                      f"ee2obj={np.linalg.norm(ee[:2]-op[:2])*100:3.0f}cm", flush=True)
             if args.carry_attract > 0 and a[6] > 0 and lifted > 0.04:   # carrying -> drive to goalC (cures undershoot)
                 a[:3] = np.clip(a[:3] + args.carry_attract * (goalC - ee), -1.0, 1.0)
             if btrue is not None: ee2b_min = min(ee2b_min, float(np.linalg.norm(ee[:2]-btrue[:2])))
