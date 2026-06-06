@@ -37,11 +37,11 @@ def motor_apply(p, ee_rel, quat, grip):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data/place"); ap.add_argument("--out", default="runs/motor_v2_head.pkl")
+    ap.add_argument("--data", nargs="+", default=["data/place"]); ap.add_argument("--out", default="runs/motor_v2_head.pkl")
     ap.add_argument("--K", type=int, default=10); ap.add_argument("--steps", type=int, default=8000)
     ap.add_argument("--batch", type=int, default=256); ap.add_argument("--lr", type=float, default=1e-3)
     args = ap.parse_args()
-    files = sorted(glob.glob(str(pathlib.Path(args.data) / "*.npz")))
+    files = sorted(f for d in args.data for f in glob.glob(str(pathlib.Path(d) / "*.npz")))
     RR, Q, G, AC = [], [], [], []
     for f in files:
         d = np.load(f); Tn = len(d["action"]); act = d["action"].astype(np.float32)
