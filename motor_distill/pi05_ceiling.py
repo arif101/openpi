@@ -39,7 +39,7 @@ def main():
         env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256)
         env.seed(args.seed); env.reset(); obs = env.reset(); sim = env.env.sim
         try:
-            rb = resolve_bodies(sim, [M, args.container + "_1"])
+            rb = resolve_bodies(sim, [M, args.container + "_1"]); cb = rb[args.container + "_1"]
         except Exception:
             env.close(); continue
         instr = f"pick up the {nm(M)} and place it in the {args.container}"
@@ -53,13 +53,14 @@ def main():
             lifted = max(lifted, body_pos(sim, rb[M])[2] - z0)
             if done:
                 break
-        try:
-            ok = bool(env.env._check_success())
-        except Exception:
-            ok = False
+        # CORRECT check: did pi0.5 place its bound object M IN the basket? Geometric (xy<6cm ~= official containment
+        # we validated: OFFICIAL=Y cases all had obj2basket_xy<=5cm). _check_success() wants T (counterfactual), not M.
+        mp = body_pos(sim, rb[M]); cp = body_pos(sim, cb)
+        d_xy = float(np.linalg.norm(mp[:2] - cp[:2]))
+        ok = bool(lifted > 0.04 and d_xy < 0.06)
         succ.append(int(ok)); env.close()
-        print(f"  {nm(M):14s} lifted={lifted*100:3.0f}cm OFFICIAL={'Y' if ok else '.'}", flush=True)
-    print(f"\n=== pi0.5 OWN MOTOR + CORRECT BINDING (N={len(succ)}, seed={args.seed}) OFFICIAL success: {np.mean(succ):.2f} ===", flush=True)
+        print(f"  {nm(M):14s} lifted={lifted*100:3.0f}cm M2basket={d_xy*100:4.0f}cm IN_BASKET={'Y' if ok else '.'}", flush=True)
+    print(f"\n=== pi0.5 OWN MOTOR + CORRECT BINDING (N={len(succ)}, seed={args.seed}) M-in-basket: {np.mean(succ):.2f} ===", flush=True)
     print("PI05_CEILING_EXIT=0", flush=True)
 
 
