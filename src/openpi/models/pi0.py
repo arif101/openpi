@@ -362,6 +362,60 @@ class Pi0(_model.BaseModel):
         )
         return x_0, pooled
 
+    def sample_actions_guided(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        target_state=None,
+        guide_dir: at.Float[at.Array, "b 3"] | None = None,   # WORLD-frame unit dir toward active target
+        guide_w: float = 0.0,                                  # 0 -> identical to sample_actions (frozen policy)
+    ) -> tuple[_model.Actions, at.Float[at.Array, "b d"]]:
+        """VLS-style TRAINING-FREE steering of the FROZEN policy: each denoising step nudges the action's position
+        dims (0:3) toward the external foveation 3D target direction `guide_dir`, scaled by `guide_w`. Trains nothing.
+        guide_w=0 reproduces sample_actions exactly. Caveat (v1, untested): guidance applied in normalized action
+        space assuming LIBERO position dims ~ world EE-delta direction; sweep guide_w."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        if target_state is None:
+            target_state = observation.target_state
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        gvec = jnp.zeros((batch_size, 3)) if guide_dir is None else guide_dir
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _unused), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size), target_state=target_state,
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_s = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_s, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_po, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens], mask=full_attn_mask, positions=positions,
+                kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+            )
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            x_next = x_t + dt * v_t
+            x_next = x_next.at[:, :, 0:3].add(guide_w * gvec[:, None, :])   # VLS-style target guidance
+            return x_next, time + dt
+
+        def cond(carry):
+            return carry[1] >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        mask_expanded = prefix_mask[:, :, None].astype(prefix_out.dtype)
+        pooled = jnp.sum(prefix_out * mask_expanded, axis=1) / jnp.maximum(jnp.sum(mask_expanded, axis=1), 1.0)
+        return x_0, pooled
+
     def sample_actions_bound(
         self,
         rng: at.KeyArrayLike,
