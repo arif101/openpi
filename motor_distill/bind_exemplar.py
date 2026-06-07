@@ -18,6 +18,32 @@ from dino_separability import dino_feat
 _MX = {}
 
 
+def height_proposals(sim, depth_norm, R, cam, vflip=True, lift=0.015, maxh=0.5, min_area=200, max_area=40000):
+    """GEOMETRY-based object proposals: unproject depth -> world height -> every blob ABOVE the table is an object.
+    Perfect recall (anything sitting on the table), centroids ~ object centers. Returns (cy_up, cx_up, mask_up)."""
+    import robosuite.utils.camera_utils as cu
+    from scipy import ndimage
+    real = cu.get_real_depth_map(sim, depth_norm)[..., 0]            # native HxW metric depth
+    w2p = cu.get_camera_transform_matrix(sim, cam, R, R); cam2world = np.linalg.inv(w2p)
+    rows, cols = np.mgrid[0:R, 0:R]
+    z = real
+    cam_pts = np.stack([cols * z, rows * z, z, np.ones_like(z)], -1)  # HxWx4 (col=x,row=y per robosuite)
+    world = cam_pts @ cam2world.T                                    # HxWx4 native-frame
+    height = world[..., 2]
+    table_z = np.percentile(height, 40)
+    obj = (height > table_z + lift) & (height < table_z + maxh)      # objects above table, below arm/background
+    lab, n = ndimage.label(obj)
+    cents = []
+    for i in range(1, n + 1):
+        m = (lab == i); a = int(m.sum())
+        if a < min_area or a > max_area: continue
+        ys, xs = np.where(m); cy, cx = ys.mean(), xs.mean()          # native centroid
+        m_up = m[::-1] if vflip else m
+        cy_up = (R - 1 - cy) if vflip else cy
+        cents.append((cy_up, cx, m_up))
+    return cents
+
+
 def sam_everything_centers(up, device, min_area=1500, max_area=22000, min_compact=0.35, dedup_px=35, pps=24):
     """Class-agnostic SAM 'segment everything' -> OBJECT-LEVEL centroids+masks (perfect recall, no detector text).
     Filter to object-sized COMPACT blobs (not table/parts/whole-scene) + dedup nested masks (keep object granularity)."""
@@ -78,7 +104,7 @@ def exemplar_bind(sim, rgb_native, depth_norm, target_name, all_names, bank, cam
     up = rgb_native[::-1] if vflip else rgb_native
     proto = bank.get(nm(target_name))
     if proto is None: return None, 0
-    cents = sam_everything_centers(up, dev)                        # class-agnostic perfect-recall proposals
+    cents = height_proposals(sim, depth_norm, R, cam, vflip)       # geometry: every object above the table (perfect recall)
     if not cents: return None, 0
     feats = []
     for (cy, cx, m) in cents:
