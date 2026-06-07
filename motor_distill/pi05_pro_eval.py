@@ -46,8 +46,11 @@ def main():
                 inits = None
                 fi = idir / f"{stem}.pruned_init"
                 if fi.exists():
-                    try: inits = np.load(fi, allow_pickle=True)
-                    except Exception: inits = None
+                    try:
+                        import torch
+                        inits = np.asarray(torch.load(fi, weights_only=False))   # torch-saved [N,47] sim states
+                    except Exception as e:
+                        print(f"  [init load failed {stem}: {e}]", flush=True); inits = None
                 instr = parse_bddl(bf)[0]
                 nt = min(args.trials, len(inits)) if inits is not None else args.trials
                 for t in range(nt):

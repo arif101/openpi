@@ -48,12 +48,26 @@ def main():
     from openpi.shared import download
     from libero.libero.envs import OffScreenRenderEnv
     from openpi_client import image_tools
+    import robosuite.utils.camera_utils as CU
+    from PIL import Image
     download.maybe_download(args.checkpoint + "/assets"); download.maybe_download(args.checkpoint + "/params")
     policy = _policy_config.create_trained_policy(_config.get_config(args.config_name), args.checkpoint)
     out = pathlib.Path(args.out); out.mkdir(parents=True, exist_ok=True)
     nm = lambda o: re.sub(r"_\d+$", "", o).replace("_", " ")
     rng = np.random.default_rng(args.seed)
     R = lambda im: image_tools.convert_to_uint8(image_tools.resize_with_pad(np.ascontiguousarray(im[::-1, ::-1]), 224, 224))
+
+    HR = 512   # hi-res render for foveation
+    def fov_crop(sim, xyz, win=130):
+        """ARCHITECTURAL foveation: hi-res render + project the referent's 3D pos -> pixel -> 224 crop (resolvable)."""
+        im = np.asarray(sim.render(camera_name="agentview", width=HR, height=HR))[::-1].copy()  # upright
+        w2p = CU.get_camera_transform_matrix(sim, "agentview", HR, HR)
+        ph = w2p @ np.array([xyz[0], xyz[1], xyz[2], 1.0])
+        col, row = int(ph[0] / ph[2]), int(HR - 1 - ph[1] / ph[2])     # account for [::-1] vertical flip
+        r0, c0 = max(0, row - win), max(0, col - win); r1, c1 = min(HR, row + win), min(HR, col + win)
+        crop = im[r0:r1, c0:c1]
+        if crop.shape[0] < 8 or crop.shape[1] < 8: crop = im
+        return np.asarray(Image.fromarray(crop).resize((224, 224))).astype(np.uint8)
 
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n_scenes]
     kept = 0
@@ -74,7 +88,7 @@ def main():
             instr = f"pick up the {nm(M)} and place it in the {args.container}"
             instr_alt = f"pick up the {nm(M2)} and place it in the {args.container}" if M2 else instr
             z0 = body_pos(sim, rb[M])[2]; chunk = None; ci = 0; lifted = 0.0
-            IM, WR, ST, AC, TR, TA, TW, HT = [], [], [], [], [], [], [], []
+            IM, WR, ST, AC, TR, TA, TW, HT, FV = [], [], [], [], [], [], [], [], []
             for step in range(args.horizon):
                 if chunk is None or ci >= args.replan:
                     o_in = build_obs(np.asarray(obs["agentview_image"]), np.asarray(obs["robot0_eye_in_hand_image"]),
@@ -86,6 +100,7 @@ def main():
                                      np.asarray(obs["robot0_eef_quat"], np.float32),
                                      np.asarray(obs["robot0_gripper_qpos"], np.float32)]).astype(np.float32)
                 ST.append(st); AC.append(a[:7])
+                FV.append(fov_crop(sim, body_pos(sim, rb[M])))     # ARCHITECTURAL: foveated referent view
                 TR.append(body_pos(sim, rb[M]).astype(np.float32))
                 TA.append(body_pos(sim, rb[M2]).astype(np.float32) if M2 else body_pos(sim, rb[M]).astype(np.float32))
                 # (B) invariance twin: teleport a distractor far on-table, render, restore
