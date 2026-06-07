@@ -26,7 +26,7 @@ def main():
     p.add_argument("--container", default="basket"); p.add_argument("--n", type=int, default=10)
     p.add_argument("--trials", type=int, default=3); p.add_argument("--horizon", type=int, default=280)
     p.add_argument("--replan", type=int, default=5); p.add_argument("--seed", type=int, default=5); p.add_argument("--img", type=int, default=128)
-    p.add_argument("--init-start", type=int, default=0)   # held-out: index into inits[] so eval positions != training positions
+    p.add_argument("--init-start", type=int, default=0); p.add_argument("--res", type=int, default=256)   # held-out: index into inits[] so eval positions != training positions
     args = p.parse_args()
     from libero.libero.envs import OffScreenRenderEnv
     from openpi_client import image_tools
@@ -50,7 +50,7 @@ def main():
         nt = min(args.trials, len(inits) - s0) if inits is not None else args.trials
         for t in range(nt):
             ti = s0 + t
-            env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256)
+            env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=args.res, camera_widths=args.res)
             env.seed(args.seed + ti); env.reset(); sim = env.env.sim
             obs = env.set_init_state(inits[ti]) if inits is not None else env.reset()
             rb = resolve_bodies(sim, [T, args.container + "_1"]); cb = rb[args.container + "_1"]
