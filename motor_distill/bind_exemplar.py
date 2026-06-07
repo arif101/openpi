@@ -18,6 +18,23 @@ from dino_separability import dino_feat
 _MX = {}
 
 
+def seg_proposals(seg_native, R, vflip=True, min_area=80, max_area=40000, exclude_top=0.30):
+    """Class-agnostic instance-seg -> per-object blobs (idealized SAM: separates objects, no identity).
+    Exclude background (id 0) + robot (top region). Returns (cy_up, cx_up, mask_up)."""
+    seg = np.asarray(seg_native).reshape(seg_native.shape[0], seg_native.shape[1])
+    cents = []
+    for i in np.unique(seg):
+        if i == 0: continue
+        m = (seg == i); a = int(m.sum())
+        if a < min_area or a > max_area: continue
+        ys, xs = np.where(m); cy, cx = ys.mean(), xs.mean()
+        m_up = m[::-1] if vflip else m
+        cy_up = (R - 1 - cy) if vflip else cy
+        if (cy_up / R) < exclude_top: continue                      # drop robot (hangs from top in upright frame)
+        cents.append((cy_up, cx, m_up))
+    return cents
+
+
 def height_proposals(sim, depth_norm, R, cam, vflip=True, lift=0.015, maxh=0.5, min_area=200, max_area=40000):
     """GEOMETRY-based object proposals: unproject depth -> world height -> every blob ABOVE the table is an object.
     Perfect recall (anything sitting on the table), centroids ~ object centers. Returns (cy_up, cx_up, mask_up)."""
@@ -99,12 +116,12 @@ def build_bank(bddls, init_dir, proto_inits, R, cam, dev, half=60):
     return bank
 
 
-def exemplar_bind(sim, rgb_native, depth_norm, target_name, all_names, bank, cam, R, dev, vflip=True, half=60):
+def exemplar_bind(sim, rgb_native, depth_norm, target_name, all_names, bank, cam, R, dev, vflip=True, half=60, seg_native=None):
     import robosuite.utils.camera_utils as cu
     up = rgb_native[::-1] if vflip else rgb_native
     proto = bank.get(nm(target_name))
     if proto is None: return None, 0
-    cents = height_proposals(sim, depth_norm, R, cam, vflip)       # geometry: every object above the table (perfect recall)
+    cents = seg_proposals(seg_native, R, vflip) if seg_native is not None else height_proposals(sim, depth_norm, R, cam, vflip)
     if not cents: return None, 0
     feats = []
     for (cy, cx, m) in cents:
@@ -144,11 +161,13 @@ def main():
         inits = np.asarray(torch.load(pathlib.Path(args.init_dir) / f"{stem}.pruned_init", weights_only=False))
         for ti in query_inits:
             if ti >= len(inits): continue
-            env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=R, camera_widths=R, camera_depths=True)
+            env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=R, camera_widths=R, camera_depths=True,
+                                     camera_segmentations="instance")
             env.seed(ti); env.reset(); obs = env.set_init_state(inits[ti]); sim = env.env.sim
             rb = resolve_bodies(sim, [T]); ntot += 1
             pred, nb = exemplar_bind(sim, np.asarray(obs[args.cam + "_image"]), np.asarray(obs[args.cam + "_depth"]),
-                                     T, objs, bank, args.cam, R, dev)
+                                     T, objs, bank, args.cam, R, dev,
+                                     seg_native=np.asarray(obs[args.cam + "_segmentation_instance"]))
             if pred is not None:
                 true = body_pos(sim, rb[T]); e = float(np.linalg.norm(pred - true)); berr.append(e); ndet += 1
                 print(f"  {stem[:24]:26s} i{ti} err={e*100:.1f}cm {'OK' if e<0.06 else 'x'} nbox={nb}", flush=True)
