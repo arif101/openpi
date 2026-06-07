@@ -75,11 +75,12 @@ def main():
             if args.binder == "oracle":
                 chosen = T
             else:
-                up = np.asarray(obs["agentview_image"])[::-1].copy()
+                hi = sim.render(width=args.bind_res, height=args.bind_res, camera_name="agentview")   # hi-res for the binder
+                up = np.asarray(hi)[::-1].copy()
                 proto = bank.get(nm(T)); feats = {}
                 for o in graspables:
                     if rb.get(o) is None: continue
-                    c = proto_crop(sim, up, args.res, "agentview", rb[o], 30)   # crop each graspable (its location)
+                    c = proto_crop(sim, up, args.bind_res, "agentview", rb[o], 60)   # hi-res crop matching the 1024 bank
                     if c is not None: feats[o] = dino_feat(c, dev)
                 chosen = max(feats, key=lambda o: float(feats[o] @ proto)) if (feats and proto is not None) else T
             bind_ok += int(chosen == T)
