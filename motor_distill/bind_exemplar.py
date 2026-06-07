@@ -18,21 +18,27 @@ from dino_separability import dino_feat
 _MX = {}
 
 
-def sam_everything_centers(up, device, min_area=150, max_frac=0.04, pps=24):
-    """Class-agnostic SAM 'segment everything' -> object-region centroids+masks (perfect recall, no detector text).
-    Filter to object-sized masks (not table/background/whole-scene)."""
+def sam_everything_centers(up, device, min_area=1500, max_area=22000, min_compact=0.35, dedup_px=35, pps=24):
+    """Class-agnostic SAM 'segment everything' -> OBJECT-LEVEL centroids+masks (perfect recall, no detector text).
+    Filter to object-sized COMPACT blobs (not table/parts/whole-scene) + dedup nested masks (keep object granularity)."""
     from PIL import Image
     if "gen" not in _MX:
         from transformers import pipeline
         _MX["gen"] = pipeline("mask-generation", model="facebook/sam-vit-base", device=0 if device == "cuda" else -1)
     out = _MX["gen"](Image.fromarray(up), points_per_side=pps, points_per_batch=64)
-    H, W = up.shape[:2]; tot = H * W; cents = []
+    cand = []
     for m in out["masks"]:
         m = np.asarray(m); a = int(m.sum())
-        if a < min_area or a > max_frac * tot: continue
-        ys, xs = np.where(m)
-        cents.append((float(ys.mean()), float(xs.mean()), m))
-    return cents
+        if a < min_area or a > max_area: continue
+        ys, xs = np.where(m); h = ys.max() - ys.min() + 1; w = xs.max() - xs.min() + 1
+        if a / float(h * w) < min_compact: continue                 # compact blob, not sparse/elongated table strip
+        cand.append((a, float(ys.mean()), float(xs.mean()), m))
+    cand.sort(reverse=True, key=lambda c: c[0])                     # largest first
+    kept = []
+    for a, cy, cx, m in cand:                                       # dedup nested/duplicate masks by centroid
+        if all((cy - k[0]) ** 2 + (cx - k[1]) ** 2 > dedup_px ** 2 for k in kept):
+            kept.append((cy, cx, m))
+    return kept
 
 
 def proto_crop(sim, rgb_up, R, cam, body, half=60):
