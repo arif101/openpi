@@ -18,19 +18,27 @@ from dino_separability import dino_feat
 _MX = {}
 
 
-def seg_proposals(seg_native, R, vflip=True, min_area=80, max_area=40000, exclude_top=0.30):
-    """Class-agnostic instance-seg -> per-object blobs (idealized SAM: separates objects, no identity).
-    Exclude background (id 0) + robot (top region). Returns (cy_up, cx_up, mask_up)."""
+def masked_crop(up, m_up, cy, cx, R, half=60):
+    """±half crop centered on the object, with NON-object pixels grayed (seg mask) -> appearance depends ONLY on
+    the object, not background/neighbors (fixes look-alike flips from context leakage)."""
+    y0, y1 = max(0, int(cy) - half), min(R, int(cy) + half); x0, x1 = max(0, int(cx) - half), min(R, int(cx) + half)
+    crop = up[y0:y1, x0:x1].copy(); mc = m_up[y0:y1, x0:x1]
+    crop[~mc] = 128
+    return crop
+
+
+def seg_proposals(seg_native, R, vflip=True, min_area=60):
+    """Class-agnostic instance-seg -> EVERY object instance (idealized SAM: separates objects, no identity).
+    Keep all non-background instances; DINOv2 rejects robot/non-objects at match time. Returns (cy_up, cx_up, mask_up)."""
     seg = np.asarray(seg_native).reshape(seg_native.shape[0], seg_native.shape[1])
     cents = []
     for i in np.unique(seg):
-        if i == 0: continue
+        if i == 0: continue                                         # background (table+floor)
         m = (seg == i); a = int(m.sum())
-        if a < min_area or a > max_area: continue
+        if a < min_area: continue                                   # drop specks only
         ys, xs = np.where(m); cy, cx = ys.mean(), xs.mean()
         m_up = m[::-1] if vflip else m
         cy_up = (R - 1 - cy) if vflip else cy
-        if (cy_up / R) < exclude_top: continue                      # drop robot (hangs from top in upright frame)
         cents.append((cy_up, cx, m_up))
     return cents
 
@@ -116,6 +124,38 @@ def build_bank(bddls, init_dir, proto_inits, R, cam, dev, half=60):
     return bank
 
 
+def build_bank_seg(bddls, init_dir, proto_inits, R, cam, dev, half=60):
+    """Prototypes from the SAME seg-blob crops the query uses (crop-domain consistency). Each blob labeled offline
+    by nearest projected true position (privileged labels for the catalog only; query stays non-privileged)."""
+    import robosuite.utils.camera_utils as cu
+    from libero.libero.envs import OffScreenRenderEnv
+    acc = {}
+    for bf in bddls:
+        instr, objs, targets, distractors = parse_bddl(bf)
+        fi = pathlib.Path(init_dir) / f"{pathlib.Path(bf).stem}.pruned_init"
+        if not fi.exists(): continue
+        inits = np.asarray(torch.load(fi, weights_only=False))
+        for ti in proto_inits:
+            if ti >= len(inits): continue
+            env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=R, camera_widths=R, camera_depths=True,
+                                     camera_segmentations="instance")
+            env.seed(ti); env.reset(); obs = env.set_init_state(inits[ti]); sim = env.env.sim
+            up = np.asarray(obs[cam + "_image"])[::-1].copy()
+            cents = seg_proposals(np.asarray(obs[cam + "_segmentation_instance"]), R, True)
+            if not cents: env.close(); continue
+            w2p = cu.get_camera_transform_matrix(sim, cam, R, R); rb = resolve_bodies(sim, objs)
+            for o in objs:
+                if rb[o] is None: continue
+                px = cu.project_points_from_world_to_camera(body_pos(sim, rb[o])[None], w2p, R, R)[0]
+                tr_up = R - 1 - px[0]; tc = px[1]
+                bi = int(np.argmin([(cy - tr_up) ** 2 + (cx - tc) ** 2 for (cy, cx, m) in cents]))
+                cy, cx, m = cents[bi]
+                if (cy - tr_up) ** 2 + (cx - tc) ** 2 > 60 ** 2: continue
+                acc.setdefault(nm(o), []).append(dino_feat(masked_crop(up, m, cy, cx, R, half), dev))
+            env.close()
+    return {k: (np.mean(fs, 0) / np.linalg.norm(np.mean(fs, 0))) for k, fs in acc.items()}
+
+
 def exemplar_bind(sim, rgb_native, depth_norm, target_name, all_names, bank, cam, R, dev, vflip=True, half=60, seg_native=None):
     import robosuite.utils.camera_utils as cu
     up = rgb_native[::-1] if vflip else rgb_native
@@ -123,10 +163,7 @@ def exemplar_bind(sim, rgb_native, depth_norm, target_name, all_names, bank, cam
     if proto is None: return None, 0
     cents = seg_proposals(seg_native, R, vflip) if seg_native is not None else height_proposals(sim, depth_norm, R, cam, vflip)
     if not cents: return None, 0
-    feats = []
-    for (cy, cx, m) in cents:
-        y0, y1 = max(0, int(cy) - half), min(R, int(cy) + half); x0, x1 = max(0, int(cx) - half), min(R, int(cx) + half)
-        feats.append(dino_feat(up[y0:y1, x0:x1], dev))             # fixed-scale crop matching prototype style
+    feats = [dino_feat(masked_crop(up, m, cy, cx, R, half), dev) for (cy, cx, m) in cents]  # object-only masked crops
     bi = int((np.stack(feats) @ proto).argmax())                  # DINOv2 visual match
     cy, cx, m = cents[bi]                                          # winning object mask
     m_nat = m[::-1] if vflip else m; ys, xs = np.where(m_nat); rr, cc = ys.mean(), xs.mean()
@@ -150,8 +187,8 @@ def main():
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
     proto_inits = [int(x) for x in args.proto_inits.split(",")]
     query_inits = [int(x) for x in args.query_inits.split(",")]
-    print(f"building prototype bank from inits {proto_inits}...", flush=True)
-    bank = build_bank(bddls, args.init_dir, proto_inits, R, args.cam, dev)
+    print(f"building masked seg prototype bank from inits {proto_inits}...", flush=True)
+    bank = build_bank_seg(bddls, args.init_dir, proto_inits, R, args.cam, dev)
     print(f"bank has {len(bank)} objects: {list(bank)}", flush=True)
     berr = []; ndet = 0; ntot = 0
     for bf in bddls:

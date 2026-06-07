@@ -45,12 +45,10 @@ def build_bank_all(proto_bddl_dir, proto_init_dir, proto_inits, R, cam, dev, hal
     return bank
 
 
-def bind_hires(sim, name, all_names, bank, dev, res=1024):
-    out = sim.render(width=res, height=res, camera_name="agentview", depth=True)
-    rgb, dep = out if isinstance(out, tuple) else (out, None)
-    if dep is None: return None
-    g, nb = exemplar_bind(sim, np.asarray(rgb), np.asarray(dep)[..., None], name, all_names, bank,
-                          "agentview", res, dev, vflip=True)
+def bind_from_obs(sim, obs, name, all_names, bank, cam, R, dev, oracle=False):
+    seg = np.asarray(obs[cam + "_segmentation_instance"])
+    g, nb = exemplar_bind(sim, np.asarray(obs[cam + "_image"]), np.asarray(obs[cam + "_depth"]),
+                          name, all_names, bank, cam, R, dev, vflip=True, seg_native=seg)
     return g
 
 
@@ -92,11 +90,11 @@ def main():
         s0 = args.init_start; nt = min(args.trials, (len(inits) - s0)) if inits is not None else args.trials
         for t in range(nt):
             ti = s0 + t
-            env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256, camera_depths=True)
+            env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=args.bind_res, camera_widths=args.bind_res, camera_depths=True, camera_segmentations="instance")
             env.seed(args.seed + ti); env.reset(); sim = env.env.sim
             obs = env.set_init_state(inits[ti]) if inits is not None else env.reset()
             rb = resolve_bodies(sim, [T]); nb += 1
-            goal_obj = bind_hires(sim, T, all_names, bank, dev, args.bind_res)
+            goal_obj = bind_from_obs(sim, obs, T, all_names, bank, "agentview", args.bind_res, dev)
             if goal_obj is not None and rb[T] is not None and np.linalg.norm(goal_obj - body_pos(sim, rb[T])) < 0.06:
                 bound += 1
             goal_cont = None; lifted = 0.0; held = False; close_cnt = 0; chunk = None; ci = 0
@@ -104,7 +102,7 @@ def main():
             for step in range(args.horizon):
                 ee = np.asarray(obs["robot0_eef_pos"], np.float32)
                 if held and goal_cont is None and cont_bddl is not None:
-                    goal_cont = bind_hires(sim, cont_bddl, all_names, bank, dev, args.bind_res)
+                    goal_cont = bind_from_obs(sim, obs, cont_bddl, all_names, bank, "agentview", args.bind_res, dev)
                 goal_w = goal_cont if (held and goal_cont is not None) else goal_obj
                 goal_rel = (goal_w - ee).astype(np.float32) if goal_w is not None else np.zeros(3, np.float32)
                 if chunk is None or ci >= args.replan:
