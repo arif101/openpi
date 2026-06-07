@@ -21,6 +21,20 @@ import numpy as np
 from cf_harness import parse_bddl, resolve_bodies, body_pos, build_obs, _quat2axisangle
 
 
+def surface_point(sim, body, depth_norm, R, cam="agentview"):
+    """3D point the BINDER returns: object's projected-center pixel -> depth -> unproject (camera-facing surface).
+    Training the motor on THIS (instead of body-center) makes motor+binder goal-consistent (absorbs the systematic
+    surface-vs-center offset that crashes a center-trained motor)."""
+    import robosuite.utils.camera_utils as cu
+    pos = body_pos(sim, body)
+    w2p = cu.get_camera_transform_matrix(sim, cam, R, R)
+    px = cu.project_points_from_world_to_camera(pos[None], w2p, R, R)[0]
+    r = int(min(max(px[0], 0), R - 1)); c = int(min(max(px[1], 0), R - 1))
+    real = cu.get_real_depth_map(sim, depth_norm)
+    pts = cu.transform_from_pixels_to_world(np.array([[r, c]]), real[None], np.linalg.inv(w2p))
+    return np.asarray(pts[0], np.float32)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config-name", default="pi05_libero")
@@ -57,7 +71,7 @@ def main():
         for seed in seeds:
             nt = min(args.trials, len(inits)) if inits is not None else args.trials
             for t in range(nt):
-                env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256)
+                env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256, camera_depths=True)
                 env.seed(seed + t); env.reset(); sim = env.env.sim
                 obs = env.set_init_state(inits[t]) if inits is not None else env.reset()
                 rb = resolve_bodies(sim, [T, args.container + "_1"]); cb = rb[args.container + "_1"]
@@ -66,11 +80,13 @@ def main():
                     cb = cand[0] if cand else None
                 if rb[T] is None or cb is None: env.close(); continue
                 z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; held = False; close_cnt = 0
+                obj_sp = surface_point(sim, rb[T], np.asarray(obs["agentview_depth"]), 256); cont_sp = None
                 WR, GR, PR, HE, CH = [], [], [], [], []
                 chunk = None; ci = 0
                 for step in range(args.horizon):
                     ee = np.asarray(obs["robot0_eef_pos"], np.float32)
-                    active = body_pos(sim, cb) if held else body_pos(sim, rb[T])
+                    if held and cont_sp is None: cont_sp = surface_point(sim, cb, np.asarray(obs["agentview_depth"]), 256)
+                    active = cont_sp if (held and cont_sp is not None) else obj_sp
                     goal_rel = (active.astype(np.float32) - ee)
                     if chunk is None or ci >= args.replan:
                         wr_raw = np.asarray(obs["robot0_eye_in_hand_image"])
