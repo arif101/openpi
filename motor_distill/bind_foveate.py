@@ -40,25 +40,56 @@ def detect_all(img, query, device, box_thr=0.12, text_thr=0.12):
     return [b.cpu().numpy().astype(int) for b in res["boxes"]]
 
 
-def clip_scores(crops, texts, device):
-    """[n_crops, n_texts] crop-vs-name scores via SigLIP-so400m (the prior-validated 1.00 disambiguator)."""
+def sam_clean_crop(up, box, device, pad=4):
+    """SAM mask within the proposal box -> single-object crop with background grayed (research lever #1:
+    clean crops are what make the fine-grained encoder work; loose boxes defeat it)."""
     from PIL import Image
-    if "sig" not in _M:
-        from transformers import AutoModel, AutoProcessor
-        mid = "google/siglip-so400m-patch14-384"
-        _M["sig"] = AutoModel.from_pretrained(mid).to(device).eval()
-        _M["sigp"] = AutoProcessor.from_pretrained(mid)
-    model, proc = _M["sig"], _M["sigp"]
-    pcs = [Image.fromarray(c) for c in crops]
-    inp = proc(text=[f"a photo of {t}" for t in texts], images=pcs, return_tensors="pt",
-               padding="max_length", truncation=True).to(device)
+    if "sam" not in _M:
+        from transformers import SamModel, SamProcessor
+        _M["sam"] = SamModel.from_pretrained("facebook/sam-vit-base").to(device).eval()
+        _M["samp"] = SamProcessor.from_pretrained("facebook/sam-vit-base")
+    sam, sp = _M["sam"], _M["samp"]
+    H, W = up.shape[:2]
+    x0, y0, x1, y1 = [int(v) for v in box]
+    pil = Image.fromarray(up)
+    inp = sp(pil, input_boxes=[[[x0, y0, x1, y1]]], return_tensors="pt").to(device)
     with torch.no_grad():
-        out = model(**inp)
-    return out.logits_per_image.cpu().numpy()              # [n_crops, n_texts] (argmax picks best name)
+        out = sam(**inp)
+    masks = sp.image_processor.post_process_masks(out.pred_masks.cpu(), inp["original_sizes"].cpu(),
+                                                  inp["reshaped_input_sizes"].cpu())[0][0]
+    scores = out.iou_scores.cpu().numpy()[0, 0]
+    m = masks[int(scores.argmax())].numpy().astype(bool)               # best mask, HxW
+    cx0, cy0 = max(0, x0 - pad), max(0, y0 - pad); cx1, cy1 = min(W, x1 + pad), min(H, y1 + pad)
+    crop = up[cy0:cy1, cx0:cx1].copy(); mc = m[cy0:cy1, cx0:cx1]
+    crop[~mc] = 128                                                    # gray background
+    return crop, m
 
 
-def foveate_bind(sim, rgb_native, depth_norm, target, all_names, cam, H, W, device, vflip=True, pad=4):
-    """Return (3D world point, chosen_label) for `target` among `all_names`. Training-free."""
+def clip_scores(crops, texts, device):
+    """[n_crops, n_texts] crop-vs-name scores via FG-CLIP (fine-grained-specialized encoder, trained on 10M hard
+    fine-grained negatives). Deep-research verdict: the recognition step is the proven bottleneck (oracle masks +
+    CLIP=20% vs oracle classifier=66%); FG-CLIP targets exactly the similar-object disambiguation failure."""
+    from PIL import Image
+    if "fg" not in _M:
+        from transformers import AutoImageProcessor, AutoTokenizer, AutoModelForCausalLM
+        mid = "qihoo360/fg-clip-base"
+        _M["fg"] = AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True).to(device).eval()
+        _M["fgt"] = AutoTokenizer.from_pretrained(mid)
+        _M["fgi"] = AutoImageProcessor.from_pretrained(mid)
+    m, tok, ip = _M["fg"], _M["fgt"], _M["fgi"]
+    pcs = [Image.fromarray(c) for c in crops]
+    pix = ip(images=pcs, return_tensors="pt").pixel_values.to(device)
+    ids = torch.tensor(tok([f"a photo of {t}" for t in texts], max_length=77, padding="max_length",
+                           truncation=True).input_ids).to(device)
+    with torch.no_grad():
+        imf = m.get_image_features(pix); txf = m.get_text_features(ids, walk_short_pos=True)
+    imf = imf / imf.norm(dim=-1, keepdim=True); txf = txf / txf.norm(dim=-1, keepdim=True)
+    return (imf @ txf.T).cpu().numpy()                     # [n_crops, n_texts]
+
+
+def foveate_bind(sim, rgb_native, depth_norm, target, all_names, cam, H, W, device, vflip=True, pad=4, clean=True):
+    """Return (3D world point, chosen_label, nbox) for `target` among `all_names`. Training-free.
+    clean=True: SAM-mask each proposal -> single-object crop (research lever #1) + mask-based 3D center."""
     import robosuite.utils.camera_utils as cu
     up = rgb_native[::-1] if vflip else rgb_native        # upright for the detector
     phrases = [nm(o) for o in all_names]
@@ -67,12 +98,16 @@ def foveate_bind(sim, rgb_native, depth_norm, target, all_names, cam, H, W, devi
         boxes = detect_all(up, "an object . a bottle . a box . a can . a carton .", device)
     if not boxes:
         return None, None, 0
-    crops, keep = [], []
+    crops, keep, masks = [], [], []
     for b in boxes:
         x0, y0, x1, y1 = b
-        x0, y0 = max(0, x0 - pad), max(0, y0 - pad); x1, y1 = min(W, x1 + pad), min(H, y1 + pad)
         if x1 - x0 < 4 or y1 - y0 < 4: continue
-        crops.append(up[y0:y1, x0:x1]); keep.append(b)
+        if clean:
+            crop, m = sam_clean_crop(up, b, device, pad)              # SAM single-object crop (gray bg)
+        else:
+            xa, ya = max(0, x0 - pad), max(0, y0 - pad); xb, yb = min(W, x1 + pad), min(H, y1 + pad)
+            crop, m = up[ya:yb, xa:xb], None
+        crops.append(crop); keep.append(b); masks.append(m)
     if not crops:
         return None, None, 0
     S = clip_scores(crops, phrases, device)                # [nbox, nname]
@@ -92,18 +127,22 @@ def foveate_bind(sim, rgb_native, depth_norm, target, all_names, cam, H, W, devi
     x0, y0, x1, y1 = keep[bi]                              # box in UPRIGHT frame
     real = cu.get_real_depth_map(sim, depth_norm)          # native HxWx1
     w2p = cu.get_camera_transform_matrix(sim, cam, H, W); cam2world = np.linalg.inv(w2p)
-    # map box to NATIVE rows (depth/camera are native), then take the CLOSEST surface (the object,
-    # not the table behind a thin bottle) -> centroid of near-pixels + that depth = robust 3D.
-    ry0, ry1 = (H - 1 - y1, H - 1 - y0) if vflip else (y0, y1)
-    ry0, ry1 = max(0, ry0), min(H, ry1); cx0, cx1 = max(0, x0), min(W, x1)
-    patch = real[ry0:ry1, cx0:cx1, 0]
-    if patch.size:
-        dnear = np.percentile(patch, 25)                   # near surface = object
-        om = patch <= dnear + 0.03
-        ys, xs = np.where(om)
-        rr, cc = (ry0 + ys.mean(), cx0 + xs.mean()) if len(ys) else ((ry0 + ry1) / 2, (cx0 + cx1) / 2)
+    m = masks[bi]
+    if m is not None and m.any():
+        m_nat = m[::-1] if vflip else m                    # SAM mask -> native frame
+        ys, xs = np.where(m_nat)
+        rr, cc = ys.mean(), xs.mean()                      # object-mask centroid = object center pixel
     else:
-        rr, cc = (ry0 + ry1) / 2, (cx0 + cx1) / 2
+        # fallback: box near-surface (closest pixels = object, not table behind a thin bottle)
+        ry0, ry1 = (H - 1 - y1, H - 1 - y0) if vflip else (y0, y1)
+        ry0, ry1 = max(0, ry0), min(H, ry1); cx0, cx1 = max(0, x0), min(W, x1)
+        patch = real[ry0:ry1, cx0:cx1, 0]
+        if patch.size:
+            om = patch <= np.percentile(patch, 25) + 0.03
+            ys, xs = np.where(om)
+            rr, cc = (ry0 + ys.mean(), cx0 + xs.mean()) if len(ys) else ((ry0 + ry1) / 2, (cx0 + cx1) / 2)
+        else:
+            rr, cc = (ry0 + ry1) / 2, (cx0 + cx1) / 2
     pts = cu.transform_from_pixels_to_world(np.array([[rr, cc]]), real[None], cam2world)
     chosen = phrases[int(S[bi].argmax())]                  # what the disambiguator thinks the box is
     return np.asarray(pts[0], np.float32), chosen, len(keep)
