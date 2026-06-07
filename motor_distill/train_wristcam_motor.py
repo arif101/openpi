@@ -31,7 +31,9 @@ class WristMotor(nn.Module):
 
 
 def load(data_dir):
-    files = sorted(glob.glob(str(pathlib.Path(data_dir) / "*.npz")))
+    files = []
+    for d in str(data_dir).split(","):
+        files += sorted(glob.glob(str(pathlib.Path(d) / "*.npz")))
     rolls = []
     for f in files:
         d = np.load(f)
