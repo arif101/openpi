@@ -55,6 +55,7 @@ def main():
     p.add_argument("--epochs", type=int, default=60); p.add_argument("--bs", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--grip-w", type=float, default=2.0); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--goal-noise", type=float, default=0.0)   # meters of goal perturbation -> robustness to binder offset
     args = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed); rng = np.random.default_rng(args.seed)
@@ -66,6 +67,7 @@ def main():
     print(f"{len(rolls)} rolls -> train {len(tr)} ({len(Y)} samp) / val {len(vr)} ({len(VY)} samp)", flush=True)
     # standardize the vec inputs (img is /255; targets stay raw action units)
     vm, vs = Xv.mean(0), Xv.std(0) + 1e-6
+    gn = (args.goal_noise / vs[:3]).astype(np.float32)   # raw meters -> standardized units, per goal dim
     Xv = (Xv - vm) / vs; Vv = (Vv - vm) / vs
     tX = [torch.tensor(a) for a in (Xi, Xv, Y)]; vX = [torch.tensor(a) for a in (Vi, Vv, VY)]
     net = WristMotor(prop_dim=Xv.shape[1]).to(dev)
@@ -89,6 +91,8 @@ def main():
         for s in range(0, n, args.bs):
             b = perm[s:s+args.bs]
             img = tX[0][b].to(dev); vec = tX[1][b].to(dev); y = tX[2][b].to(dev)
+            if args.goal_noise > 0:
+                vec = vec.clone(); vec[:, :3] += torch.randn_like(vec[:, :3]) * torch.tensor(gn, device=dev)
             pred = net(img, vec)
             loss = (F.smooth_l1_loss(pred, y, reduction="none") * w).mean()
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item() * len(b)

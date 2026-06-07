@@ -26,7 +26,8 @@ def main():
     p.add_argument("--container", default="basket"); p.add_argument("--n", type=int, default=10)
     p.add_argument("--trials", type=int, default=3); p.add_argument("--horizon", type=int, default=280)
     p.add_argument("--replan", type=int, default=5); p.add_argument("--seed", type=int, default=5); p.add_argument("--img", type=int, default=128)
-    p.add_argument("--init-start", type=int, default=0); p.add_argument("--res", type=int, default=256)   # held-out: index into inits[] so eval positions != training positions
+    p.add_argument("--init-start", type=int, default=0); p.add_argument("--res", type=int, default=256)
+    p.add_argument("--goal-offset", type=float, default=0.0)   # sim binder error: fixed random offset per rollout   # held-out: index into inits[] so eval positions != training positions
     args = p.parse_args()
     from libero.libero.envs import OffScreenRenderEnv
     from openpi_client import image_tools
@@ -59,10 +60,13 @@ def main():
                 cb = cand[0] if cand else None
             if rb[T] is None or cb is None: env.close(); succ.append(0); continue
             z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; held = False; close_cnt = 0; chunk = None; ci = 0
+            if args.goal_offset > 0:
+                _o = np.random.default_rng(args.seed + ti).normal(size=3); _o = (_o/np.linalg.norm(_o))*args.goal_offset
+            else: _o = np.zeros(3, np.float32)
             for step in range(args.horizon):
                 ee = np.asarray(obs["robot0_eef_pos"], np.float32)
                 active = body_pos(sim, cb) if held else body_pos(sim, rb[T])
-                goal_rel = (active.astype(np.float32) - ee)
+                goal_rel = (active.astype(np.float32) - ee) + _o.astype(np.float32)
                 if chunk is None or ci >= args.replan:
                     wr_raw = np.asarray(obs["robot0_eye_in_hand_image"])
                     wr = image_tools.resize_with_pad(np.ascontiguousarray(wr_raw[::-1, ::-1]), args.img, args.img)
