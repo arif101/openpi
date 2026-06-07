@@ -15,6 +15,25 @@ from cf_harness import parse_bddl, resolve_bodies, body_pos
 from bind_foveate import detect_all, sam_clean_crop, nm
 from dino_separability import dino_feat
 
+_MX = {}
+
+
+def sam_everything_centers(up, device, min_area=150, max_frac=0.04, pps=24):
+    """Class-agnostic SAM 'segment everything' -> object-region centroids+masks (perfect recall, no detector text).
+    Filter to object-sized masks (not table/background/whole-scene)."""
+    from PIL import Image
+    if "gen" not in _MX:
+        from transformers import pipeline
+        _MX["gen"] = pipeline("mask-generation", model="facebook/sam-vit-base", device=0 if device == "cuda" else -1)
+    out = _MX["gen"](Image.fromarray(up), points_per_side=pps, points_per_batch=64)
+    H, W = up.shape[:2]; tot = H * W; cents = []
+    for m in out["masks"]:
+        m = np.asarray(m); a = int(m.sum())
+        if a < min_area or a > max_frac * tot: continue
+        ys, xs = np.where(m)
+        cents.append((float(ys.mean()), float(xs.mean()), m))
+    return cents
+
 
 def proto_crop(sim, rgb_up, R, cam, body, half=60):
     import robosuite.utils.camera_utils as cu
@@ -48,32 +67,24 @@ def build_bank(bddls, init_dir, proto_inits, R, cam, dev, half=60):
     return bank
 
 
-def exemplar_bind(sim, rgb_native, depth_norm, target_name, all_names, bank, cam, R, dev, vflip=True):
+def exemplar_bind(sim, rgb_native, depth_norm, target_name, all_names, bank, cam, R, dev, vflip=True, half=60):
     import robosuite.utils.camera_utils as cu
     up = rgb_native[::-1] if vflip else rgb_native
-    phrases = [nm(o) for o in all_names]
-    boxes = detect_all(up, " . ".join(phrases) + " .", dev) or detect_all(up, "an object . a bottle . a box . a can .", dev)
-    if not boxes: return None, 0
-    crops, keep, masks = [], [], []
-    for b in boxes:
-        if b[2] - b[0] < 4 or b[3] - b[1] < 4: continue
-        crop, m = sam_clean_crop(up, b, dev, 4)
-        crops.append(crop); keep.append(b); masks.append(m)
-    if not crops: return None, 0
     proto = bank.get(nm(target_name))
-    if proto is None: return None, len(keep)
-    feats = np.stack([dino_feat(c, dev) for c in crops])           # [n, D]
-    bi = int((feats @ proto).argmax())                            # DINOv2 visual match
+    if proto is None: return None, 0
+    cents = sam_everything_centers(up, dev)                        # class-agnostic perfect-recall proposals
+    if not cents: return None, 0
+    feats = []
+    for (cy, cx, m) in cents:
+        y0, y1 = max(0, int(cy) - half), min(R, int(cy) + half); x0, x1 = max(0, int(cx) - half), min(R, int(cx) + half)
+        feats.append(dino_feat(up[y0:y1, x0:x1], dev))             # fixed-scale crop matching prototype style
+    bi = int((np.stack(feats) @ proto).argmax())                  # DINOv2 visual match
+    cy, cx, m = cents[bi]                                          # winning object mask
+    m_nat = m[::-1] if vflip else m; ys, xs = np.where(m_nat); rr, cc = ys.mean(), xs.mean()
     real = cu.get_real_depth_map(sim, depth_norm)
     w2p = cu.get_camera_transform_matrix(sim, cam, R, R); cam2world = np.linalg.inv(w2p)
-    m = masks[bi]
-    if m is not None and m.any():
-        m_nat = m[::-1] if vflip else m; ys, xs = np.where(m_nat); rr, cc = ys.mean(), xs.mean()
-    else:
-        x0, y0, x1, y1 = keep[bi]; ry0, ry1 = (R - 1 - y1, R - 1 - y0) if vflip else (y0, y1)
-        rr, cc = (ry0 + ry1) / 2, (x0 + x1) / 2
     pts = cu.transform_from_pixels_to_world(np.array([[rr, cc]]), real[None], cam2world)
-    return np.asarray(pts[0], np.float32), len(keep)
+    return np.asarray(pts[0], np.float32), len(cents)
 
 
 def main():
