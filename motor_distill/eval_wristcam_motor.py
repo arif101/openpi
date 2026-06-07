@@ -26,6 +26,7 @@ def main():
     p.add_argument("--container", default="basket"); p.add_argument("--n", type=int, default=10)
     p.add_argument("--trials", type=int, default=3); p.add_argument("--horizon", type=int, default=280)
     p.add_argument("--replan", type=int, default=5); p.add_argument("--seed", type=int, default=5); p.add_argument("--img", type=int, default=128)
+    p.add_argument("--init-start", type=int, default=0)   # held-out: index into inits[] so eval positions != training positions
     args = p.parse_args()
     from libero.libero.envs import OffScreenRenderEnv
     from openpi_client import image_tools
@@ -45,11 +46,13 @@ def main():
             if fi.exists():
                 try: inits = np.asarray(torch.load(fi, weights_only=False))
                 except Exception: inits = None
-        nt = min(args.trials, len(inits)) if inits is not None else args.trials
+        s0 = args.init_start
+        nt = min(args.trials, len(inits) - s0) if inits is not None else args.trials
         for t in range(nt):
+            ti = s0 + t
             env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256)
-            env.seed(args.seed + t); env.reset(); sim = env.env.sim
-            obs = env.set_init_state(inits[t]) if inits is not None else env.reset()
+            env.seed(args.seed + ti); env.reset(); sim = env.env.sim
+            obs = env.set_init_state(inits[ti]) if inits is not None else env.reset()
             rb = resolve_bodies(sim, [T, args.container + "_1"]); cb = rb[args.container + "_1"]
             if cb is None:
                 cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and args.container in b]
