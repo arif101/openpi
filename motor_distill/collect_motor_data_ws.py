@@ -128,7 +128,7 @@ def main():
                 env.close()
                 if ok and len(WR) > 3:
                     n_ok += 1; n_samp += len(WR)
-                    np.savez_compressed(out / f"{stem[:30]}_s{seed}_t{t}.npz",
+                    np.savez_compressed(out / f"{stem[:55]}_s{seed}_t{t}.npz",
                                         wrist=np.asarray(WR, np.uint8), obj_rel=np.asarray(OBJ, np.float32),
                                         cont_rel=np.asarray(CON, np.float32), proprio=np.asarray(PR, np.float32),
                                         chunk=np.asarray(CH, np.float32))
