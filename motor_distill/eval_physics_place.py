@@ -75,6 +75,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--head", default="data/motor_head_selector.pt"); p.add_argument("--bddl-dir", required=True)
     p.add_argument("--flow", default="")   # path to FlowMotor ckpt -> use flow-matching head (learned-place fix) instead of L1
+    p.add_argument("--logdir", default="")   # if set: log SUCCESSFUL episodes' (wrist,obj_rel,cont_rel,proprio,executed-chunk) -> analytic-DAgger place distillation
     p.add_argument("--init-dir", default=""); p.add_argument("--container", default="basket")
     p.add_argument("--n", type=int, default=10); p.add_argument("--trials", type=int, default=3)
     p.add_argument("--horizon", type=int, default=300); p.add_argument("--replan", type=int, default=5)
@@ -124,6 +125,8 @@ def main():
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
     print(f"PHYSICS-PLACE reflex={args.reflex} clear={args.clear} on {pathlib.Path(args.bddl_dir).name}", flush=True)
     succ = []; grasp = []; placed_phys = []; bind_ok = 0; nb = 0
+    if args.logdir: pathlib.Path(args.logdir).mkdir(parents=True, exist_ok=True)
+    dag_n = 0
     for bf in bddls:
         instr, objs, targets, distractors = parse_bddl(bf)
         if not targets: continue
@@ -225,7 +228,7 @@ def main():
                 rim_top, _ = body_aabb_top(sim, sim.model.body_name2id(cb))
             ee_z0 = float(np.asarray(obs["robot0_eef_pos"], np.float32)[2]); ee_zmin = ee_z0
             z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; close_run = 0; held = False; grasp_off = None; released = 0
-            chunk = None; ci = 0
+            chunk = None; ci = 0; REC = []
             for step in range(args.horizon):
                 ee = np.asarray(obs["robot0_eef_pos"], np.float32)
                 # ---- GRASP phase: reflex motor servos to the object ----
@@ -266,6 +269,10 @@ def main():
                     else:
                         d = np.clip((des_ee - ee) * args.gain, -1.0, 1.0)
                         act = np.zeros(7, np.float32); act[:3] = d; act[6] = 1.0   # hold closed, servo to release pose
+                if args.logdir:
+                    _wr = image_tools.resize_with_pad(np.ascontiguousarray(np.asarray(obs["robot0_eye_in_hand_image"])[::-1, ::-1]), args.img, args.img).astype(np.uint8)
+                    _pr = np.concatenate((_quat2axisangle(np.asarray(obs["robot0_eef_quat"])), np.asarray(obs["robot0_gripper_qpos"], np.float32))).astype(np.float32)
+                    REC.append((_wr, (obj_w - ee).astype(np.float32), (cont_w - ee).astype(np.float32), _pr, act[:7].astype(np.float32).copy()))
                 obs, _, done, _ = env.step(act.tolist())
                 lifted = max(lifted, float(body_pos(sim, rb[T])[2] - z0))   # privileged (metric only)
                 ee_now = np.asarray(obs["robot0_eef_pos"], np.float32); ee_zmin = min(ee_zmin, float(ee_now[2]))
@@ -277,6 +284,16 @@ def main():
                 if done: break
             try: ok = bool(env.env._check_success())
             except Exception: ok = False
+            if args.logdir and ok and len(REC) > 10:
+                W = np.stack([r[0] for r in REC]); O = np.stack([r[1] for r in REC]); C = np.stack([r[2] for r in REC])
+                P = np.stack([r[3] for r in REC]); A = np.stack([r[4] for r in REC]); Tn = len(A)
+                CH = np.zeros((Tn, 10, 7), np.float32)
+                for t in range(Tn):
+                    e = min(t + 10, Tn); CH[t, :e - t] = A[t:e]
+                    if e - t < 10: CH[t, e - t:] = A[Tn - 1]
+                np.savez_compressed(pathlib.Path(args.logdir) / f"{stem[:40]}_dag{dag_n}.npz",
+                                    wrist=W.astype(np.uint8), obj_rel=O.astype(np.float32), cont_rel=C.astype(np.float32),
+                                    proprio=P.astype(np.float32), chunk=CH); dag_n += 1
             succ.append(int(ok)); grasp.append(int(lifted > 0.03)); placed_phys.append(int(held and not args.reflex)); env.close()
         print(f"  {stem[:30]:32s} succ={np.mean(succ):.3f} ({sum(succ)}/{len(succ)})  grasp={np.mean(grasp):.2f}", flush=True)
     print(f"\n=== PHYSICS-PLACE [reflex={args.reflex}] on {pathlib.Path(args.bddl_dir).name}: "
