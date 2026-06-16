@@ -1,9 +1,10 @@
 """STAGE 2 (train) of the factored wrist-cam motor. Distill pi0.5's motor competence into a small
 IDENTITY-AGNOSTIC, POSITION-AGNOSTIC head:
-    input  = wrist_img(128x128, eye-in-hand) + goal_rel(3, relative target) + proprio(5, ee-orient+gripper) + held(1)
-    output = 10x7 delta-EE action chunk (behavior-clone pi0.5's chunk)
-NO base image, NO absolute position, NO object identity -> cannot memorize which/where; precision must come from the
-wrist view + the relative goal. This directly tests the wrist-cam-precision thesis (validated by the ablation).
+    input  = wrist_img(128x128, eye-in-hand) + obj_rel(3) + cont_rel(3) + proprio(5, ee-orient+gripper)
+    output = 10x7 delta-EE action chunk INCLUDING gripper (behavior-clone pi0.5's chunk)
+NO base image, NO absolute position, NO object identity, NO held/phase flag -> cannot memorize which/where, and learns
+grasp->transport->release + gripper timing from the wrist view itself (it sees the gripper holding the object). The
+policy is given BOTH goals every step and learns the phase transition; there is NO hand-coded state machine.
 
 Split by ROLLOUT (no sample leakage). Torch only (run AFTER the jax collector exits -> no GPU contention).
 Run: .venv/bin/python motor_distill/train_wristcam_motor.py --data data/motor_demos --out data/motor_head.pt --epochs 60
@@ -15,19 +16,35 @@ import torch, torch.nn as nn, torch.nn.functional as F
 
 
 class WristMotor(nn.Module):
-    def __init__(self, prop_dim=6, chunk=10, act=7):
+    """SINGLE-GOAL visual-servo motor + LEARNED PHASE SELECTOR (the proven 0.50 architecture, with the held lift-heuristic
+    replaced by a learned classifier). vec = [obj_rel(3), cont_rel(3), proprio(pdim)]. A phase classifier predicts alpha
+    ("am I in the place phase?") from wrist+proprio. The motor sees ONE HARD-SELECTED active goal (object while reaching,
+    container while placing) -- NOT a blend -- so it stays a clean single-goal servo. At TRAIN the selection uses the
+    teacher's gripper-phase label (motor always gets the correct goal); at DEPLOY the predicted alpha hard-selects. No
+    hand-coded transition rule -- the switch is learned."""
+    def __init__(self, prop_dim=11, chunk=10, act=7):
         super().__init__()
-        self.chunk, self.act = chunk, act
+        self.chunk, self.act, self.pdim = chunk, act, prop_dim - 6
         c = lambda i, o, s: nn.Sequential(nn.Conv2d(i, o, 3, s, 1), nn.GroupNorm(min(8, o), o), nn.ReLU())
         self.cnn = nn.Sequential(c(3, 32, 2), c(32, 64, 2), c(64, 128, 2), c(128, 128, 2),
                                  nn.AdaptiveAvgPool2d(1), nn.Flatten())          # -> 128
-        self.prop = nn.Sequential(nn.Linear(prop_dim, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
-        self.head = nn.Sequential(nn.Linear(256, 512), nn.ReLU(), nn.Linear(512, 512), nn.ReLU(),
-                                  nn.Linear(512, chunk * act))
+        self.prop = nn.Sequential(nn.Linear(self.pdim, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
+        self.goal = nn.Sequential(nn.Linear(3, 64), nn.ReLU(), nn.Linear(64, 64))        # single active goal
+        self.phase = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 1))    # from cnn+proprio (state), NOT goals
+        self.head = nn.Sequential(nn.Linear(256 + 64 + 1, 512), nn.ReLU(), nn.Linear(512, 512), nn.ReLU(),
+                                  nn.Linear(512, chunk * act))   # +1 = phase bit fed to head (conditions reach-mode vs place-mode, like the old `held` input)
 
-    def forward(self, img, vec):
-        f = torch.cat([self.cnn(img), self.prop(vec)], -1)
-        return self.head(f).view(-1, self.chunk, self.act)
+    def forward(self, img, vec, phase_label=None, phase_override=None, return_phase=False):
+        cnnf = self.cnn(img); pf = self.prop(vec[:, 6:])
+        obj = vec[:, 0:3]; cont = vec[:, 3:6]
+        a_logit = self.phase(torch.cat([cnnf, pf], -1)).squeeze(-1)
+        if phase_label is not None: sel = phase_label                    # teacher-selected @train
+        elif phase_override is not None: sel = phase_override            # latched phase @deploy
+        else: sel = (torch.sigmoid(a_logit) > 0.5).float()              # raw predicted
+        active = sel.unsqueeze(-1) * cont + (1 - sel.unsqueeze(-1)) * obj   # HARD single-goal selection (no blend)
+        chunk = self.head(torch.cat([cnnf, pf, self.goal(active), sel.unsqueeze(-1)], -1)).view(-1, self.chunk, self.act)
+        if return_phase: return chunk, a_logit
+        return chunk
 
 
 def load(data_dir):
@@ -37,16 +54,22 @@ def load(data_dir):
     rolls = []
     for f in files:
         d = np.load(f)
-        rolls.append({k: d[k] for k in ("wrist", "goal_rel", "proprio", "held", "chunk")})
+        r = {k: d[k] for k in ("wrist", "obj_rel", "cont_rel", "proprio", "chunk")}
+        # PER-ROLLOUT phase label = SUSTAINED gripper-close (closed for >=K consecutive steps), approximating the old
+        # held's grip+lift confirmation -> switches LATER than raw gripper-close => robust to marginal/failed grasps.
+        sep = r["proprio"][:, 3] - r["proprio"][:, 4]
+        r["phase"] = (sep < 0.05).astype(np.float32)   # plain gripper-closed (place-frac ~0.42; best so far)
+        rolls.append(r)
     return rolls
 
 
 def stack(rolls):
     img = np.concatenate([r["wrist"] for r in rolls]).astype(np.float32) / 255.0       # [M,128,128,3]
     img = np.transpose(img, (0, 3, 1, 2))
-    vec = np.concatenate([np.concatenate([r["goal_rel"], r["proprio"], r["held"][:, None]], 1) for r in rolls]).astype(np.float32)
+    vec = np.concatenate([np.concatenate([r["obj_rel"], r["cont_rel"], r["proprio"]], 1) for r in rolls]).astype(np.float32)
     y = np.concatenate([r["chunk"] for r in rolls]).astype(np.float32)                  # [M,10,7]
-    return img, vec, y
+    ph = np.concatenate([r["phase"] for r in rolls]).astype(np.float32)                 # [M]
+    return img, vec, y, ph
 
 
 def main():
@@ -55,21 +78,30 @@ def main():
     p.add_argument("--epochs", type=int, default=60); p.add_argument("--bs", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--grip-w", type=float, default=2.0); p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--goal-noise", type=float, default=0.0)   # meters of goal perturbation -> robustness to binder offset
+    p.add_argument("--goal-noise", type=float, default=0.0)   # meters of ISOTROPIC goal perturbation (breaks reach if large)
+    p.add_argument("--gnz", type=float, default=0.0)          # meters of Z-ONLY goal noise -> teach wrist z-correction w/o breaking xy reach
+    p.add_argument("--gn-close", type=float, default=0.0)     # meters of CLOSENESS-SCALED 3D goal noise -> wrist xy+z servo correction at grasp (goal-CORRECTING)
+    p.add_argument("--phase-w", type=float, default=1.0)      # weight on the learned-phase BCE (alpha vs teacher gripper-closed)
+    p.add_argument("--aug", type=int, default=0)              # multi-factor WRIST augmentation (validated LIBERO-PRO robustness lever)
+    p.add_argument("--aug-str", type=float, default=1.0)      # aug strength (reduce if eye-in-hand precision degrades)
     args = p.parse_args()
+    GRIP_SEP = 0.05   # finger-separation: raw vec col9-col10 < this => gripper CLOSED => place phase (train label only)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed); rng = np.random.default_rng(args.seed)
     rolls = load(args.data)
     assert rolls, f"no npz in {args.data}"
     idx = rng.permutation(len(rolls)); nval = max(1, int(len(rolls) * args.val_frac))
     vr = [rolls[i] for i in idx[:nval]]; tr = [rolls[i] for i in idx[nval:]]
-    Xi, Xv, Y = stack(tr); Vi, Vv, VY = stack(vr)
+    Xi, Xv, Y, Ptr = stack(tr); Vi, Vv, VY, Pval = stack(vr)   # phase = SUSTAINED-close label (computed per-rollout in load)
     print(f"{len(rolls)} rolls -> train {len(tr)} ({len(Y)} samp) / val {len(vr)} ({len(VY)} samp)", flush=True)
+    print(f"phase prior: train place-frac={Ptr.mean():.2f} val={Pval.mean():.2f}", flush=True)
     # standardize the vec inputs (img is /255; targets stay raw action units)
     vm, vs = Xv.mean(0), Xv.std(0) + 1e-6
     gn = (args.goal_noise / vs[:3]).astype(np.float32)   # raw meters -> standardized units, per goal dim
+    gnz = float(args.gnz / vs[2]) if args.gnz > 0 else 0.0   # z-only noise in standardized units (vec idx 2 = goal_rel z)
+    import torch as _t; vmt3 = _t.tensor(vm[:3]); vst3 = _t.tensor(vs[:3])   # for closeness-scaled goal noise
     Xv = (Xv - vm) / vs; Vv = (Vv - vm) / vs
-    tX = [torch.tensor(a) for a in (Xi, Xv, Y)]; vX = [torch.tensor(a) for a in (Vi, Vv, VY)]
+    tX = [torch.tensor(a) for a in (Xi, Xv, Y, Ptr)]; vX = [torch.tensor(a) for a in (Vi, Vv, VY, Pval)]
     net = WristMotor(prop_dim=Xv.shape[1]).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
@@ -90,11 +122,33 @@ def main():
         tot = 0.0
         for s in range(0, n, args.bs):
             b = perm[s:s+args.bs]
-            img = tX[0][b].to(dev); vec = tX[1][b].to(dev); y = tX[2][b].to(dev)
+            img = tX[0][b].to(dev); vec = tX[1][b].to(dev); y = tX[2][b].to(dev); ph = tX[3][b].to(dev)
+            if args.aug:   # multi-factor wrist aug: brightness/contrast/color + small translation (preserve eye-in-hand signal)
+                Bn = img.shape[0]; sgn = args.aug_str
+                bri = 1.0 + (torch.rand(Bn, 1, 1, 1, device=dev) - 0.5) * 0.4 * sgn
+                con = 1.0 + (torch.rand(Bn, 1, 1, 1, device=dev) - 0.5) * 0.4 * sgn
+                col = 1.0 + (torch.rand(Bn, 3, 1, 1, device=dev) - 0.5) * 0.2 * sgn
+                img = (((img - 0.5) * con + 0.5) * bri * col).clamp(0, 1)
+                pad = int(round(6 * sgn))
+                if pad > 0:
+                    img = F.pad(img, (pad, pad, pad, pad), mode="replicate")
+                    ox = int(torch.randint(0, 2 * pad + 1, (1,)).item()); oy = int(torch.randint(0, 2 * pad + 1, (1,)).item())
+                    img = img[:, :, oy:oy + 128, ox:ox + 128]
             if args.goal_noise > 0:
                 vec = vec.clone(); vec[:, :3] += torch.randn_like(vec[:, :3]) * torch.tensor(gn, device=dev)
-            pred = net(img, vec)
-            loss = (F.smooth_l1_loss(pred, y, reduction="none") * w).mean()
+            if gnz > 0:
+                vec = vec.clone(); vec[:, 2] += torch.randn_like(vec[:, 2]) * gnz   # z-only: keep xy reach clean
+            if args.gn_close > 0:
+                # closeness-scaled FULL-3D goal noise: full noise when AT the object (use wrist to servo),
+                # zero when far (>10cm) so the coarse reach stays clean. Teaches goal-CORRECTION at the grasp.
+                vm3 = vmt3.to(dev); vs3 = vst3.to(dev)
+                raw_xy = (vec[:, :3] * vs3 + vm3)[:, :2]; dist = raw_xy.norm(dim=1)
+                close = (1.0 - (dist / 0.10).clamp(0, 1))                            # 1 at object -> 0 at >=10cm
+                noise_m = torch.randn(len(b), 3, device=dev) * args.gn_close * close[:, None]
+                vec = vec.clone(); vec[:, :3] += noise_m / vs3
+            pred, a_logit = net(img, vec, phase_label=ph, return_phase=True)   # teacher-selected active goal at train
+            loss = (F.smooth_l1_loss(pred, y, reduction="none") * w).mean() \
+                   + args.phase_w * F.binary_cross_entropy_with_logits(a_logit, ph)
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item() * len(b)
         sched.step()
         if ep % 5 == 0 or ep == args.epochs - 1:
