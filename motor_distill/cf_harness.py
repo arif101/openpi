@@ -33,7 +33,11 @@ def parse_bddl(path):
     lang = re.search(r"\(:language\s+(.+?)\)", txt, re.S)
     instruction = " ".join(lang.group(1).split()) if lang else ""
     objs = re.search(r"\(:objects\s+(.+?)\)\s*\(:", txt, re.S)
-    object_bodies = re.findall(r"(\w+_\d+)\s+-\s+\w+", objs.group(1)) if objs else []
+    # capture EVERY instance name (\w+_\d+), not just the one immediately before "- type":
+    # spatial/goal BDDLs declare multiple same-type instances on one line
+    # ("akita_black_bowl_1 akita_black_bowl_2 - akita_black_bowl") and the old
+    # "...\s+-\s+\w+" regex silently dropped all but the last -> target fell back to the plate.
+    object_bodies = re.findall(r"(\w+_\d+)", objs.group(1)) if objs else []
     ooi = re.search(r"\(:obj_of_interest\s+(.+?)\)", txt, re.S)
     interest = re.findall(r"(\w+_\d+)", ooi.group(1)) if ooi else []
     # graspable targets = objects named in obj_of_interest (exclude fixtures/regions)
