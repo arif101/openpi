@@ -74,6 +74,7 @@ def body_aabb_top(sim, body):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--head", default="data/motor_head_selector.pt"); p.add_argument("--bddl-dir", required=True)
+    p.add_argument("--flow", default="")   # path to FlowMotor ckpt -> use flow-matching head (learned-place fix) instead of L1
     p.add_argument("--init-dir", default=""); p.add_argument("--container", default="basket")
     p.add_argument("--n", type=int, default=10); p.add_argument("--trials", type=int, default=3)
     p.add_argument("--horizon", type=int, default=300); p.add_argument("--replan", type=int, default=5)
@@ -103,6 +104,13 @@ def main():
     ck = torch.load(args.head, map_location=dev, weights_only=False)
     net = WristMotor(prop_dim=ck["prop_dim"]).to(dev); net.load_state_dict(ck["state"]); net.eval()
     vm, vs = ck["vm"], ck["vs"]
+    fnet = None; cmf = csf = None; fsteps = 10
+    if args.flow:
+        from train_flowmotor import FlowMotor
+        fck = torch.load(args.flow, map_location=dev, weights_only=False)
+        fnet = FlowMotor(prop_dim=fck["prop_dim"]).to(dev); fnet.load_state_dict(fck["state"]); fnet.eval()
+        vm, vs = fck["vm"], fck["vs"]; cmf = fck["cm"]; csf = fck["cs"]; fsteps = int(fck.get("infer_steps", 10))
+        print("FLOW head loaded steps=" + str(fsteps), flush=True)
     bank = None; sam_gen = None
     if args.binder in ("dino", "sam"):
         from bind_exemplar import build_bank
@@ -237,7 +245,11 @@ def main():
                         img = torch.tensor(np.transpose(wr_in.astype(np.float32) / 255.0, (2, 0, 1)))[None].to(dev)
                         vec = ((np.concatenate([o_in, c_in, pr]).astype(np.float32) - vm) / vs).astype(np.float32)
                         with torch.no_grad():
-                            chh = net(img, torch.tensor(vec)[None].to(dev)).cpu().numpy()[0]
+                            if fnet is not None:
+                                chs = fnet.sample(img, torch.tensor(vec)[None].to(dev), steps=fsteps).cpu().numpy()[0].reshape(-1)
+                                chh = (chs * csf + cmf).reshape(fnet.chunk, fnet.act)
+                            else:
+                                chh = net(img, torch.tensor(vec)[None].to(dev)).cpu().numpy()[0]
                         chunk = decanon_chunk(chh, theta) if phi else chh; ci = 0
                     a = chunk[ci]; ci += 1; grip = 1.0 if a[6] > 0 else -1.0
                     close_run = close_run + 1 if grip > 0 else 0
