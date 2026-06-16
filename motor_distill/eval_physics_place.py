@@ -83,7 +83,8 @@ def main():
     p.add_argument("--clear", type=float, default=0.10)   # release height above rim
     p.add_argument("--gain", type=float, default=8.0); p.add_argument("--tol", type=float, default=0.025)
     p.add_argument("--reflex", type=int, default=0)       # 0=physics place, 1=pure reflex (baseline A/B)
-    p.add_argument("--binder", default="oracle", choices=["oracle", "dino"])
+    p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
+    p.add_argument("--sam-ckpt", default="/root/openpi/sam_vit_b_01ec64.pth")
     p.add_argument("--loc", default="oracle", choices=["oracle", "rayplane", "depthflip", "nodeloc"])   # depthflip/nodeloc=honest depth localizer (nodeloc=general masked-depth, validated ~1.7cm)
     p.add_argument("--z-obj", type=float, default=0.015); p.add_argument("--z-cont", type=float, default=0.04)
     p.add_argument("--rim-h", type=float, default=0.075)   # honest container rim height above its table-plane z (basket ~7.5cm)
@@ -102,12 +103,16 @@ def main():
     ck = torch.load(args.head, map_location=dev, weights_only=False)
     net = WristMotor(prop_dim=ck["prop_dim"]).to(dev); net.load_state_dict(ck["state"]); net.eval()
     vm, vs = ck["vm"], ck["vs"]
-    bank = None
-    if args.binder == "dino":
+    bank = None; sam_gen = None
+    if args.binder in ("dino", "sam"):
         from bind_exemplar import build_bank
         print("building DINOv2 prototype bank...", flush=True)
         bank = build_bank(sorted(glob.glob(str(pathlib.Path(args.proto_dir) / "*.bddl"))),
                           args.proto_init_dir, [int(x) for x in args.proto_inits.split(",")], args.bind_res, "agentview", dev)
+    if args.binder == "sam":
+        from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+        sam = sam_model_registry["vit_b"](checkpoint=args.sam_ckpt).to(dev).eval()
+        sam_gen = SamAutomaticMaskGenerator(sam, points_per_side=24, min_mask_region_area=40)
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
     print(f"PHYSICS-PLACE reflex={args.reflex} clear={args.clear} on {pathlib.Path(args.bddl_dir).name}", flush=True)
     succ = []; grasp = []; placed_phys = []; bind_ok = 0; nb = 0
@@ -141,9 +146,10 @@ def main():
                 cb = cand[0] if cand else None
             if rb.get(T) is None or cb is None: env.close(); succ.append(0); grasp.append(0); continue
             # ---- BIND target identity ON THE FULL SCENE (must be BEFORE hide!) ----
+            obj_px = None   # SAM-proposed pixel (fully-honest attention, NO body_pos); None -> oracle obj_pixel(body_pos)
             if args.binder == "oracle":
                 chosen = T
-            else:
+            elif args.binder == "dino":
                 from bind_exemplar import proto_crop
                 from dino_separability import dino_feat
                 from bind_foveate import nm
@@ -154,7 +160,30 @@ def main():
                     c = proto_crop(sim, up, args.bind_res, "agentview", rb[o], 60)
                     if c is not None: feats[o] = dino_feat(c, dev)
                 chosen = max(feats, key=lambda o: float(feats[o] @ proto)) if (feats and proto is not None) else T
-            bind_ok += int(chosen == T); nb += 1
+            else:   # sam: SAM proposes regions (NO body_pos) -> foveated-DINOv2 match to target proto -> region pixel
+                from dino_separability import dino_feat
+                from bind_foveate import nm
+                R = args.res; HR = args.bind_res; sc = HR / R
+                img_up = np.ascontiguousarray(np.asarray(obs["agentview_image"])[::-1])
+                hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()
+                proto = bank.get(nm(T)); best = None
+                for m in sam_gen.generate(img_up):
+                    seg = m["segmentation"]; a = int(seg.sum())
+                    if a < 20 or a > 0.25 * R * R: continue
+                    ys, xs = np.where(seg); ry, cx = float(ys.mean()), float(xs.mean())
+                    hy, hx = int(ry * sc), int(cx * sc); s = 60
+                    cr = hi[max(0, hy - s):hy + s, max(0, hx - s):hx + s]
+                    if cr.size < 100: continue
+                    f = dino_feat(cr, dev); score = float(f @ proto) if proto is not None else 0.0
+                    if best is None or score > best[0]: best = (score, ry, cx)
+                chosen = T
+                if best is not None:
+                    obj_px = np.array([R - 1 - best[1], best[2]], np.float32)   # upright-row -> projection frame
+            if obj_px is not None:   # SAM scoring: pixel distance to the true target pixel
+                _tpx = obj_pixel(sim, rb[T], args.res); bind_ok += int(np.hypot(obj_px[0] - _tpx[0], obj_px[1] - _tpx[1]) < 18)
+            else:
+                bind_ok += int(chosen == T)
+            nb += 1
             # ---- HIDE all non-chosen graspables (binder->HIDE->motor), AFTER binding ----
             if args.hide:
                 for o in graspables:
@@ -166,7 +195,7 @@ def main():
             if args.loc == "depthflip":
                 import robosuite.utils.camera_utils as _cu
                 dm = _cu.get_real_depth_map(sim, np.asarray(obs["agentview_depth"]))[::-1].copy()   # row-flip aligns depth to projection (~2cm)
-                obj_w = depth_localize(sim, obj_pixel(sim, rb[chosen], args.res), dm, args.res, mode="object")
+                obj_w = depth_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, mode="object")
                 cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)   # ray-plane at container-center height: avoids basket-rim DEPTH PARALLAX (~0.2cm vs 7cm)
                 if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
                 if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])   # DIAGNOSTIC: honest xy, oracle z
@@ -174,7 +203,7 @@ def main():
                 rim_top = args.z_cont_center + args.rim_h   # release above the rim
             elif args.loc == "nodeloc":
                 dm = node_flipped(sim, obs["agentview_depth"])                          # validated general masked-depth localizer (~1.7cm)
-                obj_w = node_localize(sim, obj_pixel(sim, rb[chosen], args.res), dm, args.res, win=12, z_mode="surface")
+                obj_w = node_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, win=12, z_mode="surface")
                 cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)
                 if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
                 if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])
