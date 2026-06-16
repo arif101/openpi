@@ -67,7 +67,7 @@ def body_aabb_top(sim, body):
         if sim.model.geom_bodyid[g] != bid: continue
         gp = sim.data.geom_xpos[g]; sz = sim.model.geom_size[g]
         zs.append(gp[2] + sz[2]); halfxy = max(halfxy, float(max(sz[0], sz[1])))
-    top = max(zs) if zs else float(body_pos(sim, bid)[2] + 0.05)
+    top = max(zs) if zs else float(sim.data.body_xpos[bid][2] + 0.05)   # bid already an id (fixtures w/ geoms in child bodies)
     return top, halfxy
 
 
@@ -139,6 +139,13 @@ def main():
                 if s in toks: cut = min(cut, toks.index(s))
             tc = "_".join(toks[:cut]); cand = next((o for o in graspables if tc and tc in o), None)
             if cand: T = cand
+        cont_name = args.container + "_1"
+        if args.container == "auto":   # GOAL suite: route container per-task from the (:goal (On X Y)) predicate
+            _gtxt = pathlib.Path(bf).read_text()
+            _gm = _re.search(r"\(:goal.*?\((?:On|In)\s+(\w+)\s+(\w+)\)", _gtxt, _re.S)
+            if _gm is None or _gm.group(2).startswith("main_table"):
+                print(f"  {stem[:30]:32s} skip-articulated/push", flush=True); continue
+            T = _gm.group(1); cont_name = _re.sub(r"(_[a-z]+)+_region$", "", _gm.group(2))
         inits = None
         if args.init_dir:
             fi = pathlib.Path(args.init_dir) / f"{stem}.pruned_init"
@@ -151,9 +158,9 @@ def main():
             env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=args.res, camera_widths=args.res, camera_depths=DEPTHCAM)
             env.seed(args.seed + ti); env.reset(); sim = env.env.sim
             obs = env.set_init_state(inits[ti]) if inits is not None else env.reset()
-            rb = resolve_bodies(sim, graspables + [args.container + "_1"]); cb = rb.get(args.container + "_1")
+            rb = resolve_bodies(sim, graspables + [cont_name]); cb = rb.get(cont_name)
             if cb is None:
-                cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and args.container in b]
+                cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and cont_name in b]
                 cb = cand[0] if cand else None
             if rb.get(T) is None or cb is None: env.close(); succ.append(0); grasp.append(0); continue
             # ---- BIND target identity ON THE FULL SCENE (must be BEFORE hide!) ----
