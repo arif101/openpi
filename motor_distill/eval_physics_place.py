@@ -91,6 +91,7 @@ def main():
     p.add_argument("--obj-oracle-z", type=int, default=0)  # DIAGNOSTIC: honest xy but oracle object z (isolates depth top-surface vs body-center z-shift on grasp)
     p.add_argument("--obj-z-off", type=float, default=0.0)  # lower the object goal z toward the grasp point (depth gives TOP surface)
     p.add_argument("--grasp-lift", type=float, default=0.02)  # EE-rise required before physics takeover (secure grasp first; reflex grasps 1.0 so 0.02 takes over too early)
+    p.add_argument("--obj-aware-release", type=int, default=0)  # OBJECT-aware release: target the OBJECT (ee+grasp_off) at rim+clear, not the EE -> fixes bigger-object place
     p.add_argument("--proto-dir", default=""); p.add_argument("--proto-init-dir", default="")
     p.add_argument("--proto-inits", default="30,32,34"); p.add_argument("--bind-res", type=int, default=1024)
     args = p.parse_args()
@@ -215,6 +216,7 @@ def main():
                 else:
                     # ---- GROUNDED-PHYSICS PLACE: drive object over container, release above rim ----
                     tgt_z = rim_top + args.clear   # rim_top precomputed (geom AABB oracle, or z_cont+rim_h honest)
+                    if args.obj_aware_release: tgt_z = tgt_z - float(grasp_off[2])   # place the OBJECT (ee+grasp_off), not the EE, at rim+clear
                     des_ee = np.array([cont_w[0] - grasp_off[0], cont_w[1] - grasp_off[1], tgt_z], np.float32)
                     over = np.linalg.norm((ee + grasp_off)[:2] - cont_w[:2]) < args.tol and abs(ee[2] - tgt_z) < args.tol
                     if over or released:
