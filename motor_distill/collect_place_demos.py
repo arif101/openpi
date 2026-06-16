@@ -11,7 +11,7 @@ Run: PYTHONPATH=/root/LIBERO-PRO:motor_distill MUJOCO_GL=egl python3 motor_disti
 from __future__ import annotations
 import argparse, glob, pathlib, re, os
 import numpy as np, h5py
-from cf_harness import parse_bddl, resolve_bodies, body_pos
+from cf_harness import parse_bddl, resolve_bodies, body_pos, _quat2axisangle
 
 
 def main():
@@ -52,20 +52,24 @@ def main():
         for dk in list(data.keys())[: args.max_demos]:
             g = data[dk]
             states = np.asarray(g["states"]); acts = np.asarray(g["actions"]).astype(np.float32)
-            wrist = np.asarray(g["obs"]["eye_in_hand_rgb"])
-            ee_pos = np.asarray(g["obs"]["ee_pos"]).astype(np.float32)
-            ee_ori = np.asarray(g["obs"]["ee_ori"]).astype(np.float32)
-            grip = np.asarray(g["obs"]["gripper_states"]).astype(np.float32)
             Tt = states.shape[0]
             obj_rel = np.zeros((Tt, 3), np.float32); cont_rel = np.zeros((Tt, 3), np.float32); objz = np.zeros(Tt, np.float32)
+            proprio = np.zeros((Tt, 5), np.float32); wr_list = []
             for t in range(Tt):
                 sim.set_state_from_flattened(states[t]); sim.forward()
+                # LIVE re-render obs to EXACTLY match the eval convention (demo-stored eye_in_hand_rgb is a
+                # different convention than the live robot0_eye_in_hand_image the eval feeds -> was the bug).
+                obs = env.env._get_observations()
+                eef = np.asarray(obs["robot0_eef_pos"], np.float32)
                 op = body_pos(sim, rb[T]).astype(np.float32); cp = body_pos(sim, cb).astype(np.float32)
-                obj_rel[t] = op - ee_pos[t]; cont_rel[t] = cp - ee_pos[t]; objz[t] = op[2]
+                obj_rel[t] = op - eef; cont_rel[t] = cp - eef; objz[t] = op[2]
+                proprio[t] = np.concatenate((_quat2axisangle(np.asarray(obs["robot0_eef_quat"])),
+                                             np.asarray(obs["robot0_gripper_qpos"], np.float32))).astype(np.float32)
+                w = np.asarray(obs["robot0_eye_in_hand_image"])
+                wr_list.append(image_tools.resize_with_pad(
+                    np.ascontiguousarray(w[::-1, ::-1] if args.wrist_flip else w), args.img, args.img))
             held = (objz - objz[0] > 0.03).astype(np.int32)
-            wr = np.stack([image_tools.resize_with_pad(
-                np.ascontiguousarray(w[::-1, ::-1] if args.wrist_flip else w), args.img, args.img) for w in wrist]).astype(np.uint8)
-            proprio = np.concatenate([ee_ori, grip], axis=1).astype(np.float32)   # 3 + 2 = 5
+            wr = np.stack(wr_list).astype(np.uint8)
             ch = np.zeros((Tt, args.chunk, 7), np.float32)
             for t in range(Tt):
                 e = min(t + args.chunk, Tt); ch[t, :e - t] = acts[t:e]
