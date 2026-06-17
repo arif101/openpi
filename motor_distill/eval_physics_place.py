@@ -92,6 +92,35 @@ def resolve_noun(noun, candidates):
     return best if bs > 0 else None
 
 
+def _body_tokens(b):
+    import re as _r
+    return set(_r.sub(r"_\d+$", "", b).split("_"))
+
+
+def select_instance(sim, obj_noun, relation, names):
+    """RELATIONAL which-instance (de-hardcode oracle which-bowl): among same-noun candidate instances,
+    pick the one satisfying `relation` vs the reference objects' positions — GEOMETRY, not obj_of_interest.
+    (Positions via body_pos here = residual; the de-hardcode is the SELECTION MECHANISM = relation+geometry.)"""
+    from language_planner import parse_relation, resolve_relation
+    nt = set((obj_noun or "").lower().split())
+    cands = [n for n in names if len(nt & _body_tokens(n)) >= max(1, len(nt) - 1)]
+    if len(cands) <= 1:
+        return cands[0] if cands else None
+    _, refnouns = parse_relation(relation)
+    refkeys = {}
+    for rn in refnouns:
+        rt = set(rn.lower().split())
+        best = max(names, key=lambda n: len(rt & _body_tokens(n)), default=None)
+        if best and len(rt & _body_tokens(best)) > 0:
+            refkeys[rn] = best
+    rb = resolve_bodies(sim, cands + list(refkeys.values()))
+    cand_pos = [(k, body_pos(sim, rb[k])) for k in cands if rb.get(k) is not None]
+    ref_pos = {rn: body_pos(sim, rb[refkeys[rn]]) for rn in refkeys if rb.get(refkeys[rn]) is not None}
+    if len(cand_pos) <= 1:
+        return cand_pos[0][0] if cand_pos else None
+    return resolve_relation(relation, cand_pos, ref_pos)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--head", default="data/motor_head_selector.pt"); p.add_argument("--bddl-dir", required=True)
@@ -161,7 +190,7 @@ def main():
                 if s in toks: cut = min(cut, toks.index(s))
             tc = "_".join(toks[:cut]); cand = next((o for o in graspables if tc and tc in o), None)
             if cand: T = cand
-        cont_name = args.container + "_1"
+        cont_name = args.container + "_1"; _relnoun = None; _relrel = None
         if args.lang_plan:   # DE-HARDCODE: grasp-obj + container from the LANGUAGE instruction (not BDDL goal / oracle)
             from language_planner import plan as _lplan
             _cands = scene_bodies(bf); _subs = _lplan(instr)
@@ -171,7 +200,7 @@ def main():
             _T = resolve_noun(_pp["obj"], _cands); _C = resolve_noun(_pp["target"], _cands)
             if _T is None or _C is None:
                 print(f"  {stem[:30]:32s} skip (noun unresolved {_pp['obj']}->{_T} / {_pp['target']}->{_C})", flush=True); continue
-            T = _T; cont_name = _C
+            T = _T; cont_name = _C; _relnoun = _pp["obj"]; _relrel = _pp.get("relation")
             if len(_subs) > 2: print(f"  {stem[:30]:32s} NOTE multi-subgoal ({len(_subs)}) -> first pair only (long-10 sequencer TODO)", flush=True)
         elif args.container == "auto":   # GOAL suite: route container per-task from the (:goal (On X Y)) predicate
             _gtxt = pathlib.Path(bf).read_text()
@@ -191,6 +220,9 @@ def main():
             env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=args.res, camera_widths=args.res, camera_depths=DEPTHCAM)
             env.seed(args.seed + ti); env.reset(); sim = env.env.sim
             obs = env.set_init_state(inits[ti]) if inits is not None else env.reset()
+            if args.lang_plan and _relrel and not _relrel.startswith("instance-"):   # RELATIONAL which-instance (no oracle which-bowl)
+                _ch = select_instance(sim, _relnoun, _relrel, scene_bodies(bf))
+                if _ch: T = _ch
             rb = resolve_bodies(sim, graspables + [cont_name]); cb = rb.get(cont_name)
             if cb is None:
                 cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and cont_name in b]
