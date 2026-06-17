@@ -137,22 +137,23 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
             c = proto_crop(sim, up, args.bind_res, "agentview", rb[o], 60)
             if c is not None: feats[o] = dino_feat(c, dev)
         return (max(feats, key=lambda o: float(feats[o] @ proto)) if (feats and proto is not None) else T), None
-    # sam: SAM proposes regions on the HI-RES render (LIBERO objects are ~20px at 256 -> coarse masks;
-    # at bind_res they're crisp) -> foveated-DINOv2 match -> region pixel mapped back to res frame. NO body_pos.
+    # sam: SAM proposes WHOLE-OBJECT regions at res (hi-res over-segments objects into fragments -> worse:
+    # bind 18/30 vs 21/30) -> foveated-DINOv2 match on a HI-RES crop around each region -> region pixel. NO body_pos.
     from dino_separability import dino_feat
     from bind_foveate import nm
     R = args.res; HR = args.bind_res; sc = HR / R
+    img_up = np.ascontiguousarray(np.asarray(obs["agentview_image"])[::-1])
     hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()
     proto = bank.get(nm(T)); best = None
-    for m in sam_gen.generate(hi):                      # generate on HI-RES for small-object resolution
+    for m in sam_gen.generate(img_up):
         seg = m["segmentation"]; a = int(seg.sum())
-        if a < 200 or a > 0.25 * HR * HR: continue      # area thresholds scaled to hi-res
-        ys, xs = np.where(seg); ry, cx = float(ys.mean()), float(xs.mean())   # centroid in HR coords
-        s = 90
-        cr = hi[max(0, int(ry) - s):int(ry) + s, max(0, int(cx) - s):int(cx) + s]
+        if a < 20 or a > 0.25 * R * R: continue
+        ys, xs = np.where(seg); ry, cx = float(ys.mean()), float(xs.mean())
+        hy, hx = int(ry * sc), int(cx * sc); s = 60
+        cr = hi[max(0, hy - s):hy + s, max(0, hx - s):hx + s]
         if cr.size < 100: continue
         f = dino_feat(cr, dev); score = float(f @ proto) if proto is not None else 0.0
-        if best is None or score > best[0]: best = (score, ry / sc, cx / sc)   # -> res-frame pixel
+        if best is None or score > best[0]: best = (score, ry, cx)
     if best is not None:
         obj_px = np.array([R - 1 - best[1], best[2]], np.float32)   # upright-row -> projection frame
     return T, obj_px
@@ -374,7 +375,7 @@ def main():
     if args.binder == "sam":
         from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
         sam = sam_model_registry["vit_b"](checkpoint=args.sam_ckpt).to(dev).eval()
-        sam_gen = SamAutomaticMaskGenerator(sam, points_per_side=32, min_mask_region_area=100)
+        sam_gen = SamAutomaticMaskGenerator(sam, points_per_side=24, min_mask_region_area=40)
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))[: args.n]
     print(f"PHYSICS-PLACE reflex={args.reflex} clear={args.clear} on {pathlib.Path(args.bddl_dir).name}", flush=True)
     succ = []; grasp = []; placed_phys = []; bind_ok = 0; nb = 0
