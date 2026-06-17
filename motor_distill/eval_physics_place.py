@@ -121,11 +121,174 @@ def select_instance(sim, obj_noun, relation, names):
     return resolve_relation(relation, cand_pos, ref_pos)
 
 
+def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
+    """Identity binding: returns (chosen_body_name, obj_px or None). obj_px=SAM-proposed pixel (honest attention)."""
+    obj_px = None
+    if args.binder == "oracle":
+        return T, None
+    if args.binder == "dino":
+        from bind_exemplar import proto_crop
+        from dino_separability import dino_feat
+        from bind_foveate import nm
+        hi = sim.render(width=args.bind_res, height=args.bind_res, camera_name="agentview")
+        up = np.asarray(hi)[::-1].copy(); proto = bank.get(nm(T)); feats = {}
+        for o in graspables:
+            if rb.get(o) is None: continue
+            c = proto_crop(sim, up, args.bind_res, "agentview", rb[o], 60)
+            if c is not None: feats[o] = dino_feat(c, dev)
+        return (max(feats, key=lambda o: float(feats[o] @ proto)) if (feats and proto is not None) else T), None
+    # sam: SAM proposes regions (NO body_pos) -> foveated-DINOv2 match -> region pixel
+    from dino_separability import dino_feat
+    from bind_foveate import nm
+    R = args.res; HR = args.bind_res; sc = HR / R
+    img_up = np.ascontiguousarray(np.asarray(obs["agentview_image"])[::-1])
+    hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()
+    proto = bank.get(nm(T)); best = None
+    for m in sam_gen.generate(img_up):
+        seg = m["segmentation"]; a = int(seg.sum())
+        if a < 20 or a > 0.25 * R * R: continue
+        ys, xs = np.where(seg); ry, cx = float(ys.mean()), float(xs.mean())
+        hy, hx = int(ry * sc), int(cx * sc); s = 60
+        cr = hi[max(0, hy - s):hy + s, max(0, hx - s):hx + s]
+        if cr.size < 100: continue
+        f = dino_feat(cr, dev); score = float(f @ proto) if proto is not None else 0.0
+        if best is None or score > best[0]: best = (score, ry, cx)
+    if best is not None:
+        obj_px = np.array([R - 1 - best[1], best[2]], np.float32)   # upright-row -> projection frame
+    return T, obj_px
+
+
+def localize_targets(sim, obs, args, chosen, rb, cb, obj_px, image_tools=None):
+    """3D localization: returns (obj_w, cont_w, rim_top). Honest depth/ray-plane or oracle body_pos."""
+    if args.loc == "depthflip":
+        import robosuite.utils.camera_utils as _cu
+        dm = _cu.get_real_depth_map(sim, np.asarray(obs["agentview_depth"]))[::-1].copy()
+        obj_w = depth_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, mode="object")
+        cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)
+        if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
+        if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])
+        obj_w[2] += args.obj_z_off
+        rim_top = args.z_cont_center + args.rim_h
+    elif args.loc == "nodeloc":
+        dm = node_flipped(sim, obs["agentview_depth"])
+        obj_w = node_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, win=12, z_mode="surface")
+        cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)
+        if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
+        if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])
+        obj_w[2] += args.obj_z_off
+        rim_top = args.z_cont_center + args.rim_h
+    elif args.loc == "rayplane":
+        obj_w = ray_plane(sim, rb[chosen], args.z_obj, args.res); cont_w = ray_plane(sim, cb, args.z_cont, args.res)
+        rim_top = args.z_cont + args.rim_h
+    else:
+        obj_w = body_pos(sim, rb[chosen]).astype(np.float32); cont_w = body_pos(sim, cb).astype(np.float32)
+        rim_top, _ = body_aabb_top(sim, sim.model.body_name2id(cb))
+    return obj_w, cont_w, rim_top
+
+
+def resolve_pair_target(sim, bf, obj_noun, relation):
+    """Resolve a pair's grasp-object to a scene body via language noun + relational which-instance (no oracle)."""
+    cands = scene_bodies(bf)
+    To = resolve_noun(obj_noun, cands)
+    if To is None:
+        return None
+    if relation and relation.startswith("instance-"):
+        idx = int(relation.split("-")[1])
+        same = [n for n in cands if len(set((obj_noun or "").split()) & _body_tokens(n)) >= 1]
+        if idx < len(same): To = same[idx]
+    elif relation:
+        ch = select_instance(sim, obj_noun, relation, cands)
+        if ch: To = ch
+    return To
+
+
+def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
+                    net, fnet, vm, vs, cmf, csf, fsteps, dev, bank, sam_gen, image_tools):
+    """N-SUBGOAL SEQUENCER (long-10): execute pick-place PAIRS in order with the SAME learned dual-goal motor.
+    Advance to the next pair when the held object is released over its container. Returns (success, grasped_any).
+    This is the dual-goal->N-goal payoff: one primitive, re-targeted + re-localized per pair (no fixed 2-subgoal cap)."""
+    all_conts = list({ps["cont"] for ps in pair_specs})
+
+    def setup(spec):
+        To = resolve_pair_target(sim, bf, spec["obj"], spec.get("relation"))
+        Co = resolve_noun(spec["cont"], scene_bodies(bf))
+        rb = resolve_bodies(sim, graspables + all_conts); cb = rb.get(Co)
+        if cb is None:
+            cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and Co and Co in b]
+            cb = cand[0] if cand else None
+        if To is None or rb.get(To) is None or cb is None:
+            return None
+        chosen, obj_px = bind_target(sim, obs, args, To, graspables, rb, dev, bank, sam_gen)
+        obj_w, cont_w, rim_top = localize_targets(sim, obs, args, chosen, rb, cb, obj_px)
+        return {"T": To, "cb": cb, "rb": rb, "obj_w": obj_w, "cont_w": cont_w, "rim_top": rim_top}
+
+    def reset_state(cur):
+        ee = np.asarray(obs["robot0_eef_pos"], np.float32)
+        return dict(z0=float(body_pos(sim, cur["rb"][cur["T"]])[2]), lifted=0.0, close_run=0, open_run=0,
+                    held=False, grasp_off=None, ci=0, chunk=None, ee_zmin=float(ee[2]))
+
+    pidx = 0; cur = setup(pair_specs[0])
+    if cur is None:
+        return False, False
+    st = reset_state(cur); grasped_any = False
+    for step in range(args.horizon * len(pair_specs)):
+        ee = np.asarray(obs["robot0_eef_pos"], np.float32)
+        obj_rel = cur["obj_w"] - ee; cont_rel = cur["cont_w"] - ee
+        if st["chunk"] is None or st["ci"] >= args.replan:
+            wr_raw = np.asarray(obs["robot0_eye_in_hand_image"])
+            wr = image_tools.resize_with_pad(np.ascontiguousarray(wr_raw[::-1, ::-1]), args.img, args.img).astype(np.uint8)
+            prop = np.concatenate((_quat2axisangle(np.asarray(obs["robot0_eef_quat"])),
+                                   np.asarray(obs["robot0_gripper_qpos"], np.float32))).astype(np.float32)
+            phi = -canon_angle(obj_rel) if args.canon_mode == "perstep_obj" else 0.0; theta = -phi
+            if phi:
+                wr_in = rot_image(wr, phi); o_in = rot_vec_xy(obj_rel, phi); c_in = rot_vec_xy(cont_rel, phi)
+                pr = prop.copy(); pr[:3] = rot_vec_xy(pr[:3], phi)
+            else:
+                wr_in = wr; o_in = obj_rel; c_in = cont_rel; pr = prop
+            img = torch.tensor(np.transpose(wr_in.astype(np.float32) / 255.0, (2, 0, 1)))[None].to(dev)
+            vec = ((np.concatenate([o_in, c_in, pr]).astype(np.float32) - vm) / vs).astype(np.float32)
+            with torch.no_grad():
+                if fnet is not None:
+                    chs = fnet.sample(img, torch.tensor(vec)[None].to(dev), steps=fsteps).cpu().numpy()[0].reshape(-1)
+                    chh = (chs * csf + cmf).reshape(fnet.chunk, fnet.act)
+                else:
+                    chh = net(img, torch.tensor(vec)[None].to(dev)).cpu().numpy()[0]
+            st["chunk"] = decanon_chunk(chh, theta) if phi else chh; st["ci"] = 0
+        a = st["chunk"][st["ci"]]; st["ci"] += 1
+        grip = 1.0 if a[6] > 0 else -1.0
+        st["close_run"] = st["close_run"] + 1 if grip > 0 else 0
+        st["open_run"] = st["open_run"] + 1 if grip < 0 else 0
+        act = a[:7].copy(); act[6] = grip
+        obs, _, done, _ = env.step(act.tolist())
+        ee_now = np.asarray(obs["robot0_eef_pos"], np.float32); st["ee_zmin"] = min(st["ee_zmin"], float(ee_now[2]))
+        objp = body_pos(sim, cur["rb"][cur["T"]]).astype(np.float32)
+        st["lifted"] = max(st["lifted"], float(objp[2] - st["z0"]))
+        if (not st["held"]) and st["close_run"] > 8 and (float(ee_now[2]) - st["ee_zmin"] > args.grasp_lift):
+            st["held"] = True; grasped_any = True; st["grasp_off"] = (cur["obj_w"] - ee_now)
+        placed = (st["held"] and st["open_run"] > 2 and
+                  float(np.linalg.norm(objp[:2] - cur["cont_w"][:2])) < args.seq_rad and (objp[2] - cur["rim_top"]) < 0.08)
+        if placed:
+            pidx += 1
+            if pidx >= len(pair_specs):
+                break
+            nxt = setup(pair_specs[pidx])
+            if nxt is None:
+                break
+            cur = nxt; st = reset_state(cur); continue
+        if done:
+            break
+    try: ok = bool(env.env._check_success())
+    except Exception: ok = False
+    return ok, grasped_any
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--head", default="data/motor_head_selector.pt"); p.add_argument("--bddl-dir", required=True)
     p.add_argument("--flow", default="")   # path to FlowMotor ckpt -> use flow-matching head (learned-place fix) instead of L1
     p.add_argument("--lang-plan", type=int, default=0)   # derive grasp-obj + container from the LANGUAGE instruction (language_planner), NOT the BDDL goal / oracle
+    p.add_argument("--seq", type=int, default=0)          # N-subgoal SEQUENCER (long-10): execute pick-place PAIRS in order, advance on completion (removes dual-goal)
+    p.add_argument("--seq-rad", type=float, default=0.12) # xy radius (m) for detecting a pair placed over its container (advance trigger)
     p.add_argument("--logdir", default="")   # if set: log SUCCESSFUL episodes' (wrist,obj_rel,cont_rel,proprio,executed-chunk) -> analytic-DAgger place distillation
     p.add_argument("--init-dir", default=""); p.add_argument("--container", default="basket")
     p.add_argument("--n", type=int, default=10); p.add_argument("--trials", type=int, default=3)
@@ -180,10 +343,10 @@ def main():
     dag_n = 0
     for bf in bddls:
         instr, objs, targets, distractors = parse_bddl(bf)
-        if not targets: continue
+        if not targets and not args.seq: continue   # seq derives targets from the plan, not the BDDL
         stem = pathlib.Path(bf).stem; graspables = [o for o in objs if args.container not in o]
         import re as _re
-        m = _re.match(r"pick_up_the_(.+)$", stem); T = targets[0]
+        m = _re.match(r"pick_up_the_(.+)$", stem); T = targets[0] if targets else None
         if m:
             toks = m.group(1).split("_"); cut = len(toks)
             for s in ("between", "next", "on", "from", "in", "and"):
@@ -191,7 +354,7 @@ def main():
             tc = "_".join(toks[:cut]); cand = next((o for o in graspables if tc and tc in o), None)
             if cand: T = cand
         cont_name = args.container + "_1"; _relnoun = None; _relrel = None
-        if args.lang_plan:   # DE-HARDCODE: grasp-obj + container from the LANGUAGE instruction (not BDDL goal / oracle)
+        if args.lang_plan and not args.seq:   # DE-HARDCODE: grasp-obj + container from the LANGUAGE instruction (not BDDL goal / oracle)
             from language_planner import plan as _lplan
             _cands = scene_bodies(bf); _subs = _lplan(instr)
             _pp = next((s for s in _subs if s["skill"] == "place"), None)
@@ -208,6 +371,21 @@ def main():
             if _gm is None or _gm.group(2).startswith("main_table"):
                 print(f"  {stem[:30]:32s} skip-articulated/push", flush=True); continue
             T = _gm.group(1); cont_name = _re.sub(r"(_[a-z]+)+_region$", "", _gm.group(2))
+        pair_specs = None
+        if args.seq:   # N-SUBGOAL SEQUENCER: group plan() subgoals into ordered pick-place PAIRS
+            from language_planner import plan as _lplan
+            _subs = _lplan(instr); pair_specs = []; _i = 0
+            while _i < len(_subs):
+                _s = _subs[_i]
+                if _s["skill"] == "grasp" and _i + 1 < len(_subs) and _subs[_i + 1]["skill"] == "place":
+                    pair_specs.append({"obj": _s["obj"], "cont": _subs[_i + 1]["target"], "relation": _s.get("relation")})
+                    _i += 2
+                else:
+                    _i += 1   # articulated/unpaired subgoal -> not executed (task fails honestly)
+            _nart = sum(1 for _s in _subs if _s["skill"] in ("open", "turnon", "close", "push"))
+            print(f"  {stem[:30]:32s} SEQ {len(pair_specs)} pair(s)" + (f" +{_nart} articulated(unhandled)" if _nart else ""), flush=True)
+            if not pair_specs:
+                print(f"  {stem[:30]:32s} skip (no pick-place pair)", flush=True); continue
         inits = None
         if args.init_dir:
             fi = pathlib.Path(args.init_dir) / f"{stem}.pruned_init"
@@ -220,6 +398,10 @@ def main():
             env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=args.res, camera_widths=args.res, camera_depths=DEPTHCAM)
             env.seed(args.seed + ti); env.reset(); sim = env.env.sim
             obs = env.set_init_state(inits[ti]) if inits is not None else env.reset()
+            if args.seq:   # N-subgoal sequencer episode (long-10) — same learned motor, re-targeted per pair
+                _ok, _gr = run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
+                                           net, fnet, vm, vs, cmf, csf, fsteps, dev, bank, sam_gen, image_tools)
+                succ.append(int(_ok)); grasp.append(int(_gr)); env.close(); continue
             if args.lang_plan and _relrel and not _relrel.startswith("instance-"):   # RELATIONAL which-instance (no oracle which-bowl)
                 _ch = select_instance(sim, _relnoun, _relrel, scene_bodies(bf))
                 if _ch: T = _ch
@@ -229,39 +411,7 @@ def main():
                 cb = cand[0] if cand else None
             if rb.get(T) is None or cb is None: env.close(); succ.append(0); grasp.append(0); continue
             # ---- BIND target identity ON THE FULL SCENE (must be BEFORE hide!) ----
-            obj_px = None   # SAM-proposed pixel (fully-honest attention, NO body_pos); None -> oracle obj_pixel(body_pos)
-            if args.binder == "oracle":
-                chosen = T
-            elif args.binder == "dino":
-                from bind_exemplar import proto_crop
-                from dino_separability import dino_feat
-                from bind_foveate import nm
-                hi = sim.render(width=args.bind_res, height=args.bind_res, camera_name="agentview")
-                up = np.asarray(hi)[::-1].copy(); proto = bank.get(nm(T)); feats = {}
-                for o in graspables:
-                    if rb.get(o) is None: continue
-                    c = proto_crop(sim, up, args.bind_res, "agentview", rb[o], 60)
-                    if c is not None: feats[o] = dino_feat(c, dev)
-                chosen = max(feats, key=lambda o: float(feats[o] @ proto)) if (feats and proto is not None) else T
-            else:   # sam: SAM proposes regions (NO body_pos) -> foveated-DINOv2 match to target proto -> region pixel
-                from dino_separability import dino_feat
-                from bind_foveate import nm
-                R = args.res; HR = args.bind_res; sc = HR / R
-                img_up = np.ascontiguousarray(np.asarray(obs["agentview_image"])[::-1])
-                hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()
-                proto = bank.get(nm(T)); best = None
-                for m in sam_gen.generate(img_up):
-                    seg = m["segmentation"]; a = int(seg.sum())
-                    if a < 20 or a > 0.25 * R * R: continue
-                    ys, xs = np.where(seg); ry, cx = float(ys.mean()), float(xs.mean())
-                    hy, hx = int(ry * sc), int(cx * sc); s = 60
-                    cr = hi[max(0, hy - s):hy + s, max(0, hx - s):hx + s]
-                    if cr.size < 100: continue
-                    f = dino_feat(cr, dev); score = float(f @ proto) if proto is not None else 0.0
-                    if best is None or score > best[0]: best = (score, ry, cx)
-                chosen = T
-                if best is not None:
-                    obj_px = np.array([R - 1 - best[1], best[2]], np.float32)   # upright-row -> projection frame
+            chosen, obj_px = bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen)
             if obj_px is not None:   # SAM scoring: pixel distance to the true target pixel
                 _tpx = obj_pixel(sim, rb[T], args.res); bind_ok += int(np.hypot(obj_px[0] - _tpx[0], obj_px[1] - _tpx[1]) < 18)
             else:
@@ -275,29 +425,7 @@ def main():
                     for g in range(sim.model.ngeom):
                         if sim.model.geom_bodyid[g] == bid: sim.model.geom_rgba[g, 3] = 0.0
             # ---- LOCALIZE (oracle body_pos vs OUR honest ray-plane) ----
-            if args.loc == "depthflip":
-                import robosuite.utils.camera_utils as _cu
-                dm = _cu.get_real_depth_map(sim, np.asarray(obs["agentview_depth"]))[::-1].copy()   # row-flip aligns depth to projection (~2cm)
-                obj_w = depth_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, mode="object")
-                cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)   # ray-plane at container-center height: avoids basket-rim DEPTH PARALLAX (~0.2cm vs 7cm)
-                if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
-                if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])   # DIAGNOSTIC: honest xy, oracle z
-                obj_w[2] += args.obj_z_off                                              # lower goal toward grasp point
-                rim_top = args.z_cont_center + args.rim_h   # release above the rim
-            elif args.loc == "nodeloc":
-                dm = node_flipped(sim, obs["agentview_depth"])                          # validated general masked-depth localizer (~1.7cm)
-                obj_w = node_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, win=12, z_mode="surface")
-                cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)
-                if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
-                if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])
-                obj_w[2] += args.obj_z_off
-                rim_top = args.z_cont_center + args.rim_h
-            elif args.loc == "rayplane":
-                obj_w = ray_plane(sim, rb[chosen], args.z_obj, args.res); cont_w = ray_plane(sim, cb, args.z_cont, args.res)
-                rim_top = args.z_cont + args.rim_h
-            else:
-                obj_w = body_pos(sim, rb[chosen]).astype(np.float32); cont_w = body_pos(sim, cb).astype(np.float32)
-                rim_top, _ = body_aabb_top(sim, sim.model.body_name2id(cb))
+            obj_w, cont_w, rim_top = localize_targets(sim, obs, args, chosen, rb, cb, obj_px)
             ee_z0 = float(np.asarray(obs["robot0_eef_pos"], np.float32)[2]); ee_zmin = ee_z0
             z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; close_run = 0; held = False; grasp_off = None; released = 0
             chunk = None; ci = 0; REC = []
