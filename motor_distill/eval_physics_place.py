@@ -267,10 +267,10 @@ def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
             st["held"] = True; grasped_any = True; st["grasp_off"] = (cur["obj_w"] - ee_now)
         placed = (st["held"] and st["open_run"] > 2 and
                   float(np.linalg.norm(objp[:2] - cur["cont_w"][:2])) < args.seq_rad and (objp[2] - cur["rim_top"]) < 0.08)
-        if placed:
+        # ADVANCE only if more pairs remain; on the LAST pair keep running so the object settles
+        # (breaking early ends the episode before _check_success sees the placed object).
+        if placed and pidx + 1 < len(pair_specs):
             pidx += 1
-            if pidx >= len(pair_specs):
-                break
             nxt = setup(pair_specs[pidx])
             if nxt is None:
                 break
