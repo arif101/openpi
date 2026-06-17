@@ -126,6 +126,57 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
     obj_px = None
     if args.binder == "oracle":
         return T, None
+    if args.binder == "molmo":
+        # Molmo open-vocab POINTING VLM (point-to-the-X). Fully general, no proto/body_pos. Runs ONCE per episode.
+        from bind_foveate import nm
+        import re as _re, PIL.Image as _PI
+        global _MOLMO
+        if "_MOLMO" not in globals() or _MOLMO is None:
+            from transformers import AutoModelForCausalLM, AutoProcessor
+            mid = "allenai/Molmo-7B-D-0924"
+            _pr = AutoProcessor.from_pretrained(mid, trust_remote_code=True, torch_dtype="auto", device_map="auto")
+            _md = AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True, torch_dtype="auto", device_map="auto")
+            globals()["_MOLMO"] = (_pr, _md)
+        mpr, mmd = globals()["_MOLMO"]
+        R = args.res; HR = args.bind_res
+        hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()
+        query = nm(T).replace("_", " ")
+        with torch.no_grad():
+            mi = mpr.process(images=[_PI.fromarray(hi)], text=f"Point to the {query}.")
+            mi = {k: v.to(mmd.device).unsqueeze(0) for k, v in mi.items()}
+            from transformers import GenerationConfig
+            go = mmd.generate_from_batch(mi, GenerationConfig(max_new_tokens=80, stop_strings="<|endoftext|>"), tokenizer=mpr.tokenizer)
+            txt = mpr.tokenizer.decode(go[0, mi["input_ids"].size(1):], skip_special_tokens=True)
+        m = _re.search(r'x\d*="([\d.]+)"\s+y\d*="([\d.]+)"', txt)   # Molmo points = PERCENT of image dims
+        if m:
+            px_c = float(m.group(1)) / 100.0 * HR; px_r = float(m.group(2)) / 100.0 * HR   # HR upright (col,row)
+            obj_px = np.array([R - 1 - px_r / (HR / R), px_c / (HR / R)], np.float32)
+        return T, obj_px
+    if args.binder == "gdino":
+        # GroundingDINO open-vocab DETECTION (text -> box), the detector inside Grounded-SAM2. No TF, no body_pos.
+        from bind_foveate import nm
+        import PIL.Image as _PI
+        global _GD
+        if "_GD" not in globals() or _GD is None:
+            from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+            mid = "IDEA-Research/grounding-dino-base"
+            _gp = AutoProcessor.from_pretrained(mid)
+            _gm = AutoModelForZeroShotObjectDetection.from_pretrained(mid).to(dev).eval()
+            globals()["_GD"] = (_gp, _gm)
+        gp, gm = globals()["_GD"]
+        R = args.res; HR = args.bind_res
+        hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()
+        query = nm(T).replace("_", " ").strip() + " ."   # GroundingDINO wants lowercase, period-terminated
+        with torch.no_grad():
+            inp = gp(images=_PI.fromarray(hi), text=query.lower(), return_tensors="pt").to(dev)
+            out = gm(**inp)
+            res = gp.post_process_grounded_object_detection(out, inp["input_ids"], threshold=0.15, text_threshold=0.15,
+                                                            target_sizes=[(HR, HR)])[0]
+        if len(res["scores"]):
+            bi = int(torch.argmax(res["scores"])); bx = res["boxes"][bi].tolist()
+            cyx = ((bx[1] + bx[3]) / 2.0, (bx[0] + bx[2]) / 2.0)
+            obj_px = np.array([R - 1 - cyx[0] / (HR / R), cyx[1] / (HR / R)], np.float32)
+        return T, obj_px
     if args.binder == "owl":
         # OWLv2 open-vocab DETECTION (text query -> box). Fully general: no proto bank, no body_pos, no SAM regions.
         from bind_foveate import nm
@@ -361,7 +412,7 @@ def main():
     p.add_argument("--clear", type=float, default=0.10)   # release height above rim
     p.add_argument("--gain", type=float, default=8.0); p.add_argument("--tol", type=float, default=0.025)
     p.add_argument("--reflex", type=int, default=0)       # 0=physics place, 1=pure reflex (baseline A/B)
-    p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam", "owl"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
+    p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam", "owl", "molmo", "gdino"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
     p.add_argument("--sam-ckpt", default="/root/openpi/sam_vit_b_01ec64.pth")
     p.add_argument("--loc", default="oracle", choices=["oracle", "rayplane", "depthflip", "nodeloc"])   # depthflip/nodeloc=honest depth localizer (nodeloc=general masked-depth, validated ~1.7cm)
     p.add_argument("--z-obj", type=float, default=0.015); p.add_argument("--z-cont", type=float, default=0.04)
