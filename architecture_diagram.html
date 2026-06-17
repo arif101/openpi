@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Factored Equivariant VLA — architecture, novelty, journey</title>
+<style>
+  :root{--green:#27ae60;--red:#c0392b;--blue:#2471a3;--orange:#e67e22;--gray:#7f8c8d;--ink:#1b2631;}
+  *{box-sizing:border-box;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+  body{margin:0;background:#0f1419;color:#e8eef2;padding:28px 34px;}
+  h1{font-size:23px;margin:0 0 2px;} h2{font-size:15px;color:#9fb3c8;letter-spacing:.5px;text-transform:uppercase;margin:30px 0 12px;border-bottom:1px solid #2a3744;padding-bottom:6px;}
+  .sub{color:#9fb3c8;font-size:13px;margin-bottom:6px;}
+  .row{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;}
+  .box{background:#1c2733;border:1px solid #34475a;border-radius:10px;padding:13px 15px;min-width:150px;flex:1;}
+  .box .t{font-weight:700;font-size:14px;margin-bottom:5px;} .box .d{font-size:11.5px;color:#aebfcc;line-height:1.45;}
+  .arrow{display:flex;align-items:center;color:#5b7388;font-size:24px;padding:0 8px;}
+  .tag{display:inline-block;font-size:10px;padding:1px 7px;border-radius:9px;margin-top:6px;font-weight:700;}
+  .frozen{background:#22323f;color:#7fd3ff;border:1px solid #2d6a8a;}
+  .novel{background:#1d3a28;color:#6ee7a0;border:1px solid #2f7d50;}
+  .ours{background:#3a2420;color:#ffb59c;border:1px solid #8a4a3a;}
+  .pill{display:inline-block;background:#22323f;border:1px solid #34475a;border-radius:14px;padding:3px 10px;font-size:11px;margin:3px 4px 3px 0;color:#cfe0ec;}
+  table{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:6px;}
+  th,td{border:1px solid #2a3744;padding:6px 9px;text-align:center;} th{background:#1c2733;color:#9fb3c8;}
+  td.k{text-align:left;color:#cfe0ec;} .hi{color:var(--green);font-weight:800;} .lo{color:var(--red);}
+  .win{background:#15241a;}
+  .journey{position:relative;margin-left:6px;border-left:2px solid #34475a;padding-left:18px;}
+  .step{position:relative;margin-bottom:11px;font-size:12.5px;line-height:1.4;}
+  .step::before{content:'';position:absolute;left:-25px;top:3px;width:11px;height:11px;border-radius:50%;background:#34475a;border:2px solid #0f1419;}
+  .step.neg::before{background:var(--red);} .step.win::before{background:var(--green);} .step.res::before{background:var(--blue);}
+  .step b{color:#fff;} .muted{color:#90a4b5;}
+  .callout{background:#13241b;border:1px solid #2f7d50;border-radius:10px;padding:13px 16px;font-size:13px;line-height:1.5;}
+  .warn{background:#2a1f14;border:1px solid #8a5a2a;border-radius:10px;padding:11px 15px;font-size:12.5px;line-height:1.5;color:#ffd9a8;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;} @media(max-width:820px){.grid2{grid-template-columns:1fr;}}
+  code{background:#0c2233;color:#7fd3ff;padding:1px 5px;border-radius:4px;font-size:11.5px;}
+</style></head>
+<body>
+
+<h1>Factored Equivariant VLA</h1>
+<div class="sub">An open-vocab binder + a position-general (SE(2)-equivariant) motor. No π0 at test · no distractor hiding · no memorization.</div>
+
+<h2>Architecture — the pipeline</h2>
+<div class="row">
+  <div class="box">
+    <div class="t">① Open-vocab Binder</div>
+    <div class="d">DINOv2 visual-exemplar match (→ swap to <b>LocateAnything</b>). Picks WHICH object is the named target, among look-alikes, by appearance.</div>
+    <span class="tag frozen">FROZEN · web-pretrained → can't memorize LIBERO</span>
+  </div>
+  <div class="arrow">→</div>
+  <div class="box">
+    <div class="t">② 3D Goal</div>
+    <div class="d">Chosen object → pixel → depth unproject → a <b>relative</b> goal (target − gripper). Relative ⇒ already translation-canonical.</div>
+    <span class="tag frozen">geometry · "solved engineering"</span>
+  </div>
+  <div class="arrow">→</div>
+  <div class="box" style="border-color:#2f7d50;">
+    <div class="t">③ SE(2)-Canonicalized Motor <span style="color:var(--green)">★</span></div>
+    <div class="d">Inputs: <b>wrist cam + relative goal + proprio</b> (no global scene → distractor-blind). Rotate everything so the goal points a fixed way → run motor → rotate actions back. <b>Position-general by construction.</b></div>
+    <span class="tag novel">THE NOVELTY · equivariant</span>
+  </div>
+  <div class="arrow">→</div>
+  <div class="box"><div class="t">④ Robot</div><div class="d">10×7 delta-EE action chunk → grasp & place. Official LIBERO-PRO metric.</div><span class="tag ours">π0-free</span></div>
+</div>
+
+<h2>The novelty — why it's general, not a lookup table</h2>
+<div class="grid2">
+  <div class="callout">
+    <b>Equivariance as the cure for VLA counterfactual collapse.</b><br/>
+    Prior VLAs (π0.5) <i>memorize</i> object positions → collapse when objects move (swap axis: 100%→17%). Everyone "fixes" this by adding data (bigger lookup) or steering. We make position-invariance <b>structural</b>: the motor's bearing degree-of-freedom is removed by SE(2) canonicalization, so the success-vs-displacement curve is <b>flat by construction</b> — it <i>cannot</i> memorize positions.
+    <div style="margin-top:8px;">
+      <span class="pill">SE(2) canonicalization (Eq.Bot-style)</span>
+      <span class="pill">→ full <code>escnn</code> / ISP SO(2)/SO(3) net (paper arch)</span>
+      <span class="pill">distractor-blind motor</span>
+      <span class="pill">relative goal = translation-canonical</span>
+    </div>
+    <div style="margin-top:8px;" class="muted">Open wedge: no equivariant policy (ISP, EquiBot, EquiDiff) has ever been evaluated on LIBERO-PRO / counterfactual robustness. Validated by deep research (24/25 claims confirmed).</div>
+  </div>
+  <div>
+    <div class="sub">Position-shift extrapolation (displace object, give correct goal):</div>
+    <table>
+      <tr><th>displacement</th><th>π0.5</th><th>ours L1</th><th class="win">ours +CANON</th></tr>
+      <tr><td class="k">0 cm</td><td>0.97</td><td>0.73</td><td class="win hi">1.00</td></tr>
+      <tr><td class="k">6 cm</td><td>0.70</td><td>0.63</td><td class="win hi">0.80</td></tr>
+      <tr><td class="k">12 cm</td><td>0.83</td><td class="lo">0.30</td><td class="win hi">0.67</td></tr>
+      <tr><td class="k">16 cm</td><td>0.33</td><td>0.33</td><td class="win hi">0.67</td></tr>
+    </table>
+    <div class="sub" style="margin-top:12px;">LIBERO-PRO <b>SWAP</b> axis (object relocation):</div>
+    <table>
+      <tr><th>π0.5</th><th>VLS (SOTA)</th><th>ours L1</th><th class="win">canon motor</th></tr>
+      <tr><td>0.17</td><td>0.37</td><td>0.50</td><td class="win hi">0.80</td></tr>
+    </table>
+    <div class="muted" style="font-size:11px;margin-top:5px;">canon motor given correct binding = +43pp over VLS. Curve <b>beats π0.5</b> at 0/6/16cm.</div>
+  </div>
+</div>
+
+<h2>How we got here — the journey</h2>
+<div class="journey">
+  <div class="step"><b>Start:</b> π0.5 is monolithic & memorizes → swap collapses 100%→<b>17%</b>. <span class="muted">Diagnosis: the binding is weight-baked.</span></div>
+  <div class="step res"><b>Diagnose:</b> built the <i>position-shift extrapolation curve</i> → our distilled motor decays (0.73→0.30); π0.5 (goal-correcting) holds → the leak is <b>architectural</b>, not data.</div>
+  <div class="step neg"><b>5 negatives that mapped the wall:</b> distill-to-small-head caps · scale position data → no help · scripted control → fails · DINOv2 backbone → helps standard not swap · flow-matching head → no help. <span class="muted">All point to: structure, not data/loss.</span></div>
+  <div class="step res"><b>Deep research (104 agents, 24/25 verified):</b> equivariance gives position-generalization <i>by construction</i>; ISP handles the eye-in-hand frame; the LIBERO-PRO wedge is <b>unclaimed</b>.</div>
+  <div class="step win"><b>Cheap probe → BREAKTHROUGH:</b> SE(2)-canonicalize the same motor → curve <b>flattens & rises</b>, swap <b>0.50→0.80</b>, control proves it's not a harness artifact.</div>
+  <div class="step"><b>Now:</b> wired the full e2e (binder → canon motor). Motor solved; <b>binder is the new bottleneck</b>.</div>
+</div>
+
+<h2>Honest status — what's done, what's left</h2>
+<div class="grid2">
+  <div class="callout"><b>DONE / validated</b><br/>
+    • The equivariant motor: position-general by construction, <b>0.80 on swap</b> given correct binding (+43pp vs VLS), beats π0.5 on the curve.<br/>
+    • π0-free, no hiding, no memorization, same 118 demos.<br/>
+    • Oracle-binder e2e = 0.80 (24/30), bind 30/30 — the motor carries the pipeline when binding is right.
+  </div>
+  <div class="warn"><b>THE BOTTLENECK NOW = the binder</b><br/>
+    Deployed DINOv2-crop binder (general bank) picks the right object only <b>6/30 (20%)</b> on swap → e2e = 0.20 (below VLS). The motor is great; the <i>perception front-end</i> is weak.<br/>
+    <b>Fix:</b> replace with <b>LocateAnything</b> (NVIDIA, native-res open-vocab) or a stronger detector → lifts bind-accuracy → e2e = bind × 0.80.<br/>
+    <span class="muted">Remaining: scale N/seeds/suites · depth-localization · full <code>escnn</code>/ISP motor · paper.</span>
+  </div>
+</div>
+
+</body></html>

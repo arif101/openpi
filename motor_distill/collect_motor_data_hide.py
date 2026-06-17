@@ -28,7 +28,6 @@ def geom_ids_for_body(sim, body_name):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config-name", default="pi05_libero")
-    p.add_argument("--host", default="localhost"); p.add_argument("--port", type=int, default=8000)
     p.add_argument("--checkpoint", default="gs://openpi-assets/checkpoints/pi05_libero")
     p.add_argument("--bddl-dir", required=True); p.add_argument("--init-dir", default="")
     p.add_argument("--out", default="data/motor_demos_swap"); p.add_argument("--container", default="basket")
@@ -39,9 +38,12 @@ def main():
     args = p.parse_args()
     import torch
     from libero.libero.envs import OffScreenRenderEnv
+    from openpi.training import config as _config
+    from openpi.policies import policy_config as _policy_config
+    from openpi.shared import download
     from openpi_client import image_tools
-    from openpi_client import websocket_client_policy as _wcp
-    policy = _wcp.WebsocketClientPolicy(host=args.host, port=args.port)
+    download.maybe_download(args.checkpoint + "/assets"); download.maybe_download(args.checkpoint + "/params")
+    policy = _policy_config.create_trained_policy(_config.get_config(args.config_name), args.checkpoint)
     out = pathlib.Path(args.out); out.mkdir(parents=True, exist_ok=True)
     seeds = [int(s) for s in args.seeds.split(",")]
     bddls = sorted(glob.glob(str(pathlib.Path(args.bddl_dir) / "*.bddl")))
@@ -63,13 +65,7 @@ def main():
             cand = next((o for o in targets if tc and tc in o and args.container not in o), None) or \
                    next((o for o in objs if tc and tc in o and args.container not in o), None)
             if cand is not None: T = cand
-        cont_name = args.container + "_1"
-        if args.container == "auto":   # GOAL suite: per-task container from (:goal (On X Y)); skip articulated/push
-            _gm = _re.search(r"\(:goal.*?\((?:On|In)\s+(\w+)\s+(\w+)\)", pathlib.Path(bf).read_text(), _re.S)
-            if _gm is None or _gm.group(2).startswith("main_table"):
-                print(f"  {stem[:30]} skip-articulated/push", flush=True); continue
-            T = _gm.group(1); cont_name = _re.sub(r"(_[a-z]+)+_region$", "", _gm.group(2))
-        distract_objs = [o for o in objs if o != T and o != cont_name and args.container not in o]
+        distract_objs = [o for o in objs if args.container not in o and o != T]
         inits = None
         if args.init_dir:
             fi = pathlib.Path(args.init_dir) / f"{stem}.pruned_init"
@@ -83,9 +79,9 @@ def main():
                 env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256, camera_depths=True)
                 env.seed(seed + t); env.reset(); sim = env.env.sim
                 obs = env.set_init_state(inits[t]) if inits is not None else env.reset()
-                rb = resolve_bodies(sim, [T, cont_name] + distract_objs); cb = rb.get(cont_name)
+                rb = resolve_bodies(sim, [T, args.container + "_1"] + distract_objs); cb = rb[args.container + "_1"]
                 if cb is None:
-                    cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and cont_name in b]
+                    cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and args.container in b]
                     cb = cand[0] if cand else None
                 if rb[T] is None or cb is None: env.close(); continue
                 if args.hide:
@@ -134,7 +130,7 @@ def main():
                 env.close()
                 if ok and len(WR) > 3:
                     n_ok += 1; n_samp += len(WR)
-                    np.savez_compressed(out / f"{stem[:55]}_s{seed}_t{t}.npz",
+                    np.savez_compressed(out / f"{stem[:30]}_s{seed}_t{t}.npz",
                                         wrist=np.asarray(WR, np.uint8), obj_rel=np.asarray(OBJ, np.float32),
                                         cont_rel=np.asarray(CON, np.float32), proprio=np.asarray(PR, np.float32),
                                         chunk=np.asarray(CH, np.float32))

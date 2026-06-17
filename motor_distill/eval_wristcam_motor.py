@@ -28,6 +28,11 @@ def _surface_point(sim, body, depth_norm, R, cam="agentview"):
     return np.asarray(cu.transform_from_pixels_to_world(np.array([[r, c]]), real[None], np.linalg.inv(w2p))[0], np.float32)
 
 
+def geom_ids_for_body(sim, body_name):
+    bid = sim.model.body_name2id(body_name)
+    return [g for g in range(sim.model.ngeom) if sim.model.geom_bodyid[g] == bid]
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--head", default="data/motor_head.pt")
@@ -38,6 +43,7 @@ def main():
     p.add_argument("--init-start", type=int, default=0); p.add_argument("--res", type=int, default=256)
     p.add_argument("--goal-offset", type=float, default=0.0)   # sim binder error: fixed random offset per rollout
     p.add_argument("--surface-goal", type=int, default=0)   # use binder-style surface-point goal (needs depth)   # held-out: index into inits[] so eval positions != training positions
+    p.add_argument("--hide", type=int, default=0)   # hide distractors (deployment pipeline: binder->hide->motor); matches swap-demo collection
     args = p.parse_args()
     from libero.libero.envs import OffScreenRenderEnv
     from openpi_client import image_tools
@@ -69,6 +75,13 @@ def main():
                 cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and args.container in b]
                 cb = cand[0] if cand else None
             if rb[T] is None or cb is None: env.close(); succ.append(0); continue
+            if args.hide:
+                distract_objs = [o for o in objs if args.container not in o and o != T]
+                rbd = resolve_bodies(sim, distract_objs)
+                for o in distract_objs:
+                    if rbd.get(o) is None: continue
+                    for g in geom_ids_for_body(sim, rbd[o]): sim.model.geom_rgba[g, 3] = 0.0
+                obs = env.set_init_state(inits[ti]) if inits is not None else obs   # re-render with alpha applied
             z0 = body_pos(sim, rb[T])[2]; lifted = 0.0; held = False; close_cnt = 0; chunk = None; ci = 0
             osp = _surface_point(sim, rb[T], np.asarray(obs["agentview_depth"]), args.res) if args.surface_goal else None; csp = None
             if args.goal_offset > 0:

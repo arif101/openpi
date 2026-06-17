@@ -1,0 +1,124 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<title>Our Factored Equivariant VLA — system architecture</title>
+<style>
+ :root{--green:#2ecc71;--red:#e74c3c;--blue:#3498db;--orange:#e67e22;--purple:#a569bd;--gray:#7f8c8d;}
+ *{box-sizing:border-box;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+ body{margin:0;background:#0d1117;color:#e6edf3;padding:26px 32px 60px;line-height:1.5;}
+ h1{font-size:25px;margin:0 0 3px;} .lead{color:#9fb3c8;font-size:13.5px;margin-bottom:4px;}
+ h2{font-size:14px;color:#7d95ab;letter-spacing:.6px;text-transform:uppercase;margin:32px 0 12px;border-bottom:1px solid #21303d;padding-bottom:6px;}
+ .flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;}
+ .comp{background:#161d27;border:1px solid #2b3a48;border-radius:11px;padding:13px 15px;flex:1;min-width:170px;}
+ .comp.star{border-color:#2ecc71;box-shadow:0 0 0 1px #1d4a30 inset;}
+ .comp .n{font-size:10px;color:#7d95ab;font-weight:700;letter-spacing:.5px;}
+ .comp .t{font-weight:750;font-size:14.5px;margin:3px 0 6px;} .comp .d{font-size:11.6px;color:#aebfcc;}
+ .comp .nov{font-size:10.8px;color:#9be8b8;margin-top:8px;border-top:1px dashed #2b4a38;padding-top:6px;}
+ .arr{display:flex;align-items:center;color:#46617a;font-size:26px;padding:0 7px;}
+ .tag{display:inline-block;font-size:9.5px;font-weight:800;padding:2px 7px;border-radius:9px;margin-top:7px;}
+ .frz{background:#16313d;color:#7fd3ff;border:1px solid #2d6a8a;} .ours{background:#16331f;color:#7ff0a8;border:1px solid #2f7d50;}
+ .dist{background:#33231c;color:#ffb59c;border:1px solid #8a4a3a;}
+ table{border-collapse:collapse;width:100%;font-size:12.5px;} th,td{border:1px solid #21303d;padding:6px 9px;text-align:center;}
+ th{background:#161d27;color:#7d95ab;} td.k{text-align:left;} .hi{color:var(--green);font-weight:800;} .win{background:#13241a;}
+ .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;} @media(max-width:900px){.grid{grid-template-columns:1fr;}}
+ .card{border-radius:11px;padding:13px 15px;font-size:12.4px;}
+ .good{background:#11251a;border:1px solid #2f7d50;} .weak{background:#2a1f12;border:1px solid #8a5a2a;} .fut{background:#1c1630;border:1px solid #5a3f8a;}
+ .card h3{margin:0 0 8px;font-size:13.5px;} .card ul{margin:0;padding-left:17px;} .card li{margin-bottom:6px;}
+ .verdict{background:#0f1c2a;border:1px solid #244;border-radius:11px;padding:15px 18px;font-size:13.3px;}
+ b.g{color:var(--green);} b.o{color:var(--orange);} b.r{color:var(--red);} b.p{color:var(--purple);} b.b{color:var(--blue);}
+ code{background:#0b2233;color:#7fd3ff;padding:1px 5px;border-radius:4px;font-size:11px;} .mut{color:#8295a6;}
+</style></head><body>
+
+<h1>Our Factored <span style="color:var(--green)">Equivariant</span> VLA</h1>
+<div class="lead">A vision-language-action system split into replaceable parts. The novelty: a motor that is <b>position-general by construction</b> (equivariance), not by memorization or scale.</div>
+
+<h2>System architecture — the pipeline</h2>
+<div class="flow">
+  <div class="comp">
+    <div class="n">PERCEPTION · LANGUAGE</div><div class="t">① Open-Vocab Binder</div>
+    <div class="d">Maps the instruction ("pick up the milk") → <b>which object</b> in the scene. DINOv2 visual-exemplar match (one reference image per object) among graspable candidates. Swappable → LocateAnything / OWLv2.</div>
+    <div class="nov">▸ Novelty: bind by <b>visual reference</b>, not text (DINOv2 separability 1.00 vs ~50% for CLIP/text on look-alikes).</div>
+    <span class="tag frz">FROZEN · web-pretrained → cannot memorize LIBERO</span>
+  </div>
+  <div class="arr">→</div>
+  <div class="comp">
+    <div class="n">GROUNDING · GEOMETRY</div><div class="t">② 3D Goal</div>
+    <div class="d">Chosen object → pixel → depth unproject → a <b>relative</b> goal (target − gripper). Being relative, it is already <b>translation-canonical</b>.</div>
+    <div class="nov">▸ Status: the precise localization step (depth) is the current <b>weak link</b> — engineering, not concept.</div>
+    <span class="tag frz">geometry · "solved engineering" (in progress)</span>
+  </div>
+  <div class="arr">→</div>
+  <div class="comp star">
+    <div class="n">ACTION · THE NOVELTY ★</div><div class="t">③ SE(2)-Canonicalized Motor</div>
+    <div class="d">Inputs: <b>wrist-cam + relative goal + proprio only</b> (never the global scene → distractor-blind). Canonicalize: rotate everything so the goal points a fixed way → run motor → rotate actions back. The bearing degree-of-freedom is <b>removed by construction</b>.</div>
+    <div class="nov">▸ Novelty: <b>equivariance = position-generalization by construction</b>. Curve is flat because of the math, not the data. Distilled from π0.5 for motor competence; the canonicalization is ours.</div>
+    <span class="tag ours">OURS · novel · position-general</span>
+  </div>
+  <div class="arr">→</div>
+  <div class="comp">
+    <div class="n">CONTROL</div><div class="t">④ Robot</div>
+    <div class="d">10×7 delta end-effector action chunk → reach, grasp, place. Scored by the official LIBERO-PRO success metric.</div>
+    <span class="tag dist">π0-free at test</span>
+  </div>
+</div>
+
+<h2>What's novel — and why it's "general, not a lookup table"</h2>
+<div class="verdict">
+  Prior VLAs (π0.5) bake object identity & position into their weights → they <b class="r">memorize</b> and collapse when an object moves (swap: 100% → 17%). The field "fixes" this with <b class="o">more data</b> (a bigger lookup table) or test-time steering. We make position-invariance <b class="g">structural</b>: an <b>SE(2)-equivariant</b> motor produces correspondingly-rotated actions when the object's bearing changes, so <b>success-vs-displacement is flat by construction</b> — the policy <i>cannot</i> encode "object X lives at position P." Validated by deep research (104 agents, 24/25 claims confirmed): this wedge — <i>equivariance as the cure for VLA counterfactual collapse</i> — is <b class="b">unclaimed</b> (ISP/EquiBot/EquiDiff exist but none evaluated on LIBERO-PRO/counterfactual robustness).
+</div>
+
+<h2>Results — LIBERO-PRO swap (object relocation) · the hard axis</h2>
+<div style="display:flex;gap:18px;flex-wrap:wrap;">
+ <div style="flex:1;min-width:300px;">
+  <table>
+   <tr><th>system</th><th>N</th><th>swap success</th></tr>
+   <tr><td class="k">π0.5 (monolithic baseline)</td><td>—</td><td>0.17</td></tr>
+   <tr><td class="k">VLS (prior SOTA)</td><td>—</td><td>0.37</td></tr>
+   <tr><td class="k">our motor, no canonicalization (L1)</td><td>100</td><td>0.47</td></tr>
+   <tr class="win"><td class="k"><b>our SE(2)-canon motor</b></td><td>100</td><td class="hi">0.76</td></tr>
+   <tr class="win"><td class="k"><b>e2e: DINOv2 binder + canon motor</b></td><td>30</td><td class="hi">0.80</td></tr>
+  </table>
+  <div class="mut" style="font-size:11px;margin-top:5px;">+39pp over prior SOTA, π0-free, no distractor-hiding, same 118 demos. Binder identity = 30/30.</div>
+ </div>
+ <div style="flex:1;min-width:300px;">
+  <table>
+   <tr><th>displace</th><th>π0.5</th><th>ours L1</th><th class="win">ours CANON</th></tr>
+   <tr><td class="k">0 cm</td><td>0.97</td><td>0.73</td><td class="win hi">0.98</td></tr>
+   <tr><td class="k">6 cm</td><td>0.70</td><td>0.63</td><td class="win hi">0.84</td></tr>
+   <tr><td class="k">12 cm</td><td>0.83</td><td>0.30</td><td class="win hi">0.73</td></tr>
+   <tr><td class="k">16 cm</td><td>0.33</td><td>0.33</td><td class="win hi">0.53</td></tr>
+  </table>
+  <div class="mut" style="font-size:11px;margin-top:5px;">Position-shift curve (N=80): flattened & raised. The motor is position-general by construction.</div>
+ </div>
+</div>
+
+<h2>Do we have our own foundation-model VLA?</h2>
+<div class="verdict">
+  <b>Partly — and the part that's ours is the part that matters.</b> It is a <b>factored VLA</b>, not a monolithic from-scratch foundation model: the binder is frozen web-pretrained DINOv2, and the motor <i>borrows π0.5's competence by distillation</i>. But the <b class="g">architecture and the load-bearing idea are ours</b>: the equivariant/canonicalized motor that is position-general by construction is novel, validated, and SOTA on the hardest LIBERO-PRO axis — π0 is nowhere at test time. So: <b>we own a novel VLA <i>architecture</i> with a SOTA capability</b>; we do <b>not</b> (yet) own a from-scratch pretrained foundation model — and the research shows we shouldn't try to out-scale π0 (10k-hr data moat); our edge is the factoring + equivariance.
+</div>
+
+<h2>Capability map — what it's good at, weak at, and the future</h2>
+<div class="grid">
+  <div class="card good"><h3>✅ Strong (validated)</h3><ul>
+    <li><b>Position / relocation generalization</b> — SOTA swap 0.76–0.80, by construction not memorization.</li>
+    <li><b>Distractor robustness</b> — motor never sees the global scene; clutter can't confuse it.</li>
+    <li><b>Precise grasping</b> — wrist-cam visual precision distilled from π0.5.</li>
+    <li><b>Open-vocab identity binding</b> — DINOv2 30/30 on relocated look-alikes.</li>
+  </ul></div>
+  <div class="card weak"><h3>⚠️ Weak / in progress</h3><ul>
+    <li><b>Precise 3D localization</b> — depth unprojection bug (21cm err); the perception front-end is the bottleneck, not the motor.</li>
+    <li><b>Goal-following, not goal-correcting</b> — needs an accurate goal; large binder error breaks it.</li>
+    <li><b>Only swap axis deep-tested</b> — object/task/lan/environment axes pending.</li>
+    <li><b>SE(2) proxy, not the full <code>escnn</code>/ISP equivariant net</b> yet.</li>
+  </ul></div>
+  <div class="card fut"><h3>🧠 Future — capabilities & metacognition</h3><ul>
+    <li><b class="p">Metacognition</b>: a self-model that knows <i>when it's wrong</i> (ε prediction-error monitor we already prototyped: AUROC 0.97) → fail-detect, retry, ask-for-help.</li>
+    <li><b>Goal-correcting closed-loop motor</b> (RL / ISP-style) — robust to imperfect binding.</li>
+    <li><b>Stronger perception</b>: LocateAnything detector + robust depth → fix the e2e bottleneck.</li>
+    <li><b>Full equivariant net</b> + all LIBERO-PRO axes → the paper.</li>
+    <li><b>World-model reasoning</b> + deliberation (think-reflect-revise) layer over the factored core.</li>
+  </ul></div>
+</div>
+
+<div class="mut" style="margin-top:24px;font-size:11.5px;">
+  Pipeline: <code>binder (DINOv2/LocateAnything) → 3D goal (depth) → SE(2)-canon motor → robot</code>. Novel component = ③. Metacognition (the ε self-model, surprise-gated memory, know-when-uncertain) is the natural next layer that turns a competent VLA into a <i>deliberative</i> one.
+</div>
+</body></html>

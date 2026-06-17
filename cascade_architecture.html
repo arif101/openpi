@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Observation-Routed Cascade — System Architecture</title>
+<style>
+  body { font-family: -apple-system, 'Segoe UI', sans-serif; background:#0d1117; color:#e6edf3; margin:0; padding:24px; }
+  h1 { font-size:22px; margin:0 0 2px; } .sub { color:#8b949e; font-size:13px; margin-bottom:18px; }
+  .col { display:flex; gap:14px; align-items:stretch; }
+  .stage { flex:1; display:flex; flex-direction:column; gap:10px; }
+  .box { border-radius:10px; padding:10px 12px; font-size:12.5px; line-height:1.45; border:1px solid #30363d; background:#161b22; }
+  .box b { font-size:13px; display:block; margin-bottom:3px; }
+  .novel { border:2px solid #d29922; background:#1f1a0d; }
+  .novel b::after { content:" ★ NOVEL"; color:#d29922; font-size:10px; letter-spacing:.5px; }
+  .frozen { border:1px dashed #8b949e; }
+  .green { border-color:#2ea04366; background:#0d1f12; }
+  .hdr { font-size:11px; letter-spacing:1.5px; text-transform:uppercase; color:#8b949e; text-align:center; }
+  .arrow { text-align:center; color:#58a6ff; font-size:18px; margin:-2px 0; }
+  .flowrow { display:flex; gap:14px; margin-top:14px; }
+  .branch { flex:1; border-radius:12px; border:1px solid #30363d; padding:12px; }
+  .branch h3 { margin:0 0 8px; font-size:13px; color:#58a6ff; }
+  table { border-collapse:collapse; margin-top:18px; font-size:12.5px; }
+  td,th { border:1px solid #30363d; padding:5px 12px; text-align:center; }
+  th { background:#161b22; } .win { color:#3fb950; font-weight:600; }
+  .legend { font-size:11px; color:#8b949e; margin-top:8px; }
+  .pill { display:inline-block; background:#21262d; border-radius:99px; padding:2px 10px; margin:2px 4px 2px 0; font-size:11px; }
+</style>
+</head>
+<body>
+<h1>Observation-Routed Cascade for Counterfactual-Robust Manipulation</h1>
+<div class="sub">A non-memorizing factored specialist + a frozen generalist VLA, routed per-episode by <b>observed</b> relocation, with honest perceptual verification between phases. LIBERO-PRO, June 2026.</div>
+
+<div class="col">
+  <div class="stage">
+    <div class="hdr">1 · Honest Perception Core (shared)</div>
+    <div class="box"><b>Foveated open-vocab identity</b>SAM proposals → hi-res (1024) crops → DINOv2 match vs exemplar catalog (1 reference image / object). 90% identity on 20-px objects.</div>
+    <div class="box"><b>Metric 3D localization</b>Linearized depth → unproject target mask → height-filtered median ⇒ ~2–3 cm. (Resolution can't fix the oblique-silhouette offset — depth does.)</div>
+    <div class="box"><b>3D scene graph</b>All objects + container localized → geometric relations (between / next-to / on / center) for relation-referred targets.</div>
+  </div>
+
+  <div class="stage">
+    <div class="hdr">2 · Metacognitive Router</div>
+    <div class="box novel"><b>Counterfactual detector = the router</b>Compare observed target position vs canonical layout (exemplar scenes).<br>‖p<sub>obs</sub> − p<sub>canon</sub>‖ &gt; 8 cm ⇒ <b>scene is counterfactual</b>.<br>Relocation is <i>observed, never assumed</i> — no oracle, no axis labels.</div>
+    <div class="box"><b>Verb / embodiment gate</b>Pick-place in specialist's envelope → cascade order by relocation. Articulated verbs, rim-grasp objects → generalist-first.</div>
+  </div>
+
+  <div class="stage">
+    <div class="hdr">3 · Two Policies</div>
+    <div class="box novel"><b>Factored specialist (ours)</b>SE(2)-<b>canonicalized</b> wrist motor: rotate inputs so the goal bearing is canonical → act → de-rotate ⇒ position-general <i>by construction</i> (flat displacement curve). <b>Closed-loop wrist re-grounding</b> beats a static perfect goal (0.63 &gt; 0.53). Cannot memorize layouts.</div>
+    <div class="box frozen"><b>Frozen generalist (π0.5)</b>Untouched. Strong on taught layouts &amp; verbs (lan ≈ 1.0); collapses on relocation (swap 0.17 — binding is memorized).</div>
+  </div>
+
+  <div class="stage">
+    <div class="hdr">4 · Verify + Recover</div>
+    <div class="box novel"><b>Honest perceptual verification</b>Mid-episode: retract arm (de-occlude!) → capture state → re-localize target vs goal from pixels+depth. No oracle predicates in the loop.</div>
+    <div class="box novel"><b>Cross-recovery with damage asymmetry</b>On failure: retract → go-home (in-distribution start) → <b>re-perceive</b> → run the <i>other</i> policy.<br>Finding: failed generalist flailing wrecks scenes (spec-recovery 0/8); the specialist fails <i>gently</i> (target stays graspable → π0.5 recovers 3/8). ⇒ gentle policy goes first on counterfactual scenes.</div>
+  </div>
+</div>
+
+<div class="flowrow">
+  <div class="branch">
+    <h3>Canonical scene (observed) → GENERALIST-first</h3>
+    π0.5 (short leash ≈200 steps) → honest check → if failed: retract → home → re-localize → <b>specialist recovery</b>
+    <div class="legend">e.g. lan: π0.5 ≈1.0, + specialist recovered its 2 failures → <b>1.000</b></div>
+  </div>
+  <div class="branch">
+    <h3>Counterfactual scene (observed) → SPECIALIST-first</h3>
+    specialist (perceives, can't memorize) → honest check → if failed: retract → home → <b>π0.5 recovery</b>
+    <div class="legend">e.g. swap: specialist 0.53 + π0.5 recovery → <b>0.5–0.6</b> (π0.5 alone: 0.17)</div>
+  </div>
+</div>
+
+<table>
+<tr><th>cell (n=10)</th><th>lan</th><th>object</th><th>swap</th><th>task</th></tr>
+<tr><td><b>object suite</b></td><td class="win">1.000</td><td class="win">0.800</td><td class="win">0.500–0.600</td><td>0.200</td></tr>
+<tr><td><b>spatial suite</b></td><td>—</td><td class="win">1.000</td><td class="win">0.400</td><td>0.300</td></tr>
+<tr><td><b>goal suite</b></td><td>—</td><td class="win">0.900</td><td>—</td><td>running</td></tr>
+<tr><td><b>10 suite</b></td><td colspan="4">sequencer in progress</td></tr>
+</table>
+<div class="legend">References: π0.5 = 23.69 overall, VLS (steered π0.5, prior SOTA) = 36.81. Caveats: n=10/1-seed cells; protocol mapping + full-N validation pending; exemplar catalog (appearance + canonical layout) declared.</div>
+
+<div style="margin-top:18px">
+  <span class="pill">★ SE(2) canonicalization cures position-memorization by construction</span>
+  <span class="pill">★ closed-loop wrist re-grounding &gt; static perfect goal</span>
+  <span class="pill">★ router = honest counterfactual detector (observed relocation)</span>
+  <span class="pill">★ damage-asymmetric cascade ordering</span>
+  <span class="pill">★ oracle-free perceptual verification &amp; cross-recovery</span>
+</div>
+</body>
+</html>
