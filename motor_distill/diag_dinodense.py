@@ -26,7 +26,8 @@ def dino_dense(img_rgb, dev, res=448, mid="facebook/dinov2-large"):
         _M["m"] = AutoModel.from_pretrained(mid).to(dev).eval()
         _M["p"] = AutoImageProcessor.from_pretrained(mid)
     model, proc = _M["m"], _M["p"]
-    inp = proc(images=Image.fromarray(img_rgb), return_tensors="pt", size={"height": res, "width": res}).to(dev)
+    inp = proc(images=Image.fromarray(img_rgb), return_tensors="pt", size={"height": res, "width": res},
+               do_center_crop=False, crop_size={"height": res, "width": res}).to(dev)   # full res -> finer patch grid (448->g=32)
     with torch.no_grad():
         out = model(**inp)
     tok = out.last_hidden_state[0, 1:]                 # drop CLS -> (P, C)  (dinov2-large: no register tokens)

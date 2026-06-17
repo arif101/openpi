@@ -31,14 +31,26 @@ class GroundHead(nn.Module):
 
 
 def load(dirs):
+    from bind_foveate import nm
     F_, P_, Y_, G = [], [], [], None
+    protos = {}
     for d in str(dirs).split(","):
         for fn in sorted(glob.glob(str(pathlib.Path(d) / "*.npz"))):
             z = np.load(fn, allow_pickle=True); g = int(z["g"]); G = g
-            ft = z["feats"].astype(np.float32); gt = z["gt"]; pr = z["proto"].astype(np.float32)
-            for i in range(len(ft)):
-                F_.append(ft[i]); P_.append(pr); Y_.append(int(gt[i][0]) * g + int(gt[i][1]))
-    return np.stack(F_), np.stack(P_), np.array(Y_, np.int64), G
+            ft = z["feats"].astype(np.float32)
+            if "objs" in z:                                   # ALL-OBJECT format (collect_ground_all)
+                gts = z["gt"]; prs = z["protos"].astype(np.float32); nouns = z["nouns"]
+                for j in range(len(nouns)):
+                    protos[nm(str(nouns[j]))] = prs[j]
+                    for i in range(len(ft)):
+                        gr, gc = int(gts[j][i][0]), int(gts[j][i][1])
+                        if gr < 0: continue
+                        F_.append(ft[i]); P_.append(prs[j]); Y_.append(gr * g + gc)
+            else:                                             # single-target format (collect_ground_data)
+                gt = z["gt"]; pr = z["proto"].astype(np.float32); protos[nm(str(z["noun"]))] = pr
+                for i in range(len(ft)):
+                    F_.append(ft[i]); P_.append(pr); Y_.append(int(gt[i][0]) * g + int(gt[i][1]))
+    return np.stack(F_), np.stack(P_), np.array(Y_, np.int64), G, protos
 
 
 def main():
@@ -50,13 +62,8 @@ def main():
     args = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(args.seed); rng = np.random.default_rng(args.seed)
-    Fa, Pa, Ya, g = load(args.data)
+    Fa, Pa, Ya, g, protos = load(args.data)
     C = Fa.shape[-1]
-    # also stash per-noun protos for eval (one proto per source npz -> keyed by noun)
-    protos = {}
-    for d in str(args.data).split(","):
-        for fn in sorted(glob.glob(str(pathlib.Path(d) / "*.npz"))):
-            z = np.load(fn, allow_pickle=True); protos[str(z["noun"])] = z["proto"].astype(np.float32)
     n = len(Ya); idx = rng.permutation(n); nval = max(1, int(n * args.val_frac))
     vi, ti = idx[:nval], idx[nval:]
     print(f"{n} samples (g={g}, C={C}); train {len(ti)} / val {len(vi)}; {len(protos)} nouns", flush=True)
@@ -76,7 +83,7 @@ def main():
                 corr += int((pr == gt).sum())
                 # within-1-patch (≈ the 18px tol at g=32/res256)
                 pr_r, pr_c = pr // g, pr % g; gt_r, gt_c = gt // g, gt % g
-                d5 += int((np.abs(pr_r - gt_r) <= 1) & (np.abs(pr_c - gt_c) <= 1)).sum()
+                d5 += int(((np.abs(pr_r - gt_r) <= 1) & (np.abs(pr_c - gt_c) <= 1)).sum())
             return corr / len(vi), d5 / len(vi)
     best = 0.0
     for ep in range(args.epochs):

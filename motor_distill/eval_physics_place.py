@@ -139,7 +139,9 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
         gh, gk = globals()["_GH"]
         R = args.res; gres = gk["res"]
         proto = gk["protos"].get(nm(T))
-        if proto is None: return T, None
+        if proto is None:   # NEVER fall back to the oracle pixel — return image center so a missing proto can't masquerade as oracle success
+            print(f"  [learned] WARN no proto for {nm(T)!r} -> center px (NOT oracle)", flush=True)
+            return T, np.array([R / 2.0, R / 2.0], np.float32)
         hi = np.asarray(sim.render(width=gres, height=gres, camera_name="agentview"))[::-1].copy()
         fg, g = dino_dense(hi, dev, gres)
         with torch.no_grad():
