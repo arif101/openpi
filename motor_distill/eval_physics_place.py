@@ -158,25 +158,39 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
     return T, obj_px
 
 
+def _container_z(sim, cb, dm, args):
+    """DE-HARDCODE the z_cont_center=0.035 basket constant: detect the container TOP z from DEPTH
+    (80th-pct z of the container region) so it generalizes basket(rim~0.035)->plate(top~0.0)->any.
+    Returns (z_top, cont_w_xy_z3): ray-plane xy at the detected z (parallax-free) + detected top z.
+    Falls back to the class constant if depth fails. Gated by --cont-depth (motor must be retrained on it)."""
+    cdet = depth_localize(sim, obj_pixel(sim, cb, args.res), dm, args.res, mode="container")
+    zc = float(cdet[2]) if cdet is not None else args.z_cont_center
+    return zc, ray_plane(sim, cb, zc, args.res)
+
+
 def localize_targets(sim, obs, args, chosen, rb, cb, obj_px, image_tools=None):
     """3D localization: returns (obj_w, cont_w, rim_top). Honest depth/ray-plane or oracle body_pos."""
     if args.loc == "depthflip":
         import robosuite.utils.camera_utils as _cu
         dm = _cu.get_real_depth_map(sim, np.asarray(obs["agentview_depth"]))[::-1].copy()
         obj_w = depth_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, mode="object")
-        cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)
+        if args.cont_depth:   # general depth container-top (de-hardcodes z_cont_center per-container)
+            zc, cont_w = _container_z(sim, cb, dm, args); rim_top = zc
+        else:
+            cont_w = ray_plane(sim, cb, args.z_cont_center, args.res); rim_top = args.z_cont_center + args.rim_h
         if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
         if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])
         obj_w[2] += args.obj_z_off
-        rim_top = args.z_cont_center + args.rim_h
     elif args.loc == "nodeloc":
         dm = node_flipped(sim, obs["agentview_depth"])
         obj_w = node_localize(sim, (obj_px if obj_px is not None else obj_pixel(sim, rb[chosen], args.res)), dm, args.res, win=12, z_mode="surface")
-        cont_w = ray_plane(sim, cb, args.z_cont_center, args.res)
+        if args.cont_depth:
+            zc, cont_w = _container_z(sim, cb, dm, args); rim_top = zc
+        else:
+            cont_w = ray_plane(sim, cb, args.z_cont_center, args.res); rim_top = args.z_cont_center + args.rim_h
         if obj_w is None: obj_w = body_pos(sim, rb[chosen]).astype(np.float32)
         if args.obj_oracle_z: obj_w[2] = float(body_pos(sim, rb[chosen])[2])
         obj_w[2] += args.obj_z_off
-        rim_top = args.z_cont_center + args.rim_h
     elif args.loc == "rayplane":
         obj_w = ray_plane(sim, rb[chosen], args.z_obj, args.res); cont_w = ray_plane(sim, cb, args.z_cont, args.res)
         rim_top = args.z_cont + args.rim_h
@@ -305,6 +319,7 @@ def main():
     p.add_argument("--z-obj", type=float, default=0.015); p.add_argument("--z-cont", type=float, default=0.04)
     p.add_argument("--rim-h", type=float, default=0.075)   # honest container rim height above its table-plane z (basket ~7.5cm)
     p.add_argument("--z-cont-center", type=float, default=0.035)   # basket center height (class const) for ray-plane container loc (avoids depth parallax)
+    p.add_argument("--cont-depth", type=int, default=0)            # DE-HARDCODE z_cont_center: detect container TOP z from DEPTH (general basket->plate->any); needs motor retrained on it
     p.add_argument("--obj-oracle-z", type=int, default=0)  # DIAGNOSTIC: honest xy but oracle object z (isolates depth top-surface vs body-center z-shift on grasp)
     p.add_argument("--obj-z-off", type=float, default=0.0)  # lower the object goal z toward the grasp point (depth gives TOP surface)
     p.add_argument("--grasp-lift", type=float, default=0.02)  # EE-rise required before physics takeover (secure grasp first; reflex grasps 1.0 so 0.02 takes over too early)
