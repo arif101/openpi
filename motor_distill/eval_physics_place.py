@@ -126,6 +126,31 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
     obj_px = None
     if args.binder == "oracle":
         return T, None
+    if args.binder == "owl":
+        # OWLv2 open-vocab DETECTION (text query -> box). Fully general: no proto bank, no body_pos, no SAM regions.
+        from bind_foveate import nm
+        global _OWL
+        if "_OWL" not in globals() or _OWL is None:
+            from transformers import Owlv2Processor, Owlv2ForObjectDetection
+            _p = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
+            _m = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble").to(dev).eval()
+            globals()["_OWL"] = (_p, _m)
+        proc, mdl = globals()["_OWL"]
+        R = args.res; HR = args.bind_res; sc = HR / R
+        import PIL.Image as _PI
+        hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()   # upright
+        query = nm(T).replace("_", " ")
+        with torch.no_grad():
+            inp = proc(text=[[f"a photo of a {query}", query]], images=_PI.fromarray(hi), return_tensors="pt").to(dev)
+            out = mdl(**inp)
+            tgt = torch.tensor([[HR, HR]], device=dev)
+            res = proc.post_process_grounded_object_detection(out, threshold=0.02, target_sizes=tgt)[0]
+        if len(res["scores"]):
+            bi = int(torch.argmax(res["scores"]))
+            bx = res["boxes"][bi].tolist()   # [x0,y0,x1,y1] in HR (upright) coords
+            cyx = ((bx[1] + bx[3]) / 2.0, (bx[0] + bx[2]) / 2.0)   # (row,col) upright HR
+            obj_px = np.array([R - 1 - cyx[0] / sc, cyx[1] / sc], np.float32)   # -> res projection frame
+        return T, obj_px
     if args.binder == "dino":
         from bind_exemplar import proto_crop
         from dino_separability import dino_feat
@@ -336,7 +361,7 @@ def main():
     p.add_argument("--clear", type=float, default=0.10)   # release height above rim
     p.add_argument("--gain", type=float, default=8.0); p.add_argument("--tol", type=float, default=0.025)
     p.add_argument("--reflex", type=int, default=0)       # 0=physics place, 1=pure reflex (baseline A/B)
-    p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
+    p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam", "owl"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
     p.add_argument("--sam-ckpt", default="/root/openpi/sam_vit_b_01ec64.pth")
     p.add_argument("--loc", default="oracle", choices=["oracle", "rayplane", "depthflip", "nodeloc"])   # depthflip/nodeloc=honest depth localizer (nodeloc=general masked-depth, validated ~1.7cm)
     p.add_argument("--z-obj", type=float, default=0.015); p.add_argument("--z-cont", type=float, default=0.04)
