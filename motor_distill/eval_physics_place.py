@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse, glob, pathlib
 import numpy as np, torch
 from cf_harness import parse_bddl, resolve_bodies, body_pos, _quat2axisangle
-from train_wristcam_motor import WristMotor
+from train_wristcam_motor import WristMotor, CC_VOCAB, cont_class_from_name
 from canon import canon_angle, rot_vec_xy, rot_image, decanon_chunk
 from collect_motor_data import surface_point
 from node_localizer import localize as node_localize, flipped_depth as node_flipped
@@ -234,7 +234,8 @@ def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
             return None
         chosen, obj_px = bind_target(sim, obs, args, To, graspables, rb, dev, bank, sam_gen)
         obj_w, cont_w, rim_top = localize_targets(sim, obs, args, chosen, rb, cb, obj_px)
-        return {"T": To, "cb": cb, "rb": rb, "obj_w": obj_w, "cont_w": cont_w, "rim_top": rim_top}
+        return {"T": To, "cb": cb, "rb": rb, "obj_w": obj_w, "cont_w": cont_w, "rim_top": rim_top,
+                "cc": cont_class_from_name(spec.get("cont") or Co or "")}
 
     def reset_state(cur):
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
@@ -268,7 +269,7 @@ def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
                         chs = fnet.sample(img, torch.tensor(vec)[None].to(dev), steps=fsteps).cpu().numpy()[0].reshape(-1)
                         chh = (chs * csf + cmf).reshape(fnet.chunk, fnet.act)
                     else:
-                        chh = net(img, torch.tensor(vec)[None].to(dev)).cpu().numpy()[0]
+                        chh = net(img, torch.tensor(vec)[None].to(dev), cc=torch.tensor([cur.get("cc", 0)], dtype=torch.long, device=dev)).cpu().numpy()[0]
                 st["chunk"] = decanon_chunk(chh, theta) if phi else chh; st["ci"] = 0
             a = st["chunk"][st["ci"]]; st["ci"] += 1
             grip = 1.0 if a[6] > 0 else -1.0
@@ -353,7 +354,9 @@ def main():
     from openpi_client import image_tools
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load(args.head, map_location=dev, weights_only=False)
-    net = WristMotor(prop_dim=ck["prop_dim"]).to(dev); net.load_state_dict(ck["state"]); net.eval()
+    _cond = "n_cls" in ck   # conditioned motor (container-class embedding) vs legacy head
+    net = WristMotor(prop_dim=ck["prop_dim"], n_cls=ck.get("n_cls", len(CC_VOCAB)), conditioned=_cond).to(dev)
+    net.load_state_dict(ck["state"]); net.eval()
     vm, vs = ck["vm"], ck["vs"]
     fnet = None; cmf = csf = None; fsteps = 10
     if args.flow:
@@ -498,7 +501,7 @@ def main():
                                 chs = fnet.sample(img, torch.tensor(vec)[None].to(dev), steps=fsteps).cpu().numpy()[0].reshape(-1)
                                 chh = (chs * csf + cmf).reshape(fnet.chunk, fnet.act)
                             else:
-                                chh = net(img, torch.tensor(vec)[None].to(dev)).cpu().numpy()[0]
+                                chh = net(img, torch.tensor(vec)[None].to(dev), cc=torch.tensor([cont_class_from_name(cont_name)], dtype=torch.long, device=dev)).cpu().numpy()[0]
                         chunk = decanon_chunk(chh, theta) if phi else chh; ci = 0
                     a = chunk[ci]; ci += 1; grip = 1.0 if a[6] > 0 else -1.0
                     close_run = close_run + 1 if grip > 0 else 0

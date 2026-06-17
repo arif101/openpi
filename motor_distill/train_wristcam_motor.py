@@ -10,9 +10,36 @@ Split by ROLLOUT (no sample leakage). Torch only (run AFTER the jax collector ex
 Run: .venv/bin/python motor_distill/train_wristcam_motor.py --data data/motor_demos --out data/motor_head.pt --epochs 60
 """
 from __future__ import annotations
-import argparse, glob, pathlib
+import argparse, glob, pathlib, re
 import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
+
+
+# ---- CONTAINER-CLASS CONDITIONING (general: derived from suite-regime + the goal instruction's container noun) ----
+# Lets ONE motor host MULTIPLE place geometries (basket/plate/stove/cabinet/...) by SELECTING a mode from a learned
+# embedding, instead of MODE-AVERAGING them (which collapsed object 0.70->0.30 when goal-fixture data was added).
+CC_VOCAB = ["other", "basket", "plate", "bowl", "stove", "cabinet", "drawer", "rack", "caddy", "microwave"]
+CC_IDX = {n: i for i, n in enumerate(CC_VOCAB)}
+
+
+def cont_class_from_name(name: str) -> int:
+    """Map a container noun/body-name (e.g. 'plate_1','akita_stove','wine_rack') -> class index. General token match."""
+    s = (name or "").lower()
+    for noun in ("microwave", "cabinet", "drawer", "stove", "rack", "caddy", "plate", "basket", "bowl"):
+        if noun in s:
+            return CC_IDX[noun]
+    return 0
+
+
+def cont_class_for_file(path) -> int:
+    """Per-rollout container class. Object/coadapt/dag -> basket; spatial -> plate (place target is the plate, NOT the
+    bowl's location named in the stem); goal -> parse the container noun from the instruction stem (put X on/in the Y)."""
+    p = pathlib.Path(path); s = p.stem.lower(); d = p.parent.name.lower()
+    if "goal" in d:
+        return cont_class_from_name(s)            # goal stems name the place target
+    if "spatial" in d:
+        return CC_IDX["plate"]                    # spatial always places on the plate
+    return CC_IDX["basket"]                       # object / coadapt / dag_place / bowls / dual
 
 
 class WristMotor(nn.Module):
@@ -22,19 +49,24 @@ class WristMotor(nn.Module):
     container while placing) -- NOT a blend -- so it stays a clean single-goal servo. At TRAIN the selection uses the
     teacher's gripper-phase label (motor always gets the correct goal); at DEPLOY the predicted alpha hard-selects. No
     hand-coded transition rule -- the switch is learned."""
-    def __init__(self, prop_dim=11, chunk=10, act=7):
+    def __init__(self, prop_dim=11, chunk=10, act=7, n_cls=len(CC_VOCAB), cc_dim=16, conditioned=True):
         super().__init__()
-        self.chunk, self.act, self.pdim = chunk, act, prop_dim - 6
+        self.chunk, self.act, self.pdim, self.n_cls, self.cc_dim = chunk, act, prop_dim - 6, n_cls, cc_dim
+        self.conditioned = conditioned
         c = lambda i, o, s: nn.Sequential(nn.Conv2d(i, o, 3, s, 1), nn.GroupNorm(min(8, o), o), nn.ReLU())
         self.cnn = nn.Sequential(c(3, 32, 2), c(32, 64, 2), c(64, 128, 2), c(128, 128, 2),
                                  nn.AdaptiveAvgPool2d(1), nn.Flatten())          # -> 128
         self.prop = nn.Sequential(nn.Linear(self.pdim, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU())
         self.goal = nn.Sequential(nn.Linear(3, 64), nn.ReLU(), nn.Linear(64, 64))        # single active goal
+        extra = 0
+        if conditioned:
+            self.cc_emb = nn.Embedding(n_cls, cc_dim)   # CONTAINER-CLASS conditioning -> selects place geometry (basket/plate/stove/...)
+            extra = cc_dim
         self.phase = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 1))    # from cnn+proprio (state), NOT goals
-        self.head = nn.Sequential(nn.Linear(256 + 64 + 1, 512), nn.ReLU(), nn.Linear(512, 512), nn.ReLU(),
-                                  nn.Linear(512, chunk * act))   # +1 = phase bit fed to head (conditions reach-mode vs place-mode, like the old `held` input)
+        self.head = nn.Sequential(nn.Linear(256 + 64 + 1 + extra, 512), nn.ReLU(), nn.Linear(512, 512), nn.ReLU(),
+                                  nn.Linear(512, chunk * act))   # +1 phase bit (+cc_dim container-class embed if conditioned)
 
-    def forward(self, img, vec, phase_label=None, phase_override=None, return_phase=False):
+    def forward(self, img, vec, cc=None, phase_label=None, phase_override=None, return_phase=False):
         cnnf = self.cnn(img); pf = self.prop(vec[:, 6:])
         obj = vec[:, 0:3]; cont = vec[:, 3:6]
         a_logit = self.phase(torch.cat([cnnf, pf], -1)).squeeze(-1)
@@ -42,7 +74,11 @@ class WristMotor(nn.Module):
         elif phase_override is not None: sel = phase_override            # latched phase @deploy
         else: sel = (torch.sigmoid(a_logit) > 0.5).float()              # raw predicted
         active = sel.unsqueeze(-1) * cont + (1 - sel.unsqueeze(-1)) * obj   # HARD single-goal selection (no blend)
-        chunk = self.head(torch.cat([cnnf, pf, self.goal(active), sel.unsqueeze(-1)], -1)).view(-1, self.chunk, self.act)
+        feats = [cnnf, pf, self.goal(active), sel.unsqueeze(-1)]
+        if self.conditioned:
+            if cc is None: cc = torch.zeros(img.shape[0], dtype=torch.long, device=img.device)   # -> 'other'
+            feats.append(self.cc_emb(cc))
+        chunk = self.head(torch.cat(feats, -1)).view(-1, self.chunk, self.act)
         if return_phase: return chunk, a_logit
         return chunk
 
@@ -59,6 +95,7 @@ def load(data_dir):
         # held's grip+lift confirmation -> switches LATER than raw gripper-close => robust to marginal/failed grasps.
         sep = r["proprio"][:, 3] - r["proprio"][:, 4]
         r["phase"] = (sep < 0.05).astype(np.float32)   # plain gripper-closed (place-frac ~0.42; best so far)
+        r["cc"] = np.full(len(r["chunk"]), cont_class_for_file(f), np.int64)   # container-class conditioning label
         rolls.append(r)
     return rolls
 
@@ -69,7 +106,8 @@ def stack(rolls):
     vec = np.concatenate([np.concatenate([r["obj_rel"], r["cont_rel"], r["proprio"]], 1) for r in rolls]).astype(np.float32)
     y = np.concatenate([r["chunk"] for r in rolls]).astype(np.float32)                  # [M,10,7]
     ph = np.concatenate([r["phase"] for r in rolls]).astype(np.float32)                 # [M]
-    return img, vec, y, ph
+    cc = np.concatenate([r["cc"] for r in rolls]).astype(np.int64)                      # [M] container class
+    return img, vec, y, ph, cc
 
 
 def main():
@@ -92,16 +130,17 @@ def main():
     assert rolls, f"no npz in {args.data}"
     idx = rng.permutation(len(rolls)); nval = max(1, int(len(rolls) * args.val_frac))
     vr = [rolls[i] for i in idx[:nval]]; tr = [rolls[i] for i in idx[nval:]]
-    Xi, Xv, Y, Ptr = stack(tr); Vi, Vv, VY, Pval = stack(vr)   # phase = SUSTAINED-close label (computed per-rollout in load)
+    Xi, Xv, Y, Ptr, Ctr = stack(tr); Vi, Vv, VY, Pval, Cval = stack(vr)   # phase=sustained-close, cc=container-class
     print(f"{len(rolls)} rolls -> train {len(tr)} ({len(Y)} samp) / val {len(vr)} ({len(VY)} samp)", flush=True)
     print(f"phase prior: train place-frac={Ptr.mean():.2f} val={Pval.mean():.2f}", flush=True)
+    print("container-class hist (train): " + ", ".join(f"{CC_VOCAB[i]}={int((Ctr==i).sum())}" for i in range(len(CC_VOCAB)) if (Ctr==i).any()), flush=True)
     # standardize the vec inputs (img is /255; targets stay raw action units)
     vm, vs = Xv.mean(0), Xv.std(0) + 1e-6
     gn = (args.goal_noise / vs[:3]).astype(np.float32)   # raw meters -> standardized units, per goal dim
     gnz = float(args.gnz / vs[2]) if args.gnz > 0 else 0.0   # z-only noise in standardized units (vec idx 2 = goal_rel z)
     import torch as _t; vmt3 = _t.tensor(vm[:3]); vst3 = _t.tensor(vs[:3])   # for closeness-scaled goal noise
     Xv = (Xv - vm) / vs; Vv = (Vv - vm) / vs
-    tX = [torch.tensor(a) for a in (Xi, Xv, Y, Ptr)]; vX = [torch.tensor(a) for a in (Vi, Vv, VY, Pval)]
+    tX = [torch.tensor(a) for a in (Xi, Xv, Y, Ptr, Ctr)]; vX = [torch.tensor(a) for a in (Vi, Vv, VY, Pval, Cval)]
     net = WristMotor(prop_dim=Xv.shape[1]).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
@@ -112,7 +151,7 @@ def main():
         with torch.no_grad():
             pr = []
             for s in range(0, len(VY), 512):
-                pr.append(net(vX[0][s:s+512].to(dev), vX[1][s:s+512].to(dev)).cpu())
+                pr.append(net(vX[0][s:s+512].to(dev), vX[1][s:s+512].to(dev), cc=vX[4][s:s+512].to(dev)).cpu())
             P = torch.cat(pr); err = (P - vX[2]).abs()
             pos = err[..., :3].mean().item(); ori = err[..., 3:6].mean().item(); grp = err[..., 6].mean().item()
         return pos, ori, grp
@@ -122,7 +161,7 @@ def main():
         tot = 0.0
         for s in range(0, n, args.bs):
             b = perm[s:s+args.bs]
-            img = tX[0][b].to(dev); vec = tX[1][b].to(dev); y = tX[2][b].to(dev); ph = tX[3][b].to(dev)
+            img = tX[0][b].to(dev); vec = tX[1][b].to(dev); y = tX[2][b].to(dev); ph = tX[3][b].to(dev); ccb = tX[4][b].to(dev)
             if args.aug:   # multi-factor wrist aug: brightness/contrast/color + small translation (preserve eye-in-hand signal)
                 Bn = img.shape[0]; sgn = args.aug_str
                 bri = 1.0 + (torch.rand(Bn, 1, 1, 1, device=dev) - 0.5) * 0.4 * sgn
@@ -146,7 +185,7 @@ def main():
                 close = (1.0 - (dist / 0.10).clamp(0, 1))                            # 1 at object -> 0 at >=10cm
                 noise_m = torch.randn(len(b), 3, device=dev) * args.gn_close * close[:, None]
                 vec = vec.clone(); vec[:, :3] += noise_m / vs3
-            pred, a_logit = net(img, vec, phase_label=ph, return_phase=True)   # teacher-selected active goal at train
+            pred, a_logit = net(img, vec, cc=ccb, phase_label=ph, return_phase=True)   # teacher-selected active goal at train
             loss = (F.smooth_l1_loss(pred, y, reduction="none") * w).mean() \
                    + args.phase_w * F.binary_cross_entropy_with_logits(a_logit, ph)
             opt.zero_grad(); loss.backward(); opt.step(); tot += loss.item() * len(b)
@@ -156,7 +195,7 @@ def main():
             tag = ""
             if score < best:
                 best = score
-                torch.save({"state": net.state_dict(), "vm": vm, "vs": vs, "prop_dim": int(Xv.shape[1])}, args.out)
+                torch.save({"state": net.state_dict(), "vm": vm, "vs": vs, "prop_dim": int(Xv.shape[1]), "n_cls": int(net.n_cls)}, args.out)
                 tag = " *saved"
             print(f"ep{ep:3d} train_l1={tot/n:.4f}  val_pos={pos:.4f} ori={ori:.4f} grip={grp:.4f}{tag}", flush=True)
     print(f"\n=== BEST val pos-L1 (score)= {best:.4f}  saved -> {args.out} ===", flush=True)
