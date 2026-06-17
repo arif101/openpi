@@ -71,10 +71,32 @@ def body_aabb_top(sim, body):
     return top, halfxy
 
 
+def scene_bodies(bf):
+    """Object + fixture instance names from the BDDL (the scene the agent perceives) — NOT the (:goal) predicate."""
+    import re as _r, pathlib as _p
+    txt = _p.Path(bf).read_text(); names = []
+    for blk in (_r.search(r"\(:objects\s+(.+?)\)\s*\(:", txt, _r.S), _r.search(r"\(:fixtures\s+(.+?)\)\s*\(:", txt, _r.S)):
+        if blk: names += _r.findall(r"(\w+_\d+)", blk.group(1))
+    return list(dict.fromkeys(names))
+
+
+def resolve_noun(noun, candidates):
+    """Open-vocab noun -> scene body by token overlap (language-driven; no body_pos / no goal predicate)."""
+    import re as _r
+    nt = set(_r.sub(r"[^a-z ]", " ", (noun or "").lower()).split())
+    best, bs = None, 0
+    for b in candidates:
+        bt = set(_r.sub(r"_\d+$", "", b).split("_"))
+        ov = len(nt & bt)
+        if ov > bs: bs, best = ov, b
+    return best if bs > 0 else None
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--head", default="data/motor_head_selector.pt"); p.add_argument("--bddl-dir", required=True)
     p.add_argument("--flow", default="")   # path to FlowMotor ckpt -> use flow-matching head (learned-place fix) instead of L1
+    p.add_argument("--lang-plan", type=int, default=0)   # derive grasp-obj + container from the LANGUAGE instruction (language_planner), NOT the BDDL goal / oracle
     p.add_argument("--logdir", default="")   # if set: log SUCCESSFUL episodes' (wrist,obj_rel,cont_rel,proprio,executed-chunk) -> analytic-DAgger place distillation
     p.add_argument("--init-dir", default=""); p.add_argument("--container", default="basket")
     p.add_argument("--n", type=int, default=10); p.add_argument("--trials", type=int, default=3)
@@ -140,7 +162,18 @@ def main():
             tc = "_".join(toks[:cut]); cand = next((o for o in graspables if tc and tc in o), None)
             if cand: T = cand
         cont_name = args.container + "_1"
-        if args.container == "auto":   # GOAL suite: route container per-task from the (:goal (On X Y)) predicate
+        if args.lang_plan:   # DE-HARDCODE: grasp-obj + container from the LANGUAGE instruction (not BDDL goal / oracle)
+            from language_planner import plan as _lplan
+            _cands = scene_bodies(bf); _subs = _lplan(instr)
+            _pp = next((s for s in _subs if s["skill"] == "place"), None)
+            if _pp is None:
+                print(f"  {stem[:30]:32s} skip (no pick-place subgoal; articulated)", flush=True); continue
+            _T = resolve_noun(_pp["obj"], _cands); _C = resolve_noun(_pp["target"], _cands)
+            if _T is None or _C is None:
+                print(f"  {stem[:30]:32s} skip (noun unresolved {_pp['obj']}->{_T} / {_pp['target']}->{_C})", flush=True); continue
+            T = _T; cont_name = _C
+            if len(_subs) > 2: print(f"  {stem[:30]:32s} NOTE multi-subgoal ({len(_subs)}) -> first pair only (long-10 sequencer TODO)", flush=True)
+        elif args.container == "auto":   # GOAL suite: route container per-task from the (:goal (On X Y)) predicate
             _gtxt = pathlib.Path(bf).read_text()
             _gm = _re.search(r"\(:goal.*?\((?:On|In)\s+(\w+)\s+(\w+)\)", _gtxt, _re.S)
             if _gm is None or _gm.group(2).startswith("main_table"):
