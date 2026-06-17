@@ -36,6 +36,7 @@ def main():
     p.add_argument("--horizon", type=int, default=280); p.add_argument("--replan", type=int, default=5)
     p.add_argument("--img", type=int, default=128); p.add_argument("--hide", type=int, default=1)
     p.add_argument("--goal-mode", default="surface", choices=["surface", "body", "depthflip"])   # depthflip = honest localizer (co-adaptation: train==test)
+    p.add_argument("--cont-depth", type=int, default=0)   # depth-detect container TOP z (de-hardcode z_cont_center 0.035; general basket->plate); MATCH the --cont-depth deploy
     args = p.parse_args()
     import torch
     from libero.libero.envs import OffScreenRenderEnv
@@ -69,7 +70,16 @@ def main():
             if _gm is None or _gm.group(2).startswith("main_table"):
                 print(f"  {stem[:30]} skip-articulated/push", flush=True); continue
             T = _gm.group(1); cont_name = _re.sub(r"(_[a-z]+)+_region$", "", _gm.group(2))
+        # SPATIAL relational which-instance: 2 identical bowls disambiguated by relation -> label T correctly
+        # (else targets[0]/stem picks an arbitrary bowl while pi0.5 grasps the relationally-correct one -> mislabeled data).
+        _relrel = None; _relnoun = None
+        if args.container != "auto":
+            from language_planner import plan as _lp
+            for _s in _lp(instr):
+                if _s["skill"] == "grasp" and _s.get("relation") and not str(_s["relation"]).startswith("instance-"):
+                    _relrel = _s["relation"]; _relnoun = _s["obj"]; break
         distract_objs = [o for o in objs if o != T and o != cont_name and args.container not in o]
+        T_base = T; distract_base = list(distract_objs)   # immutable base; relational T re-resolved per-trial
         inits = None
         if args.init_dir:
             fi = pathlib.Path(args.init_dir) / f"{stem}.pruned_init"
@@ -83,6 +93,12 @@ def main():
                 env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256, camera_depths=True)
                 env.seed(seed + t); env.reset(); sim = env.env.sim
                 obs = env.set_init_state(inits[t]) if inits is not None else env.reset()
+                T = T_base; distract_objs = list(distract_base)   # reset from immutable base each trial
+                if _relrel:   # relational which-instance (needs sim, per-init): pick the correct bowl + recompute distractors
+                    from eval_physics_place import select_instance as _si, scene_bodies as _sb
+                    _ch = _si(sim, _relnoun, _relrel, _sb(bf))
+                    if _ch:
+                        T = _ch; distract_objs = [o for o in objs if o != T and o != cont_name and args.container not in o]
                 rb = resolve_bodies(sim, [T, cont_name] + distract_objs); cb = rb.get(cont_name)
                 if cb is None:
                     cand = [b for b in (sim.model.body_id2name(i) for i in range(sim.model.nbody)) if b and cont_name in b]
@@ -107,7 +123,11 @@ def main():
                     _dm = _cu.get_real_depth_map(sim, np.asarray(obs["agentview_depth"]))[::-1].copy()
                     obj_sp = _dl(sim, _op(sim, rb[T], 256), _dm, 256, mode="object")
                     if obj_sp is None: obj_sp = body_pos(sim, rb[T]).astype(np.float32)
-                    cont_sp = _rp(sim, cb, 0.035, 256)
+                    if args.cont_depth:   # de-hardcode container z: depth-detect TOP (basket rim / plate top), match deploy
+                        _cd = _dl(sim, _op(sim, cb, 256), _dm, 256, mode="container")
+                        cont_sp = _rp(sim, cb, float(_cd[2]), 256) if _cd is not None else _rp(sim, cb, 0.035, 256)
+                    else:
+                        cont_sp = _rp(sim, cb, 0.035, 256)
                 else:
                     obj_sp = surface_point(sim, rb[T], np.asarray(obs["agentview_depth"]), 256)
                     cont_sp = surface_point(sim, cb, np.asarray(obs["agentview_depth"]), 256)
