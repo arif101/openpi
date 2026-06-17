@@ -126,6 +126,28 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
     obj_px = None
     if args.binder == "oracle":
         return T, None
+    if args.binder == "learned":
+        # LEARNED grounding head (trained on LIBERO sim auto-labels): frozen DINOv2 dense feats + object proto -> heatmap.
+        from bind_foveate import nm
+        from diag_dinodense import dino_dense
+        from train_ground_head import GroundHead
+        global _GH
+        if "_GH" not in globals() or _GH is None:
+            gk = torch.load(args.ground_head, map_location=dev, weights_only=False)
+            gh = GroundHead(gk["C"]).to(dev); gh.load_state_dict(gk["state"]); gh.eval()
+            globals()["_GH"] = (gh, gk)
+        gh, gk = globals()["_GH"]
+        R = args.res; gres = gk["res"]
+        proto = gk["protos"].get(nm(T))
+        if proto is None: return T, None
+        hi = np.asarray(sim.render(width=gres, height=gres, camera_name="agentview"))[::-1].copy()
+        fg, g = dino_dense(hi, dev, gres)
+        with torch.no_grad():
+            lo = gh(torch.tensor(fg[None]).to(dev), torch.tensor(proto[None]).to(dev))[0]
+            pi = int(lo.argmax()); pr, pc = pi // g, pi % g
+        r_up = (pr + 0.5) / g * gres; c = (pc + 0.5) / g * gres
+        obj_px = np.array([R - 1 - r_up / (gres / R), c / (gres / R)], np.float32)
+        return T, obj_px
     if args.binder == "molmo":
         # Molmo open-vocab POINTING VLM (point-to-the-X). Fully general, no proto/body_pos. Runs ONCE per episode.
         from bind_foveate import nm
@@ -134,8 +156,8 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
         if "_MOLMO" not in globals() or _MOLMO is None:
             from transformers import AutoModelForCausalLM, AutoProcessor
             mid = "allenai/Molmo-7B-D-0924"
-            _pr = AutoProcessor.from_pretrained(mid, trust_remote_code=True, torch_dtype="auto", device_map="auto")
-            _md = AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True, torch_dtype="auto", device_map="auto")
+            _pr = AutoProcessor.from_pretrained(mid, trust_remote_code=True, torch_dtype="auto")
+            _md = AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True, torch_dtype=torch.float16).to(dev)  # no accelerate auto-map (Molmo remote code != tfm5)
             globals()["_MOLMO"] = (_pr, _md)
         mpr, mmd = globals()["_MOLMO"]
         R = args.res; HR = args.bind_res
@@ -412,8 +434,9 @@ def main():
     p.add_argument("--clear", type=float, default=0.10)   # release height above rim
     p.add_argument("--gain", type=float, default=8.0); p.add_argument("--tol", type=float, default=0.025)
     p.add_argument("--reflex", type=int, default=0)       # 0=physics place, 1=pure reflex (baseline A/B)
-    p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam", "owl", "molmo", "gdino"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
+    p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam", "owl", "molmo", "gdino", "learned"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
     p.add_argument("--sam-ckpt", default="/root/openpi/sam_vit_b_01ec64.pth")
+    p.add_argument("--ground-head", default="data/ground_head.pt")   # learned grounding-head ckpt for --binder learned
     p.add_argument("--loc", default="oracle", choices=["oracle", "rayplane", "depthflip", "nodeloc"])   # depthflip/nodeloc=honest depth localizer (nodeloc=general masked-depth, validated ~1.7cm)
     p.add_argument("--z-obj", type=float, default=0.015); p.add_argument("--z-cont", type=float, default=0.04)
     p.add_argument("--rim-h", type=float, default=0.075)   # honest container rim height above its table-plane z (basket ~7.5cm)
