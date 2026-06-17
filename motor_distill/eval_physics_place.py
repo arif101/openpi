@@ -239,61 +239,82 @@ def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
     def reset_state(cur):
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
         return dict(z0=float(body_pos(sim, cur["rb"][cur["T"]])[2]), lifted=0.0, close_run=0, open_run=0,
-                    held=False, grasp_off=None, ci=0, chunk=None, ee_zmin=float(ee[2]))
+                    held=False, grasp_off=None, ci=0, chunk=None, released=0, ee_zmin=float(ee[2]))
 
     pidx = 0; cur = setup(pair_specs[0])
     if cur is None:
-        return False, False
-    st = reset_state(cur); grasped_any = False
+        return False, False, None
+    st = reset_state(cur); grasped_any = False; REC = []
     for step in range(args.horizon * len(pair_specs)):
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
         obj_rel = cur["obj_w"] - ee; cont_rel = cur["cont_w"] - ee
-        if st["chunk"] is None or st["ci"] >= args.replan:
-            wr_raw = np.asarray(obs["robot0_eye_in_hand_image"])
-            wr = image_tools.resize_with_pad(np.ascontiguousarray(wr_raw[::-1, ::-1]), args.img, args.img).astype(np.uint8)
-            prop = np.concatenate((_quat2axisangle(np.asarray(obs["robot0_eef_quat"])),
-                                   np.asarray(obs["robot0_gripper_qpos"], np.float32))).astype(np.float32)
-            phi = -canon_angle(obj_rel) if args.canon_mode == "perstep_obj" else 0.0; theta = -phi
-            if phi:
-                wr_in = rot_image(wr, phi); o_in = rot_vec_xy(obj_rel, phi); c_in = rot_vec_xy(cont_rel, phi)
-                pr = prop.copy(); pr[:3] = rot_vec_xy(pr[:3], phi)
-            else:
-                wr_in = wr; o_in = obj_rel; c_in = cont_rel; pr = prop
-            img = torch.tensor(np.transpose(wr_in.astype(np.float32) / 255.0, (2, 0, 1)))[None].to(dev)
-            vec = ((np.concatenate([o_in, c_in, pr]).astype(np.float32) - vm) / vs).astype(np.float32)
-            with torch.no_grad():
-                if fnet is not None:
-                    chs = fnet.sample(img, torch.tensor(vec)[None].to(dev), steps=fsteps).cpu().numpy()[0].reshape(-1)
-                    chh = (chs * csf + cmf).reshape(fnet.chunk, fnet.act)
+        if (not st["held"]) or args.reflex:
+            # ---- LEARNED motor (grasp + reflex=1 place) ----
+            if st["chunk"] is None or st["ci"] >= args.replan:
+                wr_raw = np.asarray(obs["robot0_eye_in_hand_image"])
+                wr = image_tools.resize_with_pad(np.ascontiguousarray(wr_raw[::-1, ::-1]), args.img, args.img).astype(np.uint8)
+                prop = np.concatenate((_quat2axisangle(np.asarray(obs["robot0_eef_quat"])),
+                                       np.asarray(obs["robot0_gripper_qpos"], np.float32))).astype(np.float32)
+                phi = -canon_angle(obj_rel) if args.canon_mode == "perstep_obj" else 0.0; theta = -phi
+                if phi:
+                    wr_in = rot_image(wr, phi); o_in = rot_vec_xy(obj_rel, phi); c_in = rot_vec_xy(cont_rel, phi)
+                    pr = prop.copy(); pr[:3] = rot_vec_xy(pr[:3], phi)
                 else:
-                    chh = net(img, torch.tensor(vec)[None].to(dev)).cpu().numpy()[0]
-            st["chunk"] = decanon_chunk(chh, theta) if phi else chh; st["ci"] = 0
-        a = st["chunk"][st["ci"]]; st["ci"] += 1
-        grip = 1.0 if a[6] > 0 else -1.0
+                    wr_in = wr; o_in = obj_rel; c_in = cont_rel; pr = prop
+                img = torch.tensor(np.transpose(wr_in.astype(np.float32) / 255.0, (2, 0, 1)))[None].to(dev)
+                vec = ((np.concatenate([o_in, c_in, pr]).astype(np.float32) - vm) / vs).astype(np.float32)
+                with torch.no_grad():
+                    if fnet is not None:
+                        chs = fnet.sample(img, torch.tensor(vec)[None].to(dev), steps=fsteps).cpu().numpy()[0].reshape(-1)
+                        chh = (chs * csf + cmf).reshape(fnet.chunk, fnet.act)
+                    else:
+                        chh = net(img, torch.tensor(vec)[None].to(dev)).cpu().numpy()[0]
+                st["chunk"] = decanon_chunk(chh, theta) if phi else chh; st["ci"] = 0
+            a = st["chunk"][st["ci"]]; st["ci"] += 1
+            grip = 1.0 if a[6] > 0 else -1.0
+            act = a[:7].copy(); act[6] = grip
+        else:
+            # ---- ANALYTIC grounded-physics place (offline DAgger teacher, reflex=0) ----
+            tgt_z = cur["rim_top"] + args.clear
+            if args.obj_aware_release: tgt_z = tgt_z - float(st["grasp_off"][2])
+            des_ee = np.array([cur["cont_w"][0] - st["grasp_off"][0], cur["cont_w"][1] - st["grasp_off"][1], tgt_z], np.float32)
+            over = float(np.linalg.norm((ee + st["grasp_off"])[:2] - cur["cont_w"][:2])) < args.tol and abs(ee[2] - tgt_z) < args.tol
+            if over or st["released"]:
+                st["released"] += 1; act = np.zeros(7, np.float32); act[6] = -1.0
+            else:
+                d = np.clip((des_ee - ee) * args.gain, -1.0, 1.0); act = np.zeros(7, np.float32); act[:3] = d; act[6] = 1.0
+            grip = act[6]
         st["close_run"] = st["close_run"] + 1 if grip > 0 else 0
         st["open_run"] = st["open_run"] + 1 if grip < 0 else 0
-        act = a[:7].copy(); act[6] = grip
+        if args.logdir:   # DAgger: log (wrist, obj_rel, cont_rel, proprio, executed action) for distillation
+            _wr = image_tools.resize_with_pad(np.ascontiguousarray(np.asarray(obs["robot0_eye_in_hand_image"])[::-1, ::-1]), args.img, args.img).astype(np.uint8)
+            _pr = np.concatenate((_quat2axisangle(np.asarray(obs["robot0_eef_quat"])), np.asarray(obs["robot0_gripper_qpos"], np.float32))).astype(np.float32)
+            REC.append((_wr, (cur["obj_w"] - ee).astype(np.float32), (cur["cont_w"] - ee).astype(np.float32), _pr, act[:7].astype(np.float32).copy()))
         obs, _, done, _ = env.step(act.tolist())
         ee_now = np.asarray(obs["robot0_eef_pos"], np.float32); st["ee_zmin"] = min(st["ee_zmin"], float(ee_now[2]))
         objp = body_pos(sim, cur["rb"][cur["T"]]).astype(np.float32)
         st["lifted"] = max(st["lifted"], float(objp[2] - st["z0"]))
         if (not st["held"]) and st["close_run"] > 8 and (float(ee_now[2]) - st["ee_zmin"] > args.grasp_lift):
             st["held"] = True; grasped_any = True; st["grasp_off"] = (cur["obj_w"] - ee_now)
-        placed = (st["held"] and st["open_run"] > 2 and
-                  float(np.linalg.norm(objp[:2] - cur["cont_w"][:2])) < args.seq_rad and (objp[2] - cur["rim_top"]) < 0.08)
-        # ADVANCE only if more pairs remain; on the LAST pair keep running so the object settles
-        # (breaking early ends the episode before _check_success sees the placed object).
-        if placed and pidx + 1 < len(pair_specs):
+        # pair completion: learned=released-over-container; analytic=release counter elapsed
+        if args.reflex:
+            placed = (st["held"] and st["open_run"] > 2 and
+                      float(np.linalg.norm(objp[:2] - cur["cont_w"][:2])) < args.seq_rad and (objp[2] - cur["rim_top"]) < 0.08)
+        else:
+            placed = st["released"] > 8
+        if placed and pidx + 1 < len(pair_specs):   # advance only if more pairs remain
             pidx += 1
             nxt = setup(pair_specs[pidx])
             if nxt is None:
                 break
             cur = nxt; st = reset_state(cur); continue
+        if (not args.reflex) and st["released"] > 25:   # last analytic place done -> let it settle a bit then stop
+            break
         if done:
             break
     try: ok = bool(env.env._check_success())
     except Exception: ok = False
-    return ok, grasped_any
+    return ok, grasped_any, (REC if (args.logdir and ok and len(REC) > 10) else None)
 
 
 def main():
@@ -413,9 +434,19 @@ def main():
             env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=args.res, camera_widths=args.res, camera_depths=DEPTHCAM)
             env.seed(args.seed + ti); env.reset(); sim = env.env.sim
             obs = env.set_init_state(inits[ti]) if inits is not None else env.reset()
-            if args.seq:   # N-subgoal sequencer episode (long-10) — same learned motor, re-targeted per pair
-                _ok, _gr = run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
-                                           net, fnet, vm, vs, cmf, csf, fsteps, dev, bank, sam_gen, image_tools)
+            if args.seq:   # N-subgoal sequencer episode (long-10) — same learned motor (or analytic teacher), re-targeted per pair
+                _ok, _gr, _rec = run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
+                                                 net, fnet, vm, vs, cmf, csf, fsteps, dev, bank, sam_gen, image_tools)
+                if _rec is not None:   # DAgger: save the SUCCESSFUL multi-pair trajectory as distillation npz
+                    W = np.stack([r[0] for r in _rec]); O = np.stack([r[1] for r in _rec]); C = np.stack([r[2] for r in _rec])
+                    P = np.stack([r[3] for r in _rec]); A = np.stack([r[4] for r in _rec]); Tn = len(A)
+                    CH = np.zeros((Tn, 10, 7), np.float32)
+                    for tt in range(Tn):
+                        e = min(tt + 10, Tn); CH[tt, :e - tt] = A[tt:e]
+                        if e - tt < 10: CH[tt, e - tt:] = A[Tn - 1]
+                    np.savez_compressed(pathlib.Path(args.logdir) / f"{stem[:40]}_seq{dag_n}.npz",
+                                        wrist=W.astype(np.uint8), obj_rel=O.astype(np.float32), cont_rel=C.astype(np.float32),
+                                        proprio=P.astype(np.float32), chunk=CH); dag_n += 1
                 succ.append(int(_ok)); grasp.append(int(_gr)); env.close(); continue
             if args.lang_plan and _relrel and not _relrel.startswith("instance-"):   # RELATIONAL which-instance (no oracle which-bowl)
                 _ch = select_instance(sim, _relnoun, _relrel, scene_bodies(bf))
