@@ -121,15 +121,175 @@ def select_instance(sim, obj_noun, relation, names):
     return resolve_relation(relation, cand_pos, ref_pos)
 
 
-def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
-    """Identity binding: returns (chosen_body_name, obj_px or None). obj_px=SAM-proposed pixel (honest attention)."""
+def _match_proto(noun, protos):
+    """Token-overlap match a noun phrase to a grounding-head proto key (handles 'ramekin'->'glazed rim porcelain ramekin',
+    'cookies box'->'cookies'). Returns the proto vector or None. General (no per-task lookup)."""
+    if noun in protos:
+        return protos[noun]
+    nt = set(str(noun).lower().split())
+    best, bs = None, 0
+    for k in protos:
+        s = len(nt & set(str(k).split()))
+        if s > bs:
+            bs, best = s, k
+    return protos[best] if (best is not None and bs > 0) else None
+
+
+def _gh_dense(sim, args, dev, gk):
+    """Render agentview@gres (upright) -> frozen DINOv2 dense feat tensor (1,g,g,C) + g. One forward per init."""
+    from diag_dinodense import dino_dense
+    gres = gk["res"]
+    hi = np.asarray(sim.render(width=gres, height=gres, camera_name="agentview"))[::-1].copy()
+    fg, g = dino_dense(hi, dev, gres)
+    return torch.tensor(fg[None]).to(dev), g
+
+
+def _gh_peaks_px(gh, fg_t, proto, g, args, gk, k=1, nms=1, raw=False, soft=False):
+    """Peak pixels (256 frame) for `proto`. raw=False: trained head logits (sharp on textured objects).
+    raw=True: RAW DINOv2 dense cosine correspondence (feats*proto).sum — robust on low-texture bowls (diag_dinodense 0.767),
+    where the head collapses to a center-bias. soft=True: SUB-PATCH soft-argmax (correspondence-weighted centroid over a
+    5x5 window) -> sub-8px precision so an 18px-bind peak becomes grasp-precise. k=2 + wider nms separates the two bowls."""
+    R = args.res; gres = gk["res"]
+    with torch.no_grad():
+        if raw:
+            pt = torch.tensor(np.asarray(proto), dtype=fg_t.dtype, device=fg_t.device)
+            lo = (fg_t[0] * pt).sum(-1).clone()                  # (g,g) cosine map
+        else:
+            lo = gh(fg_t, torch.tensor(np.asarray(proto)[None]).to(fg_t.device))[0].reshape(g, g).clone()
+    out = []
+    for _ in range(k):
+        pi = int(lo.argmax()); pr, pc = pi // g, pi % g
+        if soft:   # correspondence-weighted centroid over a 5x5 window around argmax -> sub-patch peak
+            w0 = max(0, pr - 2); w1 = min(g, pr + 3); c0 = max(0, pc - 2); c1 = min(g, pc + 3)
+            win = lo[w0:w1, c0:c1]
+            wt = torch.softmax((win - win.max()).flatten() * 8.0, 0).reshape(win.shape)
+            rr = torch.arange(w0, w1, device=lo.device, dtype=wt.dtype)[:, None]
+            cc = torch.arange(c0, c1, device=lo.device, dtype=wt.dtype)[None, :]
+            fr = float((wt * rr).sum()); fc = float((wt * cc).sum())
+        else:
+            fr, fc = float(pr), float(pc)
+        r_up = (fr + 0.5) / g * gres; c = (fc + 0.5) / g * gres
+        out.append(np.array([R - 1 - r_up / (gres / R), c / (gres / R)], np.float32))
+        lo[max(0, pr - nms):pr + nms + 1, max(0, pc - nms):pc + nms + 1] = -1e9   # suppress nbhd -> next distinct peak
+    return out
+
+
+def _depth_map(sim, obs, args):
+    """Row-aligned metric depth map matching args.loc (for honest pixel->3D unprojection in relational disambiguation)."""
+    if args.loc == "nodeloc":
+        return node_flipped(sim, obs["agentview_depth"])
+    import robosuite.utils.camera_utils as _cu
+    return _cu.get_real_depth_map(sim, np.asarray(obs["agentview_depth"]))[::-1].copy()
+
+
+def build_scene_protos(bf, init_dir, dev, gk, proto_inits=(30, 32, 34)):
+    """Per-SCENE DINOv2 patch protos (raw-correspondence templates) for every body in THIS task, from exemplar inits
+    (reference template = identity, honest; the QUERY uses no body_pos). Fixes the combined head's nm-collision (one
+    dict proto per noun, contaminated by the last alphabetical task). Same-noun instances (both bowls) average into one
+    proto -> two correspondence peaks. Matches diag_dinodense (0.767 on bowls)."""
+    from libero.libero.envs import OffScreenRenderEnv
+    import robosuite.utils.camera_utils as cu
+    from bind_foveate import nm
+    from diag_dinodense import dino_dense
+    gres = gk["res"]; stem = pathlib.Path(bf).stem
+    fi = pathlib.Path(init_dir) / f"{stem}.pruned_init"
+    if not fi.exists(): return {}
+    try: inits = np.asarray(torch.load(fi, weights_only=False))
+    except Exception: return {}
+    cand = scene_bodies(bf)
+    env = OffScreenRenderEnv(bddl_file_name=bf, camera_heights=256, camera_widths=256, camera_depths=False)
+    acc = {}
+    for qi in proto_inits:
+        if qi >= len(inits): continue
+        env.seed(qi); env.reset(); env.set_init_state(inits[qi]); sim = env.env.sim
+        rb = resolve_bodies(sim, cand)
+        hi = np.asarray(sim.render(width=gres, height=gres, camera_name="agentview"))[::-1].copy()
+        fg, g = dino_dense(hi, dev, gres)
+        w2p = cu.get_camera_transform_matrix(sim, "agentview", gres, gres)
+        for o in cand:
+            if rb.get(o) is None: continue
+            px = cu.project_points_from_world_to_camera(body_pos(sim, rb[o])[None], w2p, gres, gres)[0]
+            r_up = gres - 1 - px[0]; c = px[1]
+            gr = int(np.clip(r_up / gres * g, 0, g - 1)); gc = int(np.clip(c / gres * g, 0, g - 1))
+            patch = fg[max(0, gr - 1):gr + 2, max(0, gc - 1):gc + 2].reshape(-1, fg.shape[-1])
+            if len(patch): acc.setdefault(nm(o), []).append(patch.mean(0))
+    env.close()
+    return {k: (np.mean(v, 0) / (np.linalg.norm(np.mean(v, 0)) + 1e-6)).astype(np.float32) for k, v in acc.items() if v}
+
+
+def _sam_centroids(sam_gen, sim, obs, args, crop_proto, dev, k=2):
+    """Top-k SAM region centroids matched to a DINOv2 crop proto (shape/boundary segmentation -> finds BOTH dark bowls
+    as distinct masks where correspondence finds only the stronger one). Returns 256-frame pixels (mask centroid = object
+    center, grasp-precise). Solves the relational which-bowl chance-wall (need both same-noun instances as candidates)."""
+    from dino_separability import dino_feat
+    R = args.res; HR = args.bind_res; sc = HR / R
+    img_up = np.ascontiguousarray(np.asarray(obs["agentview_image"])[::-1])
+    hi = np.asarray(sim.render(width=HR, height=HR, camera_name="agentview"))[::-1].copy()
+    scored = []
+    for m in sam_gen.generate(img_up):
+        seg = m["segmentation"]; a = int(seg.sum())
+        if a < 20 or a > 0.25 * R * R: continue
+        ys, xs = np.where(seg); ry, cx = float(ys.mean()), float(xs.mean())
+        hy, hx = int(ry * sc), int(cx * sc); s = 60
+        cr = hi[max(0, hy - s):hy + s, max(0, hx - s):hx + s]
+        if cr.size < 100: continue
+        f = dino_feat(cr, dev); score = float(f @ crop_proto) if crop_proto is not None else 0.0
+        scored.append((score, np.array([R - 1 - ry, cx], np.float32)))
+    scored.sort(key=lambda t: -t[0])
+    return [px for _, px in scored[:k]]
+
+
+def _depth_grid_eval(sim, obs, g, gres=448):
+    """Agentview real depth -> upright -> block-mean to g x g, table-relative (objects = positive bump). MUST render at
+    the SAME res as training (gres=448): at 256 the ~20px bowl is washed out by the block-mean (bump < 1 block) -> depth
+    goes uninformative -> head collapses. At 448 the bump survives (~2.5 blocks). Matches train_inst_head/collect_ground_depth."""
+    import robosuite.utils.camera_utils as _cu
+    try:
+        out = sim.render(width=gres, height=gres, camera_name="agentview", depth=True)
+        draw = out[1] if isinstance(out, (tuple, list)) else np.asarray(obs["agentview_depth"])
+        if draw.ndim == 2: draw = draw[..., None]
+    except Exception:
+        draw = np.asarray(obs["agentview_depth"])
+        if draw.ndim == 2: draw = draw[..., None]
+    dm = _cu.get_real_depth_map(sim, draw)[::-1, :, 0].copy()
+    Rd = dm.shape[0]; bs = max(1, Rd // g)
+    d = dm[:g * bs, :g * bs].reshape(g, bs, g, bs).mean((1, 3))
+    med = np.median(d)
+    return np.clip((med - d) / 0.05, -2.0, 6.0).astype(np.float32)
+
+
+def _inst_peaks_px(ih, fg_t, depth_g, proto, g, args, ik, k=2, nms=2):
+    """SUPERVISED multi-instance head -> top-k sigmoid peaks (sub-patch soft-argmax), 256-frame pixels. Depth-fused ->
+    recovers BOTH dark bowls where correspondence loses the 2nd in background noise (deep-research 2026-06-17 fix)."""
+    R = args.res; gres = ik["res"]
+    dt = torch.tensor(depth_g[None]).to(fg_t.device)
+    pt = torch.tensor(np.asarray(proto, np.float32)[None]).to(fg_t.device)
+    with torch.no_grad():
+        hm = torch.sigmoid(ih(fg_t.float(), dt.float(), pt))[0].clone()
+    out = []
+    for _ in range(k):
+        pi = int(hm.argmax()); pr, pc = pi // g, pi % g
+        w0 = max(0, pr - 2); w1 = min(g, pr + 3); c0 = max(0, pc - 2); c1 = min(g, pc + 3); win = hm[w0:w1, c0:c1]
+        wt = torch.softmax((win - win.max()).flatten() * 8.0, 0).reshape(win.shape)
+        rr = torch.arange(w0, w1, device=hm.device, dtype=wt.dtype)[:, None]
+        cc = torch.arange(c0, c1, device=hm.device, dtype=wt.dtype)[None, :]
+        fr = float((wt * rr).sum()); fc = float((wt * cc).sum())
+        r_up = (fr + 0.5) / g * gres; c = (fc + 0.5) / g * gres
+        out.append(np.array([R - 1 - r_up / (gres / R), c / (gres / R)], np.float32))
+        hm[max(0, pr - nms):pr + nms + 1, max(0, pc - nms):pc + nms + 1] = -1.0
+    return out
+
+
+def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen, relation=None):
+    """Identity binding: returns (chosen_body_name, obj_px or None). obj_px=SAM-proposed pixel (honest attention).
+    When `relation` is given + binder=learned, disambiguates same-noun instances by HONEST geometry (predicted peaks +
+    predicted reference positions -> resolve_relation), NOT body_pos -> de-hardcodes select_instance for spatial."""
     obj_px = None
     if args.binder == "oracle":
         return T, None
     if args.binder == "learned":
         # LEARNED grounding head (trained on LIBERO sim auto-labels): frozen DINOv2 dense feats + object proto -> heatmap.
         from bind_foveate import nm
-        from diag_dinodense import dino_dense
         from train_ground_head import GroundHead
         global _GH
         if "_GH" not in globals() or _GH is None:
@@ -137,18 +297,66 @@ def bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen):
             gh = GroundHead(gk["C"]).to(dev); gh.load_state_dict(gk["state"]); gh.eval()
             globals()["_GH"] = (gh, gk)
         gh, gk = globals()["_GH"]
-        R = args.res; gres = gk["res"]
+        R = args.res
         proto = gk["protos"].get(nm(T))
+        if proto is None:
+            proto = _match_proto(nm(T), gk["protos"])
         if proto is None:   # NEVER fall back to the oracle pixel — return image center so a missing proto can't masquerade as oracle success
             print(f"  [learned] WARN no proto for {nm(T)!r} -> center px (NOT oracle)", flush=True)
             return T, np.array([R / 2.0, R / 2.0], np.float32)
-        hi = np.asarray(sim.render(width=gres, height=gres, camera_name="agentview"))[::-1].copy()
-        fg, g = dino_dense(hi, dev, gres)
-        with torch.no_grad():
-            lo = gh(torch.tensor(fg[None]).to(dev), torch.tensor(proto[None]).to(dev))[0]
-            pi = int(lo.argmax()); pr, pc = pi // g, pi % g
-        r_up = (pr + 0.5) / g * gres; c = (pc + 0.5) / g * gres
-        obj_px = np.array([R - 1 - r_up / (gres / R), c / (gres / R)], np.float32)
+        fg_t, g = _gh_dense(sim, args, dev, gk)
+        # ---- RELATIONAL which-instance (honest): predicted bowl peaks + predicted ref positions -> resolve_relation ----
+        from language_planner import parse_relation, resolve_relation
+        kind, refnouns = parse_relation(relation) if relation else (None, [])
+        if kind:
+            # RAW correspondence on PER-SCENE protos (head collapses on low-texture bowls; scene proto avoids nm-collision)
+            SP = globals().get("_SCENE_PROTOS", {})
+            bproto = SP.get(nm(T))
+            if bproto is None: bproto = proto
+            IH = globals().get("_IH"); SAMG = globals().get("_SAM_GEN"); BANK = globals().get("_BANK") or {}
+            cropproto = BANK.get(nm(T))
+            iproto = None
+            if IH is not None:
+                ih, ik = IH
+                iproto = bproto if bproto is not None else ik["protos"].get(nm(T))   # PER-SCENE proto (nm-collision in saved dict)
+            if iproto is not None:   # SUPERVISED depth-fused multi-instance head -> BOTH dark bowls (deep-research fix)
+                depth_g = _depth_grid_eval(sim, obs, g, ik["res"])
+                cand_px = _inst_peaks_px(ih, fg_t, depth_g, iproto, g, args, ik, k=2, nms=2)
+            elif SAMG is not None and cropproto is not None:   # SAM shape-segmentation fallback
+                cand_px = _sam_centroids(SAMG, sim, obs, args, cropproto, dev, k=2)
+                if len(cand_px) < 2:
+                    cand_px = _gh_peaks_px(gh, fg_t, bproto, g, args, gk, k=2, nms=2, raw=True, soft=True)
+            else:
+                cand_px = _gh_peaks_px(gh, fg_t, bproto, g, args, gk, k=2, nms=2, raw=True, soft=True)   # correspondence fallback
+            if len(cand_px) >= 2:
+                dm = _depth_map(sim, obs, args)
+                cand_pos = [depth_localize(sim, px, dm, R, mode="object") for px in cand_px]
+                ref_pos = {}
+                for rn in refnouns:
+                    rp = _match_proto(rn, SP)
+                    use_raw = rp is not None
+                    if rp is None: rp = _match_proto(rn, gk["protos"])
+                    if rp is None: continue
+                    rpx = _gh_peaks_px(gh, fg_t, rp, g, args, gk, k=1, raw=use_raw, soft=use_raw)[0]
+                    w = depth_localize(sim, rpx, dm, R, mode="object")
+                    if w is not None: ref_pos[rn] = w
+                cands = [(i, cand_pos[i]) for i in range(len(cand_pos)) if cand_pos[i] is not None]
+                if cands and (ref_pos or kind == "from"):
+                    ci = resolve_relation(relation, cands, ref_pos)
+                    return T, np.asarray(cand_px[int(ci)], np.float32)
+        # ---- single-instance (object suite): inst-head top-1 (UNIFIED depth grounder) else GroundHead argmax ----
+        IH = globals().get("_IH")
+        if IH is not None:   # ONE unified depth multi-instance head: top-1 for single-instance objects
+            ih, ik = IH
+            SP = globals().get("_SCENE_PROTOS", {})
+            sproto = SP.get(nm(T))
+            if sproto is None: sproto = _match_proto(nm(T), SP)
+            if sproto is None: sproto = ik["protos"].get(nm(T))
+            if sproto is not None:
+                depth_g = _depth_grid_eval(sim, obs, g, ik["res"])
+                obj_px = _inst_peaks_px(ih, fg_t, depth_g, sproto, g, args, ik, k=1, nms=2)[0]
+                return T, obj_px
+        obj_px = _gh_peaks_px(gh, fg_t, proto, g, args, gk, k=1)[0]
         return T, obj_px
     if args.binder == "molmo":
         # Molmo open-vocab POINTING VLM (point-to-the-X). Fully general, no proto/body_pos. Runs ONCE per episode.
@@ -325,7 +533,9 @@ def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
     all_conts = list({ps["cont"] for ps in pair_specs})
 
     def setup(spec):
-        To = resolve_pair_target(sim, bf, spec["obj"], spec.get("relation"))
+        _rel = spec.get("relation")
+        _relp = _rel if (_rel and not str(_rel).startswith("instance-")) else None
+        To = resolve_pair_target(sim, bf, spec["obj"], _rel)   # oracle which-instance = handle/scoring; learned binder re-picks honestly via relation
         Co = resolve_noun(spec["cont"], scene_bodies(bf))
         rb = resolve_bodies(sim, graspables + all_conts); cb = rb.get(Co)
         if cb is None:
@@ -333,7 +543,8 @@ def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
             cb = cand[0] if cand else None
         if To is None or rb.get(To) is None or cb is None:
             return None
-        chosen, obj_px = bind_target(sim, obs, args, To, graspables, rb, dev, bank, sam_gen)
+        chosen, obj_px = bind_target(sim, obs, args, To, graspables, rb, dev, bank, sam_gen,
+                                     relation=(_relp if args.binder == "learned" else None))
         obj_w, cont_w, rim_top = localize_targets(sim, obs, args, chosen, rb, cb, obj_px)
         return {"T": To, "cb": cb, "rb": rb, "obj_w": obj_w, "cont_w": cont_w, "rim_top": rim_top,
                 "cc": cont_class_from_name(spec.get("cont") or Co or "")}
@@ -439,6 +650,8 @@ def main():
     p.add_argument("--binder", default="oracle", choices=["oracle", "dino", "sam", "owl", "molmo", "gdino", "learned"])   # sam = SAM proposes pixels (no body_pos) -> FULLY honest attention
     p.add_argument("--sam-ckpt", default="/root/openpi/sam_vit_b_01ec64.pth")
     p.add_argument("--ground-head", default="data/ground_head.pt")   # learned grounding-head ckpt for --binder learned
+    p.add_argument("--rel-sam", type=int, default=0)   # SAM shape-segmentation for relational which-bowl (finds BOTH dark bowls vs correspondence's one)
+    p.add_argument("--inst-head", default="")          # SUPERVISED depth-fused multi-instance head ckpt (train_inst_head) for relational which-bowl
     p.add_argument("--loc", default="oracle", choices=["oracle", "rayplane", "depthflip", "nodeloc"])   # depthflip/nodeloc=honest depth localizer (nodeloc=general masked-depth, validated ~1.7cm)
     p.add_argument("--z-obj", type=float, default=0.015); p.add_argument("--z-cont", type=float, default=0.04)
     p.add_argument("--rim-h", type=float, default=0.075)   # honest container rim height above its table-plane z (basket ~7.5cm)
@@ -467,7 +680,24 @@ def main():
         fnet = FlowMotor(prop_dim=fck["prop_dim"]).to(dev); fnet.load_state_dict(fck["state"]); fnet.eval()
         vm, vs = fck["vm"], fck["vs"]; cmf = fck["cm"]; csf = fck["cs"]; fsteps = int(fck.get("infer_steps", 10))
         print("FLOW head loaded steps=" + str(fsteps), flush=True)
-    bank = None; sam_gen = None
+    bank = None; sam_gen = None; gk_l = None
+    if args.binder == "learned":
+        gk_l = torch.load(args.ground_head, map_location=dev, weights_only=False)
+        if args.inst_head:   # SUPERVISED depth-fused multi-instance head (deep-research fix for spatial dark-bowl wall)
+            from train_inst_head import InstHead
+            print("loading supervised multi-instance head (depth-fused)...", flush=True)
+            _ik = torch.load(args.inst_head, map_location=dev, weights_only=False)
+            _ih = InstHead(_ik["C"]).to(dev); _ih.load_state_dict(_ik["state"]); _ih.eval()
+            globals()["_IH"] = (_ih, _ik)
+        if args.rel_sam:   # SAM shape-segmentation for relational which-bowl (finds BOTH dark bowls); needs crop-proto bank
+            from bind_exemplar import build_bank
+            from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+            print("building SAM + crop-proto bank for relational which-bowl...", flush=True)
+            _pdir = args.proto_dir or args.bddl_dir; _pidir = args.proto_init_dir or args.init_dir
+            globals()["_BANK"] = build_bank(sorted(glob.glob(str(pathlib.Path(_pdir) / "*.bddl"))),
+                                            _pidir, [int(x) for x in args.proto_inits.split(",")], args.bind_res, "agentview", dev)
+            _sam = sam_model_registry["vit_b"](checkpoint=args.sam_ckpt).to(dev).eval()
+            globals()["_SAM_GEN"] = SamAutomaticMaskGenerator(_sam, points_per_side=24, min_mask_region_area=40)
     if args.binder in ("dino", "sam"):
         from bind_exemplar import build_bank
         print("building DINOv2 prototype bank...", flush=True)
@@ -486,6 +716,9 @@ def main():
         instr, objs, targets, distractors = parse_bddl(bf)
         if not targets and not args.seq: continue   # seq derives targets from the plan, not the BDDL
         stem = pathlib.Path(bf).stem; graspables = [o for o in objs if args.container not in o]
+        if args.binder == "learned":   # per-SCENE raw-correspondence protos for relational disambiguation (avoids nm-collision)
+            globals()["_SCENE_PROTOS"] = build_scene_protos(bf, args.init_dir, dev, gk_l,
+                                                            tuple(int(x) for x in args.proto_inits.split(",")))
         import re as _re
         m = _re.match(r"pick_up_the_(.+)$", stem); T = targets[0] if targets else None
         if m:
@@ -553,8 +786,9 @@ def main():
                                         wrist=W.astype(np.uint8), obj_rel=O.astype(np.float32), cont_rel=C.astype(np.float32),
                                         proprio=P.astype(np.float32), chunk=CH); dag_n += 1
                 succ.append(int(_ok)); grasp.append(int(_gr)); env.close(); continue
-            if args.lang_plan and _relrel and not _relrel.startswith("instance-"):   # RELATIONAL which-instance (no oracle which-bowl)
-                _ch = select_instance(sim, _relnoun, _relrel, scene_bodies(bf))
+            _relrel_pick = _relrel if (args.lang_plan and _relrel and not _relrel.startswith("instance-")) else None
+            if _relrel_pick:   # RELATIONAL which-instance: oracle select_instance = GT for SCORING only; learned binder picks honestly via `relation`
+                _ch = select_instance(sim, _relnoun, _relrel_pick, scene_bodies(bf))
                 if _ch: T = _ch
             rb = resolve_bodies(sim, graspables + [cont_name]); cb = rb.get(cont_name)
             if cb is None:
@@ -562,7 +796,8 @@ def main():
                 cb = cand[0] if cand else None
             if rb.get(T) is None or cb is None: env.close(); succ.append(0); grasp.append(0); continue
             # ---- BIND target identity ON THE FULL SCENE (must be BEFORE hide!) ----
-            chosen, obj_px = bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen)
+            chosen, obj_px = bind_target(sim, obs, args, T, graspables, rb, dev, bank, sam_gen,
+                                         relation=(_relrel_pick if args.binder == "learned" else None))
             if obj_px is not None:   # SAM scoring: pixel distance to the true target pixel
                 _tpx = obj_pixel(sim, rb[T], args.res); bind_ok += int(np.hypot(obj_px[0] - _tpx[0], obj_px[1] - _tpx[1]) < 18)
             else:

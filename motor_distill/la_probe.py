@@ -28,10 +28,14 @@ def main():
         text = proc.py_apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         images, videos = proc.process_vision_info(msgs)
         inp = proc(text=[text], images=images, videos=videos, return_tensors="pt").to("cuda")
+        gkw = {}
+        for k in ("image_grid_hws", "image_grid_thw", "video_grid_thw", "image_sizes"):
+            if k in inp: gkw[k] = inp[k]
         with torch.no_grad():
             out = model.generate(pixel_values=inp["pixel_values"].to(torch.bfloat16), input_ids=inp["input_ids"],
-                                 attention_mask=inp["attention_mask"], tokenizer=tok, max_new_tokens=512, generation_mode="hybrid")
-        ans = tok.decode(out[0], skip_special_tokens=False)
+                                 attention_mask=inp["attention_mask"], tokenizer=tok, max_new_tokens=512,
+                                 generation_mode="hybrid", use_cache=True, **gkw)
+        ans = out if isinstance(out, str) else (out[0] if isinstance(out[0], str) else tok.decode(out[0], skip_special_tokens=False))
         # parse first point or box-center; coords are 0..1000 (x=col, y=row)
         pts = re.findall(r"<box><(\d+)><(\d+)>(?:<(\d+)><(\d+)>)?</box>", ans)
         if pts:
