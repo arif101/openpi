@@ -477,8 +477,42 @@ def _container_z(sim, cb, dm, args):
     return zc, ray_plane(sim, cb, zc, args.res)
 
 
+def _surface_of(sim, cb):
+    """Place SURFACE of a fixture container (stove cook-area / cabinet top / rack top), NOT the main-body center.
+    diag_goalplace.py proved goal tasks need the fixture's surface region (teleport 2/2), not body_pos(cb).
+    Returns (xy_z3, top_z) or None for simple containers (plate/bowl/basket -> use main body as before).
+    General: among the fixture FAMILY (bodies+sites sharing cb's base token), pick the highest 'surface' candidate."""
+    import re as _re
+    name = cb if isinstance(cb, str) else sim.model.body_id2name(cb)
+    base = _re.sub(r"_(main|base|\d+)$", "", name)                      # flat_stove_1_main -> flat_stove
+    base = _re.sub(r"_\d+$", "", base)
+    if not any(k in base for k in ("stove", "cabinet", "rack", "drawer")):
+        return None                                                     # plate/bowl/basket -> normal main-body place
+    KW = ("cook", "burner", "top", "region", "rack", "plate")
+    best = None
+    # 1) sites (region targets like flat_stove_1_cook_region / wooden_cabinet_1_top_side / wine_rack_1_top_region)
+    for i in range(sim.model.nsite):
+        sn = sim.model.site_id2name(i)
+        if not sn or base.split("_")[0] not in sn: continue
+        if not any(k in sn for k in KW): continue
+        p = np.asarray(sim.data.site_xpos[i], np.float32)
+        if best is None or p[2] > best[2]: best = p
+    # 2) fallback: sub-bodies (cabinet_top / burner_plate) by aabb top
+    if best is None:
+        for i in range(sim.model.nbody):
+            bn = sim.model.body_id2name(i)
+            if not bn or base.split("_")[0] not in bn: continue
+            if not any(k in bn for k in KW): continue
+            top, _ = body_aabb_top(sim, i); bp = np.asarray(sim.data.body_xpos[i], np.float32)
+            cand = np.array([bp[0], bp[1], top], np.float32)
+            if best is None or cand[2] > best[2]: best = cand
+    if best is None: return None
+    return best, float(best[2])
+
+
 def localize_targets(sim, obs, args, chosen, rb, cb, obj_px, image_tools=None):
-    """3D localization: returns (obj_w, cont_w, rim_top). Honest depth/ray-plane or oracle body_pos."""
+    """3D localization: returns (obj_w, cont_w, rim_top). Honest depth/ray-plane or oracle body_pos.
+    --place-surface: target the fixture SURFACE region (stove/cabinet/rack top) not the container center."""
     if args.loc == "depthflip":
         import robosuite.utils.camera_utils as _cu
         dm = _cu.get_real_depth_map(sim, np.asarray(obs["agentview_depth"]))[::-1].copy()
@@ -506,6 +540,11 @@ def localize_targets(sim, obs, args, chosen, rb, cb, obj_px, image_tools=None):
     else:
         obj_w = body_pos(sim, rb[chosen]).astype(np.float32); cont_w = body_pos(sim, cb).astype(np.float32)
         rim_top, _ = body_aabb_top(sim, sim.model.body_name2id(cb))
+    if getattr(args, "place_surface", 0):   # target the fixture SURFACE region (stove/cabinet/rack top), not main-body center
+        surf = _surface_of(sim, cb)
+        if surf is not None:
+            sxyz, sz = surf
+            cont_w = np.array([sxyz[0], sxyz[1], sz], np.float32); rim_top = float(sz)
     return obj_w, cont_w, rim_top
 
 
@@ -560,7 +599,8 @@ def run_seq_episode(env, sim, obs, args, pair_specs, bf, graspables,
     st = reset_state(cur); grasped_any = False; REC = []
     for step in range(args.horizon * len(pair_specs)):
         ee = np.asarray(obs["robot0_eef_pos"], np.float32)
-        obj_rel = cur["obj_w"] - ee; cont_rel = cur["cont_w"] - ee
+        obj_rel = cur["obj_w"] - ee
+        cont_rel = (cur["obj_w"] - ee) if not args.reflex else (cur["cont_w"] - ee)   # analytic place owns placing -> motor pursues OBJECT (decouple from OOD high container)
         if (not st["held"]) or args.reflex:
             # ---- LEARNED motor (grasp + reflex=1 place) ----
             if st["chunk"] is None or st["ci"] >= args.replan:
@@ -652,6 +692,7 @@ def main():
     p.add_argument("--ground-head", default="data/ground_head.pt")   # learned grounding-head ckpt for --binder learned
     p.add_argument("--rel-sam", type=int, default=0)   # SAM shape-segmentation for relational which-bowl (finds BOTH dark bowls vs correspondence's one)
     p.add_argument("--inst-head", default="")          # SUPERVISED depth-fused multi-instance head ckpt (train_inst_head) for relational which-bowl
+    p.add_argument("--place-surface", type=int, default=0)   # target the fixture SURFACE region (stove cook / cabinet top / rack top) not container center (goal suite)
     p.add_argument("--loc", default="oracle", choices=["oracle", "rayplane", "depthflip", "nodeloc"])   # depthflip/nodeloc=honest depth localizer (nodeloc=general masked-depth, validated ~1.7cm)
     p.add_argument("--z-obj", type=float, default=0.015); p.add_argument("--z-cont", type=float, default=0.04)
     p.add_argument("--rim-h", type=float, default=0.075)   # honest container rim height above its table-plane z (basket ~7.5cm)
@@ -819,7 +860,8 @@ def main():
                 ee = np.asarray(obs["robot0_eef_pos"], np.float32)
                 # ---- GRASP phase: reflex motor servos to the object ----
                 if not held or args.reflex:
-                    obj_rel = obj_w - ee; cont_rel = cont_w - ee
+                    obj_rel = obj_w - ee
+                    cont_rel = (obj_w - ee) if not args.reflex else (cont_w - ee)   # analytic place owns placing -> motor pursues OBJECT (decouple from OOD high container goal that breaks grasp)
                     if chunk is None or ci >= args.replan:
                         wr_raw = np.asarray(obs["robot0_eye_in_hand_image"])
                         wr = image_tools.resize_with_pad(np.ascontiguousarray(wr_raw[::-1, ::-1]), args.img, args.img).astype(np.uint8)
