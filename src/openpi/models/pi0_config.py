@@ -32,6 +32,13 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # FOVEATED MEMORY (FOVEATED_MEMORY_SPEC_v1): number of map soft tokens appended to the
+    # prefix AFTER text (0 = feature fully off; the K=0 code path is bit-identical to baseline
+    # because no params are created and no branch enters the traced graph).
+    map_tokens_k: int = 0
+    # Per-token feature width of the map query (FoveatedMap.query() contract).
+    map_token_dim: int = 72
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):

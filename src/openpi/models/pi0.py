@@ -95,6 +95,20 @@ class Pi0(_model.BaseModel):
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             # NEW: project target state to action expert width for waypoint conditioning
             self.target_state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+
+        # FOVEATED MEMORY: map soft-token projection (K tokens appended after text in the
+        # prefix). Zero-init output layer => at warm-start the tokens are exactly the learned
+        # registers (0.02-scale), so the perturbation to a pretrained checkpoint is tiny.
+        # map_tokens_k == 0 creates NO params and adds NOTHING to the traced graph (bit-parity).
+        self.map_k = config.map_tokens_k
+        if self.map_k > 0:
+            self.map_proj_in = nnx.Linear(config.map_token_dim, 256, rngs=rngs)
+            self.map_proj_out = nnx.Linear(
+                256, paligemma_config.width, kernel_init=nnx.initializers.zeros_init(), rngs=rngs
+            )
+            self.map_registers = nnx.Param(
+                nnx.initializers.normal(0.02)(rngs.params(), (self.map_k, paligemma_config.width))
+            )
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -133,6 +147,17 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # FOVEATED MEMORY: K map tokens appended AFTER text. ar_mask=False -> full bidirectional
+        # attention with the whole prefix (perception CAN see the map, unlike the suffix
+        # target token whose ar_mask=True hides it from the prefix). Appending at the tail
+        # keeps all pretrained image/text positions unchanged (RoPE-safe).
+        if self.map_k > 0 and obs.map_tokens is not None:
+            mt = nnx.swish(self.map_proj_in(obs.map_tokens))
+            mt = self.map_proj_out(mt) + self.map_registers
+            tokens.append(mt)
+            input_mask.append(jnp.ones(mt.shape[:2], dtype=jnp.bool_))
+            ar_mask += [False] * mt.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)

@@ -119,6 +119,10 @@ class Observation(Generic[ArrayT]):
     # When None, model behaves identically to standard Pi0/Pi0.5.
     target_state: at.Float[ArrayT, "*b s"] | None = None
 
+    # FOVEATED MEMORY: map soft-token features (K, D) from FoveatedMap.query().
+    # When None (or the model's map_tokens_k == 0), model behaves identically to baseline.
+    map_tokens: at.Float[ArrayT, "*b k d"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -140,6 +144,7 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             target_state=data.get("target_state"),
+            map_tokens=data.get("map_tokens"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -220,6 +225,7 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         target_state=observation.target_state,
+        map_tokens=observation.map_tokens,
     )
 
 
