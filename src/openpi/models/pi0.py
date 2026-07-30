@@ -109,6 +109,10 @@ class Pi0(_model.BaseModel):
             self.map_registers = nnx.Param(
                 nnx.initializers.normal(0.02)(rngs.params(), (self.map_k, paligemma_config.width))
             )
+            # ReZero gate: tokens start EXACTLY zero (RMSNorm scales any nonzero token to full
+            # magnitude — measured 20x warm-start perturbation without this; G0 preflight
+            # 2026-07-30). Gradient flows through alpha first.
+            self.map_alpha = nnx.Param(jnp.zeros(()))
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -121,7 +125,7 @@ class Pi0(_model.BaseModel):
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], at.Bool[at.Array, "b s"]]:
         input_mask = []
         ar_mask = []
         tokens = []
@@ -154,14 +158,23 @@ class Pi0(_model.BaseModel):
         # keeps all pretrained image/text positions unchanged (RoPE-safe).
         if self.map_k > 0 and obs.map_tokens is not None:
             mt = nnx.swish(self.map_proj_in(obs.map_tokens))
-            mt = self.map_proj_out(mt) + self.map_registers
+            mt = self.map_alpha * (self.map_proj_out(mt) + self.map_registers)
             tokens.append(mt)
             input_mask.append(jnp.ones(mt.shape[:2], dtype=jnp.bool_))
             ar_mask += [False] * mt.shape[1]
+            _n_map = mt.shape[1]
+        else:
+            _n_map = 0
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-        return tokens, input_mask, ar_mask
+        # POSITION-TRANSPARENT map tokens: zero contribution to the RoPE position cumsum, so
+        # suffix positions are identical with or without them (measured 3x perturbation from
+        # the naive +K shift; G0 preflight 2026-07-30).
+        pos_weight = input_mask
+        if _n_map:
+            pos_weight = input_mask.at[:, -_n_map:].set(False)
+        return tokens, input_mask, ar_mask, pos_weight
 
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"],
@@ -231,7 +244,7 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_posw = self.embed_prefix(observation)
         # Read target_state from observation (None if not provided in dataset)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
             observation, x_t, time, target_state=observation.target_state,
@@ -239,7 +252,7 @@ class Pi0(_model.BaseModel):
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
+        positions = jnp.cumsum(jnp.concatenate([prefix_posw, suffix_mask], axis=1), axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
@@ -269,9 +282,9 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(None, observation, train=False)
 
         # Embed prefix (images + language tokens)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_posw = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        positions = jnp.cumsum(prefix_posw, axis=1) - 1
 
         # Forward pass through the VLM — same path as sample_actions prefix pass
         (prefix_out, _), _ = self.PaliGemma.llm(
@@ -307,9 +320,9 @@ class Pi0(_model.BaseModel):
             (prefix_out [b, s, d], prefix_mask [b, s]).
         """
         observation = _model.preprocess_observation(None, observation, train=False)
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_posw = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        positions = jnp.cumsum(prefix_posw, axis=1) - 1
         (prefix_out, _), _ = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
@@ -337,9 +350,9 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_posw = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        positions = jnp.cumsum(prefix_posw, axis=1) - 1
         (prefix_out, _unused), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
@@ -358,7 +371,7 @@ class Pi0(_model.BaseModel):
             # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = jnp.sum(prefix_posw, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
@@ -410,9 +423,9 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
         gvec = jnp.zeros((batch_size, 3)) if guide_dir is None else guide_dir
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_posw = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        positions = jnp.cumsum(prefix_posw, axis=1) - 1
         (prefix_out, _unused), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
@@ -423,7 +436,7 @@ class Pi0(_model.BaseModel):
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             prefix_attn_mask_s = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             full_attn_mask = jnp.concatenate([prefix_attn_mask_s, suffix_attn_mask], axis=-1)
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = jnp.sum(prefix_posw, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
             (_po, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens], mask=full_attn_mask, positions=positions,
                 kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
@@ -466,9 +479,9 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_posw = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        positions = jnp.cumsum(prefix_posw, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
@@ -479,7 +492,7 @@ class Pi0(_model.BaseModel):
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             prefix_attn_mask_s = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             full_attn_mask = jnp.concatenate([prefix_attn_mask_s, suffix_attn_mask], axis=-1)
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = jnp.sum(prefix_posw, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
             (_, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens], mask=full_attn_mask, positions=positions,
                 kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
@@ -517,9 +530,9 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         def build_prefix(obs):
-            pt, pm, par = self.embed_prefix(obs)
+            pt, pm, par, ppw = self.embed_prefix(obs)
             _, kv = self.PaliGemma.llm([pt, None], mask=make_attn_mask(pm, par),
-                                       positions=jnp.cumsum(pm, axis=1) - 1)
+                                       positions=jnp.cumsum(ppw, axis=1) - 1)
             return pm, kv
 
         pm_c, kv_c = build_prefix(observation)
@@ -565,9 +578,9 @@ class Pi0(_model.BaseModel):
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
 
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, prefix_posw = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        positions = jnp.cumsum(prefix_posw, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         x_t = noise
@@ -579,7 +592,7 @@ class Pi0(_model.BaseModel):
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             prefix_attn_mask_s = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             full_attn_mask = jnp.concatenate([prefix_attn_mask_s, suffix_attn_mask], axis=-1)
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = jnp.sum(prefix_posw, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
             (_, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens], mask=full_attn_mask, positions=positions,
                 kv_cache=kv_cache, adarms_cond=[None, adarms_cond],

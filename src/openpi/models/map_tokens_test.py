@@ -84,8 +84,8 @@ def test_k8_slot_is_live_and_finite():
     pp_none = _model.preprocess_observation(None, obs, train=False)
     pp_tok = _model.preprocess_observation(None, obs_tok, train=False)
     assert pp_tok.map_tokens is not None, "preprocess_observation dropped map_tokens"
-    t_none, _, _ = m8.embed_prefix(pp_none)
-    t_tok, _, _ = m8.embed_prefix(pp_tok)
+    t_none, _, _, _ = m8.embed_prefix(pp_none)
+    t_tok, _, _, _ = m8.embed_prefix(pp_tok)
     assert t_tok.shape[1] == t_none.shape[1] + 8, (t_none.shape, t_tok.shape)
     assert jnp.all(jnp.isfinite(_loss(m8, cfg, obs_tok)))
     # NOTE: loss-level influence is NOT testable in ad-hoc created models — nnx_bridge
@@ -96,10 +96,10 @@ def test_k8_slot_is_live_and_finite():
     # preflight_map_influence.py.
 
 
-def test_zero_init_tokens_equal_registers():
-    """At zero-init the injected tokens are EXACTLY the registers (input-independent):
-    proj_out kernel and bias are zeros, so mt = 0 + registers. This is the warm-start
-    guarantee — the map pathway starts as 8 learned constants, not noise."""
+def test_zero_init_tokens_are_exactly_zero():
+    """ReZero gate: map_alpha=0 at init, so injected tokens are EXACTLY zero regardless of
+    input (RMSNorm scales any nonzero token to full magnitude — the 20x warm-start trap,
+    G0 preflight 2026-07-30). The pathway unlocks through alpha's gradient."""
     from openpi.models import model as _model
 
     cfg, m8 = _make(8)
@@ -109,13 +109,27 @@ def test_zero_init_tokens_equal_registers():
         pp = _model.preprocess_observation(
             None, dataclasses.replace(obs, map_tokens=tok), train=False
         )
-        t_all, _, _ = m8.embed_prefix(pp)
+        t_all, _, _, _ = m8.embed_prefix(pp)
         injected = t_all[:, -8:, :]
-        expected = jnp.broadcast_to(
-            m8.map_registers.value[None].astype(injected.dtype), injected.shape
-        )
-        assert jnp.allclose(injected, expected, atol=1e-6), (
-            f"zero-init tokens must equal registers exactly (fill={fill})"
-        )
+        assert jnp.allclose(injected, 0.0, atol=1e-8), f"gated tokens must be zero (fill={fill})"
+
+
+def test_position_transparency():
+    """Suffix positions must be IDENTICAL with and without map tokens (the RoPE-shift trap:
+    naive appending moved every suffix position by K -> 3x perturbation)."""
+    from openpi.models import model as _model
+
+    cfg, m8 = _make(8)
+    obs = cfg.fake_obs()
+    pp0 = _model.preprocess_observation(None, obs, train=False)
+    pp8 = _model.preprocess_observation(
+        None, dataclasses.replace(obs, map_tokens=jnp.ones((1, 8, 72), jnp.float32)), train=False
+    )
+    _, _, _, pw0 = m8.embed_prefix(pp0)
+    _, _, _, pw8 = m8.embed_prefix(pp8)
+    # position sum (= next position offset for the suffix) must match exactly
+    assert int(pw0.sum()) == int(pw8.sum()), (int(pw0.sum()), int(pw8.sum()))
+    # map slots contribute zero position weight
+    assert not bool(pw8[:, -8:].any())
 
 
